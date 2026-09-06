@@ -49,7 +49,7 @@ void *g_tp_value[64][kTpSlots];
  * comporta igual -- al pasarse, se sirve por el camino general.
  */
 uint32_t register_thread_pointer(uintptr_t tp) noexcept {
-    const uint32_t start = uint32_t(tp >> 6) & (kTpSlots - 1);
+    const uint32_t start = tp_index(tp); // el MISMO reparto que el camino rapido
     for (uint32_t n = 0; n < kTpSlots; ++n) {
         const uint32_t i = (start + n) & (kTpSlots - 1);
         uintptr_t expected = 0;

@@ -89,13 +89,24 @@ the cases it wins is not telling you anything. On Linux against glibc:
 
 | case | ours | glibc | why |
 | :--- | ---: | ---: | :--- |
-| `burst` of 4 KiB | 16.9 ns | 9.0 ns | **A design gap**: size classes stop at 2 KiB and a chunk is 64 KiB, so a 4 KiB request takes a **whole 64 KiB chunk** -- 16x the waste -- and goes through the span path, which takes a lock. Serving 2 KiB-64 KiB from classes carved out of multi-chunk spans would close it. |
-| `churn` of 4 KiB / 64 KiB | 10.8 / 13.0 ns | 8.7 / 10.1 ns | Same gap. |
-| `realloc` growing past 64 KiB | 70-120 ns | 60-68 ns | glibc uses `mremap`, which remaps pages to a new address **without copying**. We cannot: it would move the block **out of our region**, and `in_region` -- two comparisons, which is what makes freeing cheap -- would stop recognising it. Spans absorb their free neighbour instead, which fixed the case from 30x worse to 0.86x. |
+| `hot` of 1 MiB | ~14 ns | ~12 ns | Span path: one lock and a free-list walk against glibc's cached mmap. |
+| `churn` of 64 KiB | ~11 ns | ~10 ns | Same, and it **swings either way between runs** -- it read 1.32x in our favour minutes before it read 0.91x against. At this size the measurement is noisier than the difference. |
+| `calloc` of 64 KiB and up | ~430 ns / ~7 us | the same | A tie by construction: at that size the cost is materialising pages, which is identical for both. Neither allocator can be faster at it. |
 
-Everything else we now win, from 1.0x to 36x. The small sizes were losing at
-0.83-0.98x until the thread slot stopped calling `pthread_getspecific` on every
-allocation and started reading the thread pointer with one instruction.
+Everything else we win, from 1.0x to 36x. Three things closed most of the gap,
+and each is written up where it lives:
+
+- **Size classes now reach 16 KiB.** They stopped at 2 KiB, so a 4 KiB request
+  took a whole 64 KiB chunk -- 16x the waste -- and went through the span path
+  with a lock. `hot` of 4 KiB went 6.17 -> 1.63 ns, `churn` 10.8 -> 3.66, for
+  +6% peak memory.
+- **Spans split and coalesce.** Exact-fit lists meant a 17-chunk span could not
+  serve a 1-chunk request, so a growing buffer consumed fresh region every
+  round. `realloc` growing to 1 MiB went 3,583 -> 74 ns and peak memory 144 ->
+  21 MiB.
+- **The thread slot reads the thread pointer with one instruction.** It used to
+  call `pthread_getspecific` on every allocation, which is why the small sizes
+  lost at 0.83-0.98x.
 
 On Windows the picture is different: we win everywhere by 2x to 500x, because
 msvcrt's allocator is much weaker. The `<- system wins` rows above are a Linux

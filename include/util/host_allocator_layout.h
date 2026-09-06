@@ -90,7 +90,7 @@ namespace util {
  * dentro de un trozo solo anade desperdicio -- el sistema ya sabe entregar
  * paginas.
  */
-inline constexpr size_t kMaxSmall = 2048;
+inline constexpr size_t kMaxSmall = 16384;
 
 /// Alineacion que garantiza `operator new` para cualquier tipo.
 inline constexpr size_t kAlign = 16;
@@ -109,7 +109,23 @@ inline constexpr uint32_t kSizes[] = {
     // De 1 KiB a 2 KiB el paso se abre un poco: son el 0,5% de las reservas,
     // asi que el desperdicio por redondeo pesa poco.  El mayor queda en un
     // 15% (1.537 bytes van a una clase de 1.792).
-    1152, 1280, 1408, 1536, 1792, 2048};
+    1152, 1280, 1408, 1536, 1792, 2048,
+    /* DE 2 KiB A 16 KiB: el hueco que costaba caro.  Sin estas clases, una
+     * peticion de 4 KiB se iba al camino de TRAMOS y se llevaba un trozo
+     * ENTERO de 64 KiB -- dieciseis veces el desperdicio -- ademas de tomar el
+     * cerrojo de tramos.  Medido contra `malloc`, era el unico sitio donde
+     * perdiamos de largo: `burst` de 4 KiB, 16,9 ns frente a 9,0.
+     *
+     * Con clase propia, un trozo de 64 KiB da quince bloques de 4 KiB y ninguno
+     * pasa por el cerrojo.
+     *
+     * OJO CON SUBIR MAS.  Arriba del todo quedan pocos bloques por trozo -- a
+     * 16 KiB salen tres --, y un trozo no se devuelve hasta que se vacia
+     * entero, asi que pasado cierto punto se cambia tiempo por fragmentacion.
+     * 16 KiB es donde estaba el equilibrio al medirlo; ver el banco
+     * `bench_vs_malloc`, que es lo que hay que volver a mirar antes de tocar
+     * esta lista. */
+    2560, 3072, 3584, 4096, 5120, 6144, 8192, 10240, 12288, 16384};
 inline constexpr uint32_t kClasses = sizeof(kSizes) / sizeof(kSizes[0]);
 
 /// Trozo que se pide a la region cada vez que una clase se queda sin bloques.

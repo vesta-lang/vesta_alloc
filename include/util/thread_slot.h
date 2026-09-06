@@ -101,15 +101,32 @@ uint32_t register_thread_pointer(uintptr_t tp) noexcept;
 }
 
 /**
- * @brief La casilla de este hilo en la tabla directa.
+ * @brief La casilla de un puntero de hilo en la tabla directa.
  *
- * Los bloques de control estan alineados, asi que los bits bajos del puntero
- * no distinguen: se toman a partir del sexto.  Una colision no es un error --
- * se resuelve por el camino lento --, solo cuesta una llamada.
+ * MEZCLA TODOS LOS BITS, y no es por elegancia.  La primera version tomaba un
+ * trozo del puntero tal cual (`(tp >> 6) & 255`), y eso hacia que TODOS los
+ * hilos cayeran en la MISMA casilla: los bloques de control se reparten con el
+ * paso del tamano de pila -- 8 MiB en glibc --, que es multiplo de la tabla, de
+ * modo que los bits elegidos salian identicos.  Con eso, todos los hilos menos
+ * uno fallaban SIEMPRE y se iban al camino lento en cada reserva: doce hilos
+ * pasaron de 0,60 a 6,61 ns por operacion.
+ *
+ * Multiplicar por una constante impar grande y quedarse con los bits ALTOS
+ * reparte cualquier paso regular, que es justo el caso que se dio.
+ */
+[[gnu::always_inline]] constexpr uint32_t tp_index(uintptr_t tp) noexcept {
+    return uint32_t((tp * 0x9E3779B97F4A7C15ull) >> 56) & (kTpSlots - 1);
+}
+
+/**
+ * @brief La casilla de este hilo.
+ *
+ * Una colision no es un error -- se resuelve por el camino lento --, solo
+ * cuesta una llamada.  Lo que no puede pasar es que colisionen SIEMPRE.
  */
 [[gnu::always_inline]] inline uint32_t thread_index() noexcept {
     const uintptr_t tp = thread_pointer();
-    const uint32_t i = uint32_t(tp >> 6) & (kTpSlots - 1);
+    const uint32_t i = tp_index(tp);
     if (g_tp_key[i].load(std::memory_order_relaxed) == tp) return i;
     return register_thread_pointer(tp);
 }

@@ -91,14 +91,24 @@ casos que gana no esta diciendo nada.  En Linux contra glibc:
 
 | caso | nuestro | glibc | por que |
 | :--- | ---: | ---: | :--- |
-| `burst` de 4 KiB | 16,9 ns | 9,0 ns | **Hueco de diseno**: las clases de tamano se paran en 2 KiB y un trozo son 64 KiB, asi que una peticion de 4 KiB se lleva un trozo ENTERO -- 16 veces de desperdicio -- y pasa por el camino de tramos, que toma cerrojo.  Servir el rango 2 KiB-64 KiB con clases talladas de tramos de varios trozos lo cerraria. |
-| `churn` de 4 KiB / 64 KiB | 10,8 / 13,0 ns | 8,7 / 10,1 ns | El mismo hueco. |
-| `realloc` que crece de 64 KiB | 70-120 ns | 60-68 ns | glibc usa `mremap`, que remapea las paginas a otra direccion **sin copiar**.  Nosotros no podemos: moveria el bloque **fuera de nuestra region**, y `in_region` -- dos comparaciones, que es lo que hace barato liberar -- dejaria de reconocerlo.  Los tramos absorben a su vecino libre en su lugar, lo que llevo este caso de 30 veces peor a 0,86x. |
+| `hot` de 1 MiB | ~14 ns | ~12 ns | Camino de tramos: un cerrojo y un recorrido de lista, contra el `mmap` cacheado de glibc. |
+| `churn` de 64 KiB | ~11 ns | ~10 ns | Lo mismo, y **cambia de signo entre corridas**: minutos antes marcaba 1,32x a favor y despues 0,91x en contra.  A ese tamano la medida tiene mas ruido que la diferencia. |
+| `calloc` de 64 KiB en adelante | ~430 ns / ~7 us | igual | Empate POR CONSTRUCCION: ahi el coste es materializar paginas, que es identico para los dos.  Ninguno puede ser mas rapido en eso. |
 
-Todo lo demas lo ganamos ahora, entre 1,0x y 36x.  Los tamanos pequenos perdian
-por 0,83-0,98x hasta que la ranura por hilo dejo de llamar a
-`pthread_getspecific` en CADA reserva y paso a leer el puntero de hilo con una
-instruccion.
+Todo lo demas lo ganamos, entre 1,0x y 36x.  Tres cosas cerraron casi todo el
+hueco, y cada una esta explicada donde vive:
+
+- **Las clases de tamano llegan ya a 16 KiB.**  Se paraban en 2 KiB, asi que una
+  peticion de 4 KiB se llevaba un trozo entero de 64 KiB -- dieciseis veces el
+  desperdicio -- y pasaba por el camino de tramos, con cerrojo.  `hot` de 4 KiB
+  fue de 6,17 a 1,63 ns, y `churn` de 10,8 a 3,66, por un +6% de memoria.
+- **Los tramos se parten y se juntan.**  Con listas de ajuste exacto, un tramo de
+  diecisiete trozos no podia servir una peticion de uno, asi que un bufer que
+  crece consumia region nueva en cada vuelta.  `realloc` creciendo hasta 1 MiB
+  fue de 3.583 a 74 ns, y el pico de 144 a 21 MiB.
+- **La ranura por hilo lee el puntero de hilo con una instruccion.**  Antes
+  llamaba a `pthread_getspecific` en CADA reserva, y por eso los tamanos
+  pequenos perdian por 0,83-0,98x.
 
 En Windows el cuadro es otro: ganamos en todo entre 2x y 500x, porque el
 asignador de msvcrt es mucho mas flojo.  Las filas de arriba son un resultado de
