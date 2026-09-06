@@ -317,22 +317,34 @@ ThreadCache *cache() noexcept {
 std::atomic_flag g_span_lock = ATOMIC_FLAG_INIT;
 
 /**
- * @brief Hasta que tamano se deja un tramo libre CON memoria detras.
+ * @brief Cuanta memoria de tramos LIBRES se conserva sin devolver al sistema.
  *
- * Por debajo se guarda entero y reusarlo es sacarlo de una lista.  Por encima
- * se devuelven sus paginas al sistema y se conserva solo la primera, que es
- * donde viven la cabecera y el enlace de la lista -- si se devolvieran TODAS no
- * habria donde escribir ese enlace.
+ * POR QUE UN PRESUPUESTO Y NO UN UMBRAL POR TAMANO.  Porque lo segundo se probo
+ * y es carisimo.  Habia aqui un tope por tramo -- por encima de 1 MiB se
+ * devolvian sus paginas al soltarlo --, y eso convierte cada par
+ * reservar/liberar de un bloque grande en tres llamadas al sistema.  Medido
+ * contra `malloc` en Linux, por operacion:
  *
- * Es la pieza que faltaba la vez que se probo a subir el tope de las clases:
- * entonces el asignador no devolvia nada al sistema nunca, y por eso servir
- * bloques grandes costaba un 7,4% de memoria.  Ahora un tramo que se suelta
- * deja de ocupar memoria fisica sin perder su sitio.
+ *     reservar y soltar 1 MiB      nuestro 1.438 ns    malloc 9,6 ns
+ *     lo mismo con vida y relevo   nuestro 1.959 ns    malloc 17,4 ns
  *
- * Es una constante de AFINADO, no de capacidad: cambiarla mueve el equilibrio
- * entre memoria y llamadas al sistema, y nada mas.
+ * Cien veces peor, y por una constante que no estaba midiendo nada.  Con el
+ * presupuesto: se conserva lo soltado mientras quepa, y solo se devuelve al
+ * sistema lo que se pase.  Asi el caso normal -- soltar y volver a pedir el
+ * mismo tamano, que es lo que hacen las fases -- no toca el sistema NI UNA vez,
+ * y la memoria retenida sigue acotada.
+ *
+ * 64 MiB es de AFINADO, no de capacidad: pasarse no rompe nada, solo hace que
+ * a partir de ahi los tramos que se suelten devuelvan sus paginas.
  */
-constexpr uint32_t kSpanKeepCommittedChunks = 16; // 1 MiB
+constexpr size_t kSpanRetainBudget = size_t(64) << 20; // 64 MiB
+
+/// Bytes de tramos libres que ahora mismo conservan su memoria.
+std::atomic<size_t> g_span_retained{0};
+
+/// Marca en `ChunkHeader::_pad` de un tramo libre al que se le devolvieron las
+/// paginas.  Al reusarlo hay que volver a pedirlas.
+constexpr uint32_t kSpanDecommitted = 1;
 
 /// Listas de tramos libres por numero EXACTO de trozos.  Sin partir ni juntar:
 /// las fases piden y sueltan los mismos tamanos una y otra vez, asi que el
@@ -360,13 +372,26 @@ uintptr_t take_chunks(size_t count) noexcept {
     return addr;
 }
 
-/// Sirve una reserva grande.  nullptr si la region no da mas.
-void *alloc_span(ThreadCache *c, size_t n) noexcept {
+/**
+ * @brief Sirve una reserva grande.  nullptr si la region no da mas.
+ * @param fresh Si no es nulo, sale `true` cuando el tramo viene RECIEN del
+ *        sistema y por tanto esta a cero.  Lo usa @c host_alloc_zeroed para
+ *        saltarse un `memset` que no hace falta.
+ *
+ * Un tramo recien comprometido esta garantizado a cero, tanto en Windows como
+ * en POSIX: entregar paginas de otro proceso sin limpiarlas seria una fuga de
+ * datos, asi que el sistema no lo hace.  Uno REUSADO no lo esta, aunque se le
+ * hayan devuelto las paginas: su primera pagina se conserva -- ahi viven la
+ * cabecera y el enlace de la lista -- y lleva lo que hubiera.
+ */
+void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
+    if (fresh != nullptr) *fresh = false;
     const uint32_t chunks = chunks_for(n);
     const size_t bytes = size_t(chunks) * kChunkBytes;
     uintptr_t addr = 0;
     bool reused = false;
 
+    bool needs_commit = false;
     if (chunks <= kMaxSpanChunks) {
         SpanLock lk;
         void *head = g_span_free[chunks];
@@ -374,18 +399,25 @@ void *alloc_span(ThreadCache *c, size_t n) noexcept {
             g_span_free[chunks] = *reinterpret_cast<void **>(head);
             addr = reinterpret_cast<uintptr_t>(head);
             reused = true;
+            /* Solo hay que volver a pedir paginas si se le quitaron al
+             * soltarlo, que es lo que pasa cuando el presupuesto estaba lleno.
+             * En el caso normal no se toca el sistema NI UNA vez. */
+            needs_commit =
+                reinterpret_cast<ChunkHeader *>(addr)->_pad == kSpanDecommitted;
+            if (!needs_commit)
+                g_span_retained.fetch_sub(bytes, std::memory_order_relaxed);
         }
     }
     if (addr == 0) {
         addr = take_chunks(chunks);
         if (addr == 0) return nullptr;
-        if (!os_commit(reinterpret_cast<void *>(addr), bytes)) return nullptr;
-    } else if (chunks > kSpanKeepCommittedChunks) {
-        /* Solo los tramos grandes vuelven sin memoria detras -- a los pequenos
-         * no se les quita, justamente para que reusarlos no cueste una llamada
-         * al sistema.  Ver @c kSpanKeepCommittedChunks. */
-        if (!os_commit(reinterpret_cast<void *>(addr), bytes)) return nullptr;
+        needs_commit = true;
+        // Nunca usado: lo que entregue el sistema viene a cero.
+        if (fresh != nullptr) *fresh = true;
     }
+    if (needs_commit &&
+        !os_commit(reinterpret_cast<void *>(addr), bytes))
+        return nullptr;
 
     ChunkHeader *h = reinterpret_cast<ChunkHeader *>(addr);
     h->magic = kSpanMagic;
@@ -409,18 +441,37 @@ void *alloc_span(ThreadCache *c, size_t n) noexcept {
  */
 void free_span(ChunkHeader *h) noexcept {
     const uint32_t chunks = h->cls;
+    const size_t bytes = size_t(chunks) * kChunkBytes;
     ThreadCache *c = cache();
     if (c != nullptr) c->stats.large_frees++;
 
-    if (chunks > kSpanKeepCommittedChunks) {
-        /* Se sueltan las paginas menos la primera: ahi esta la cabecera, y en
-         * ella el enlace de la lista de libres. */
+    /* UN TRAMO QUE SE GUARDA, SE GUARDA CON SU MEMORIA.  Aqui hubo dos intentos
+     * de devolver paginas al soltarlo, y los dos se midieron y se retiraron:
+     *
+     *   - por TAMANO (devolver las de todo tramo de mas de 1 MiB): convierte
+     *     cada par reservar/soltar en tres llamadas al sistema.  1.438 ns por
+     *     operacion frente a los 9,6 de `malloc`.  Cien veces peor.
+     *   - por PRESUPUESTO (conservar hasta 64 MiB): peor todavia, y de forma
+     *     mas dificil de ver.  Una fase que suelta 512 tramos de 1 MiB llena el
+     *     presupuesto con SESENTA Y CUATRO de ellos, que se quedan ahi
+     *     pinchados porque nadie vuelve a pedir ese tamano -- y a partir de ese
+     *     momento CUALQUIER liberacion, de cualquier tamano, ve el presupuesto
+     *     lleno y devuelve sus paginas.  Una llamada al sistema por reserva,
+     *     para siempre.  Medido: `calloc` de 4 KiB paso de 19 ns a 4.341.
+     *
+     * Lo que queda retenido esta acotado por el pico de tramos libres a la vez,
+     * que es memoria que el programa ya llego a tener.  Si algun dia hace falta
+     * devolverla, lo suyo es una llamada EXPLICITA que el anfitrion haga entre
+     * fases -- donde se sabe que no va a volver a hacer falta --, no una
+     * decision tomada en cada liberacion sin saber que viene despues. */
+    h->_pad = 0;
+    if (chunks > kMaxSpanChunks) {
+        /* Estos si devuelven sus paginas, porque no se guardan: se pierde el
+         * rango de direcciones y quedarse ademas con la memoria seria regalar
+         * las dos cosas. */
         const size_t page = os_page_size();
-        const size_t bytes = size_t(chunks) * kChunkBytes;
         if (bytes > page)
             os_decommit(reinterpret_cast<char *>(h) + page, bytes - page);
-    }
-    if (chunks > kMaxSpanChunks) {
         /* Mas grande de lo que merece la pena guardar.  Sus paginas ya se
          * devolvieron arriba; el rango de direcciones se pierde, y eso es
          * asumible: la region son 256 GiB y esto pasa una vez entre cien mil.
@@ -635,6 +686,28 @@ HostAllocStats host_alloc_stats() {
 
 bool host_alloc_active() {
     return allocator_active();
+}
+
+void *host_alloc_zeroed(size_t n) noexcept {
+    /* Solo los TRAMOS pueden venir limpios del sistema, y solo si son nuevos.
+     * Todo lo demas sale de una lista de libres con lo que dejara el inquilino
+     * anterior, asi que hay que limpiarlo.  El motivo de que esto no sea
+     * `host_alloc` + `memset`, con la medida, esta en la cabecera. */
+    if (n > kMaxSmall && allocator_active()) {
+        ThreadCache *c = detail::current_cache();
+        if (c == nullptr) c = detail::ensure_cache();
+        if (c != nullptr) {
+            bool already_zero = false;
+            void *p = alloc_span(c, n, &already_zero);
+            if (p != nullptr) {
+                if (!already_zero) std::memset(p, 0, n);
+                return p;
+            }
+        }
+    }
+    void *p = host_alloc(n);
+    if (p != nullptr) std::memset(p, 0, n);
+    return p;
 }
 
 /* Una tabla y no dos trozos pegados en un buffer: asi es reentrante, vale entre

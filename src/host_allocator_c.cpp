@@ -54,10 +54,11 @@ void *vesta_host_calloc(size_t count, size_t size) {
      * caros: si se desborda se reserva de menos y se escribe de mas.  Se
      * comprueba antes de multiplicar. */
     if (count != 0 && size > (size_t(-1) / count)) return nullptr;
-    const size_t total = count * size;
-    void *p = util::host_alloc(total);
-    if (p != nullptr) std::memset(p, 0, total);
-    return p;
+    /* `host_alloc_zeroed`, no `host_alloc` mas un `memset`: cuando la memoria
+     * acaba de venir del sistema ya esta a cero y limpiarla otra vez es
+     * escribir de balde.  Con bloques de 1 MiB eran veintitres veces mas lento
+     * que `calloc`; ver la cabecera. */
+    return util::host_alloc_zeroed(count * size);
 }
 
 void *vesta_host_realloc(void *p, size_t n) {

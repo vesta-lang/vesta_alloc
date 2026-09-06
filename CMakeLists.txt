@@ -289,7 +289,7 @@ endif()
 #  numero que fluctua no puede decidir si un cambio pasa o no.
 # -----------------------------------------------------------------------------
 if(VESTA_ALLOC_BUILD_BENCH)
-    foreach(_b IN ITEMS bench_allocator bench_reserve_cost)
+    foreach(_b IN ITEMS bench_allocator bench_vs_malloc bench_reserve_cost)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)

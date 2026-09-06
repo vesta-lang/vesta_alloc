@@ -28,6 +28,7 @@
  */
 
 #include "util/host_allocator.h"
+#include "util/os_memory.h"
 
 #include <atomic>
 #include <chrono>
@@ -151,6 +152,17 @@ int main() {
                 s.bytes_reserved / (1024.0 * 1024.0),
                 (unsigned long long)s.chunks,
                 (unsigned long long)s.remote_frees);
+
+    /* And what the OPERATING SYSTEM says this process cost, which is a
+     * different question and the one that matters for a memory/speed
+     * trade-off.  The counter above says how much was ever asked of the
+     * region, not how much is still held: it cannot tell you whether keeping
+     * freed blocks around instead of returning their pages to the OS is
+     * costing you anything.  This can. */
+    const util::OsProcessMemory pm = util::os_process_memory();
+    std::printf("process peak %.1f MiB resident, %.1f MiB now\n",
+                pm.working_set_peak / (1024.0 * 1024.0),
+                pm.working_set / (1024.0 * 1024.0));
     std::printf("\nCompare by running this same binary with "
                 "VESTA_NO_HOST_SLAB=1.\n");
     return 0;

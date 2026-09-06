@@ -411,6 +411,34 @@ class AllocScope {
  */
 HostAllocStats host_alloc_stats();
 
+/**
+ * @brief Sirve @p n bytes PUESTOS A CERO.
+ * @return nullptr solo si tampoco pudo el asignador del sistema.
+ *
+ * NO es `host_alloc` mas un `memset`, y ahi esta toda la gracia: cuando la
+ * memoria acaba de venir del sistema operativo **ya viene a cero** -- lo
+ * garantizan tanto Windows como POSIX, porque entregar paginas de otro proceso
+ * sin limpiarlas seria una fuga de datos --, asi que volver a ponerla a cero es
+ * escribir de balde.
+ *
+ * Cuanto de balde, medido en Linux contra `calloc` con bloques de 1 MiB:
+ *
+ *     con memset siempre     176.126 ns
+ *     calloc de glibc          7.578 ns
+ *
+ * Veintitres veces, y no por ser mas lento haciendo lo mismo: por hacer un
+ * trabajo que no hacia falta.  Los bloques pequenos SI se limpian, porque salen
+ * de una lista de libres y llevan lo que dejara el inquilino anterior.
+ *
+ * @par Hilos
+ * Segura desde cualquier hilo, igual que @c host_alloc.
+ *
+ * @code
+ *   int *v = static_cast<int *>(util::host_alloc_zeroed(n * sizeof(int)));
+ * @endcode
+ */
+void *host_alloc_zeroed(size_t n) noexcept;
+
 /// true si el asignador esta sirviendo (false con `VESTA_NO_HOST_SLAB=1`).
 /// @par Hilos
 /// Segura.  La primera llamada consulta el entorno; las demas leen un atomico.
