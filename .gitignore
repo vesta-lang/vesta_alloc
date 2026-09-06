@@ -1,0 +1,28 @@
+# Directorios de construccion
+build/
+cmake-build-*/
+out/
+
+# Artefactos
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.pdb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Editores
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+# Finales de linea LF SIEMPRE, tambien en Windows.
+#
+# No es cosmetico.  Este mismo arbol ya tuvo un fallo por esto: un fichero con
+# CRLF que un `sh` de Linux tenia que ejecutar moria con "Syntax error: word
+# unexpected", y el mensaje no decia nada de saltos de linea.  Una biblioteca
+# que se lleva a otros sistemas no puede depender de con que se saco.
+* text=auto eol=lf
+
+# Binarios, por si alguna vez entra alguno.
+*.png binary
+*.jpg binary
+*.gz  binary
+*.a   binary
+*.lib binary
