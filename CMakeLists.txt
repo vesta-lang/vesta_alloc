@@ -28,7 +28,9 @@ cmake_minimum_required(VERSION 3.12)
 
 # Detectar si se esta construyendo suelto o dentro de otro proyecto.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(vesta_alloc VERSION 1.0.0 LANGUAGES CXX)
+    # C tambien: los ejemplos en C se compilan COMO C, que es lo que comprueba
+    # que la cabecera de la capa en C lo sea de verdad.
+    project(vesta_alloc VERSION 1.0.0 LANGUAGES CXX C)
     set(VESTA_ALLOC_STANDALONE ON)
 
     # -------------------------------------------------------------------------
@@ -68,9 +70,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     #
     # Quien lo construya para si mismo puede pedir `native`:
     #     cmake -S . -B build -DVESTA_ALLOC_TUNE=native
+    # OJO al escribirlo: el texto de ayuda tiene que ser UNA sola cadena.  En
+    # dos, CMake las toma como valores mas y la variable acaba conteniendo el
+    # texto entero -- que se cuela tal cual en la linea de compilacion.
     set(VESTA_ALLOC_TUNE "generic" CACHE STRING
-            "Microarquitectura para -mtune (generic para distribuir, native "
-            "para la maquina de uno)")
+            "Microarquitectura para -mtune: generic para distribuir, native para la maquina de uno")
 
     # `-march=x86-64` es la LINEA BASE: no se emite ni una instruccion fuera
     # del x86-64 original.  Y `-ffast-math` NO esta, igual que en el proyecto
@@ -90,6 +94,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
             CACHE STRING "Flags C++ de Release" FORCE)
     set(CMAKE_CXX_FLAGS_PROFILE "${_va_opt_str} -DNDEBUG -g1 -fno-omit-frame-pointer"
             CACHE STRING "Flags C++ para perfilar (Release + simbolos)" FORCE)
+    # Debug tambien lleva `-march=x86-64` explicito.  Sin el se usa lo que
+    # llevara compilado el propio GCC, que en algunas distribuciones NO es la
+    # linea base: un binario de depuracion que no arranca en otra maquina es
+    # una forma tonta de perder una tarde.
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -march=x86-64"
+            CACHE STRING "Flags C++ de Debug" FORCE)
     set(CMAKE_EXE_LINKER_FLAGS_PROFILE "${CMAKE_EXE_LINKER_FLAGS_RELEASE}"
             CACHE STRING "Flags de enlazado para perfilar" FORCE)
     set(CMAKE_SHARED_LINKER_FLAGS_PROFILE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE}"
@@ -220,6 +230,26 @@ if(VESTA_ALLOC_BUILD_EXAMPLES)
         add_executable(vesta_alloc_ejemplo_${_e} examples/${_e}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_ejemplo_${_e} PRIVATE vesta_alloc)
+    endforeach()
+
+    # Los de C se compilan COMO C, y eso no es un detalle de presentacion: es
+    # lo unico que comprueba que `host_allocator_c.h` sea C de verdad.  Sin
+    # esto, la cabecera podria dejar de serlo -- un `bool`, un argumento por
+    # defecto, un namespace -- y nadie se enteraria hasta que un usuario en C
+    # intentara incluirla.
+    #
+    # Y hay que forzar el enlazador de C++: el ejecutable solo tiene fuentes en
+    # C, asi que CMake elegiria el de C y faltaria la biblioteca estandar de
+    # C++.  Es la misma trampa que se encuentra cualquiera que use esto desde
+    # un proyecto en C; esta escrito en el README.
+    foreach(_e IN ITEMS c_basic c_library_hook)
+        add_executable(vesta_alloc_ejemplo_${_e} examples/${_e}.c
+                $<TARGET_OBJECTS:vesta_alloc>)
+        target_link_libraries(vesta_alloc_ejemplo_${_e} PRIVATE vesta_alloc)
+        set_target_properties(vesta_alloc_ejemplo_${_e} PROPERTIES
+                LINKER_LANGUAGE CXX
+                C_STANDARD 99
+                C_STANDARD_REQUIRED ON)
     endforeach()
 endif()
 

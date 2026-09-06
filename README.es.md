@@ -150,6 +150,21 @@ La misma forma vale para `sqlite3_config(SQLITE_CONFIG_MALLOC, ...)`,
 Comprobar que expone la version que llevas vendorizada en vez de darlo por
 hecho.
 
+`examples/c_basic.c` y `examples/c_library_hook.c` se compilan **como C**, no
+como C++.  Es a proposito: son lo unico que comprueba que
+`host_allocator_c.h` sea C de verdad, en vez de limitarse a decirlo.
+
+**Una trampa al llamar desde un programa en C**: la biblioteca es C++, asi que
+el enlace final necesita la biblioteca estandar de C++.  Si tu ejecutable solo
+tiene fuentes en C, tu sistema de construccion elegira el enlazador de C y
+saldran simbolos `std::` sin resolver.  En CMake:
+
+```cmake
+set_target_properties(tu_programa_c PROPERTIES LINKER_LANGUAGE CXX)
+```
+
+o enlazar con `g++`/`clang++` en vez de con `gcc`/`clang`.
+
 ## Licencia
 
 GPLv2 -- ver `LICENSE`.  **Ojo**: a diferencia de la licencia de VestaVM, aqui

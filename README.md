@@ -146,6 +146,21 @@ The same shape works for `sqlite3_config(SQLITE_CONFIG_MALLOC, ...)`,
 `CRYPTO_set_mem_functions` and zlib-style `zalloc`/`zfree` hooks. Check what the
 version you actually vendored exposes rather than assuming.
 
+`examples/c_basic.c` and `examples/c_library_hook.c` are compiled **as C**, not
+as C++. That is deliberate: they are the only thing that checks
+`host_allocator_c.h` really is valid C, rather than merely claiming to be.
+
+**One gotcha when calling from a C program**: the library itself is C++, so the
+final link needs the C++ standard library. If your executable has only C
+sources, your build system will pick the C linker and you will get undefined
+references to `std::` symbols. In CMake:
+
+```cmake
+set_target_properties(your_c_program PROPERTIES LINKER_LANGUAGE CXX)
+```
+
+or link with `g++`/`clang++` instead of `gcc`/`clang`.
+
 ## License
 
 GPLv2 -- see `LICENSE`. **Note**: unlike the VestaVM license this came from,
