@@ -126,6 +126,19 @@ struct HostAllocStats {
     uint64_t large_frees = 0;    ///< tramos devueltos
     uint64_t chunks = 0;         ///< trozos pedidos a la region
     uint64_t bytes_reserved = 0; ///< bytes comprometidos de la region
+    /**
+     * @brief Veces que se pidio identificador de dueno y no quedaba.
+     *
+     * Distinto de cero significa que hubo mas de @c kMaxThreads-1 duenos VIVOS
+     * a la vez, y que esos hilos se sirvieron de las listas COMPARTIDAS, detras
+     * del unico cerrojo del asignador.  No es un fallo -- funciona igual --,
+     * pero es la unica forma de enterarse: desde fuera solo se nota que todo va
+     * mas lento sin razon visible.
+     *
+     * No se lleva por hilo: quien la incrementa es precisamente el que no
+     * consiguio uno.
+     */
+    uint64_t no_owner_id = 0;
     /// Reparto de los tamanos PEDIDOS.  Los tramos exactos estan en
     /// `kBucketLimit`, en el `.cpp`; llegan hasta arriba porque hay que poder
     /// ver la COLA para decidir como servir las reservas grandes.  Solo se
@@ -141,7 +154,7 @@ namespace detail {
  * No es API.  Esta en la cabecera unicamente porque el camino rapido la toca y
  * tiene que poder estar en linea; ver la nota del principio del fichero.
  */
-struct ThreadCache {
+struct alignas(64) ThreadCache {
     void *free_list[kClasses];
     uint32_t id;
     bool used;
@@ -154,6 +167,30 @@ struct ThreadCache {
      * La mueve @c AllocScope, nunca se toca a mano.
      */
     uint8_t tag;
+    /**
+     * @brief El trozo GRANDE que este hilo esta gastando, por clase.
+     *
+     * Un trozo grande es de 1 MiB, y encadenar su lista libre escribe un
+     * puntero en CADA bloque -- o sea que lo toca entero y lo compromete
+     * entero --.  Medido: una sola reserva de 16 KiB dejaba 759 KiB residentes,
+     * doce veces lo de antes.  Por eso se encadena por TANDAS: se compromete y
+     * se encadena lo que se va a entregar, y aqui se recuerda de que trozo
+     * seguir.  El desperdicio se sigue amortizando sobre el 1 MiB entero, que
+     * es la razon de que el trozo sea grande.
+     *
+     * Nulo mientras esa clase no se haya tocado, que es lo normal: casi ninguna
+     * las usa todas.
+     */
+    ChunkHeader *big_run[kClasses];
+    /**
+     * @brief Un tramo guardado por este hilo, por numero de trozos.
+     *
+     * El indice es `trozos - 1`.  Nulo si no hay ninguno guardado, que es lo
+     * normal en un hilo que no pida reservas grandes.  Ver `kSpanCacheSlots`:
+     * existe porque el cerrojo de tramos era el 76% de lo que costaba una
+     * reserva grande, y era el unico sitio donde el camino rapido sincronizaba.
+     */
+    ChunkHeader *span_cache[kSpanCacheSlots];
     HostAllocStats stats;
 };
 
@@ -177,7 +214,13 @@ extern bool g_measure;
  * que compartir.
  */
 [[gnu::always_inline]] inline ThreadCache *current_cache() noexcept {
-    if (!g_cache_slot.ensure()) return nullptr;
+    /* SIN `ensure` aqui, y no es un olvido.  Reservar la ranura es cosa del
+     * camino LENTO, que es quien la usa: @c cache lo hace antes de dar de alta.
+     * Aqui `ensure` no cambiaba ninguna respuesta -- con la ranura sin reservar,
+     * @c get devuelve nulo igual, y con ella reservada pero vacia tambien --,
+     * solo anadia una carga atomica mas de la MISMA variable en el camino mas
+     * caliente que tiene el compilador.  Y son dos cargas y no una porque son
+     * atomicas con orden de adquisicion: el compilador no puede fusionarlas. */
     return static_cast<ThreadCache *>(g_cache_slot.get());
 }
 
@@ -274,6 +317,14 @@ void host_free_remote(void *p, ChunkHeader *h) noexcept;
 /// **Segura desde cualquier hilo**; toma el cerrojo de tramos si hace falta.
 void host_free_not_small(void *p, ChunkHeader *h) noexcept;
 
+/**
+ * @brief Suelta un bloque de la region de las clases GRANDES.
+ *
+ * Fuera de linea porque son el 0,9% de las liberaciones: meterlo en la cabecera
+ * engordaria el camino caliente para servir al caso raro.
+ */
+void host_free_big(void *p) noexcept;
+
 } // namespace detail
 
 /**
@@ -314,12 +365,23 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
  *
  * COMO: se pide de mas, se sube el puntero hasta la alineacion pedida y el
  * original se guarda en el hueco de justo antes, que es lo unico que hace falta
- * para poder soltarlo.  El coste es @p align - 1 + 8 bytes por bloque.
+ * para poder soltarlo.
+ *
+ * LO QUE SE PIDE DE MAS SON @p align BYTES, no @p align - 1 + 8, y la
+ * diferencia no es cosmetica: los tamanos se redondean a una CLASE, asi que
+ * siete bytes de mas pueden costar una clase entera.  Un `alignas(64)` de 64
+ * bytes pedia 135 y caia en la clase de 160; pidiendo 128 cae en la de 128.
+ *
+ * Se puede pedir menos porque @c host_alloc ya entrega 16 alineados en TODOS
+ * sus caminos -- los bloques de un trozo salen a `trozo + 16` con paso multiplo
+ * de 16, un tramo sale tambien a `trozo + 16`, y el respaldo del sistema
+ * garantiza `max_align_t` --.  Con el original ya 16 alineado, la distancia
+ * hasta el siguiente multiplo de @p align ESTRICTAMENTE mayor que el es como
+ * mucho @p align, y como poco 16: lo primero acota lo que hay que pedir, y lo
+ * segundo garantiza que los 8 bytes de la cabecera caben siempre.
  *
  * @param n     Bytes utiles.
- * @param align Alineacion pedida.  Potencia de dos, y al menos 16 -- que es lo
- *              que el compilador garantiza al llamar a la sobrecarga alineada
- *              de `operator new`, la unica que llega aqui --.
+ * @param align Alineacion pedida.  Potencia de dos.
  * @return El bloque alineado, o nullptr si no hay memoria.
  *
  * @par Hilos
@@ -327,16 +389,23 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
  */
 [[gnu::always_inline]] inline void *host_alloc_aligned(size_t n,
                                                        size_t align) noexcept {
-    /* Sin comprobar que `align` llegue a 8: quien llama es la sobrecarga
-     * alineada de `operator new`, y el lenguaje solo la usa cuando la
-     * alineacion pasa de la natural, o sea 16.  Una rama que nunca se toma en
-     * el camino de reserva no se pone "por si acaso". */
-    const size_t extra = align - 1u + sizeof(void *);
-    if (__builtin_expect(n > (size_t)-1 - extra, 0)) return nullptr;
-    void *raw = host_alloc(n + extra);
+    /* El paso no baja de la alineacion natural del asignador.  Por debajo de
+     * 16, la distancia hasta el destino podria quedarse en menos de los 8 bytes
+     * que necesita la cabecera y se escribiria ANTES del bloque.  Antes esto no
+     * hacia falta y habia una nota diciendo que no se ponia "por si acaso"; con
+     * el relleno justo si hace falta, y ademas esta funcion es publica: dar por
+     * hecho que solo la llama `operator new` es dar por hecho algo que el
+     * compilador no puede comprobar.  Es un `cmov`, y en un camino que solo
+     * pisan los tipos sobre-alineados. */
+    const size_t step = align < kAlign ? kAlign : align;
+    if (__builtin_expect(n > (size_t)-1 - step, 0)) return nullptr;
+    void *raw = host_alloc(n + step);
     if (__builtin_expect(raw == nullptr, 0)) return nullptr;
-    const uintptr_t base = (uintptr_t)raw + sizeof(void *);
-    const uintptr_t aligned = (base + (align - 1u)) & ~(uintptr_t)(align - 1u);
+    /* `+ step` antes de truncar es lo que fuerza a subir SIEMPRE al menos una
+     * posicion: si `raw` ya estuviera alineado, quedarse donde esta no dejaria
+     * sitio para la cabecera. */
+    const uintptr_t aligned =
+        ((uintptr_t)raw + step) & ~(uintptr_t)(align - 1u);
     ((void **)aligned)[-1] = raw; // el original, para poder soltarlo
     return (void *)aligned;
 }
@@ -357,6 +426,14 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
 [[gnu::always_inline]] inline void host_free(void *p) noexcept {
     if (p == nullptr) return;
     if (!in_region(p)) {
+        /* Aqui no llega NUNCA un bloque pequeno, y por eso la region de las
+         * clases grandes se pregunta justo aqui y no antes: el camino que si es
+         * caliente sigue siendo el mismo que antes de que existiera, sin una
+         * comparacion de mas.  Comprobado desensamblando. */
+        if (in_big_region(p)) {
+            detail::host_free_big(p);
+            return;
+        }
         std::free(p);
         return;
     }
@@ -513,6 +590,18 @@ class SingleOwnerAllocator {
      * un fallo del programa que lo usa.
      */
     SingleOwnerAllocator() noexcept;
+
+    /**
+     * @brief Devuelve el identificador al reparto.
+     *
+     * Lo que quedara dentro NO se libera: son bloques validos de trozos que
+     * siguen siendo nuestros, y quien tome el identificador despues los hereda.
+     * Sin esto, cada almacen propio que se creara y se destruyera se llevaba un
+     * identificador para siempre -- el mismo defecto que tenian los hilos --, y
+     * al agotarse los 63 todo el proceso pasa a servirse por las listas
+     * compartidas, detras del unico cerrojo.
+     */
+    ~SingleOwnerAllocator() noexcept;
 
     SingleOwnerAllocator(const SingleOwnerAllocator &) = delete;
     SingleOwnerAllocator &operator=(const SingleOwnerAllocator &) = delete;

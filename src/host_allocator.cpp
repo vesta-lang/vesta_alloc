@@ -44,6 +44,11 @@ namespace detail {
 
 std::atomic<uintptr_t> g_region_base{0};
 std::atomic<uintptr_t> g_region_end{0};
+
+/* La region de las clases GRANDES.  A cero mientras nadie pida una: quien no
+ * reserve nunca 2 KiB o mas no paga ni el apalabrado.  Ver `kBigChunkBytes`. */
+std::atomic<uintptr_t> g_big_base{0};
+std::atomic<uintptr_t> g_big_end{0};
 uint8_t g_class_of[(kMaxSmall / kAlign) + 1];
 
 /// La ranura por hilo con el puntero al cache.  Global normal, no de hilo: lo
@@ -89,7 +94,6 @@ constexpr uint32_t kSizeBuckets =
 // =========================================================================
 
 ThreadCache g_caches[kMaxThreads];
-std::atomic<uint32_t> g_next_id{0};
 
 /**
  * @brief El ultimo cache es COMPARTIDO, no de un hilo.
@@ -124,8 +128,28 @@ struct SharedLock {
  * un `compare_exchange` -- sin bloquear a nadie -- y el dueno se lleva la pila
  * ENTERA de un golpe cuando se queda sin bloques.  Es lo que hace que liberar
  * entre hilos no cueste ni fugue.
+ *
+ * UNA LINEA DE CACHE ENTERA POR DUENO, y esto es lo unico de aqui que hay que
+ * respetar al tocarlo.  Era un array de dos dimensiones a secas, y con 36
+ * clases la fila de un dueno medía 288 bytes -- CUATRO LINEAS Y MEDIA --, asi
+ * que la mitad de los duenos compartia linea con el siguiente.
+ *
+ * Y esta es justo la estructura que escriben OTROS hilos: cada liberacion ajena
+ * es un `compare_exchange` aqui.  Dos hilos soltando bloques de duenos
+ * distintos que cayeran en la misma linea se peleaban por ella sin tener nada
+ * que ver el uno con el otro.  La firma en VTune es inconfundible y estaba
+ * puesta: `Machine Clears` 3,6% de las ranuras de cauce con `L3 Bound` al 16,3%
+ * y `DRAM Bound` al 5,3% -- lineas rebotando entre nucleos, que acaban en L3 y
+ * no en memoria.
+ *
+ * `alignas(64)` en la fila hace dos cosas a la vez: la empieza en linea y
+ * redondea su tamano a 320, de modo que la siguiente tambien empieza en linea.
+ * Cuesta 2 KiB en todo el proceso.
  */
-std::atomic<void *> g_remote[kMaxThreads][kClasses];
+struct alignas(64) RemoteLists {
+    std::atomic<void *> head[kClasses];
+};
+RemoteLists g_remote[kMaxThreads];
 
 std::atomic<size_t> g_chunk_next{0};
 
@@ -152,6 +176,10 @@ std::atomic<uint64_t> g_spans_dropped{0};
 std::atomic<uint64_t> g_corrupt_frees{0};
 /// 0 sin tocar, 1 montandose, 2 lista, 3 no se pudo.
 std::atomic<int> g_region_state{0};
+/// Lo mismo para la region grande, que se monta aparte y mas tarde.
+std::atomic<int> g_big_state{0};
+/// Siguiente trozo grande libre, en unidades de `kBigChunkBytes`.
+std::atomic<size_t> g_big_next{0};
 
 /// 0 sin mirar, 1 activo, 2 apagado por entorno.
 std::atomic<int> g_active_state{0};
@@ -271,6 +299,67 @@ bool ensure_region() noexcept {
 }
 
 /**
+ * @brief Apalabra la region de las clases GRANDES, la primera vez que hace
+ *        falta.
+ *
+ * Aparte de la pequena, y no por simetria: la mascara que localiza la cabecera
+ * de un puntero depende del tamano de trozo, asi que dos tamanos de trozo
+ * necesitan dos rangos.  Mezclados, el camino de liberar tendria que averiguar
+ * de cual es antes de enmascarar y eso lo pagarian tambien las reservas
+ * pequenas, que son el 81%.
+ *
+ * Y PEREZOSA: un programa que nunca reserve 2 KiB o mas no llega aqui, asi que
+ * no paga ni las direcciones.  Montarla al arrancar seria cobrarle a todos por
+ * algo que usa el 0,9% de las reservas.
+ */
+bool ensure_big_region() noexcept {
+    int s = g_big_state.load(std::memory_order_acquire);
+    if (s == 2) return true;
+    if (s == 3) return false;
+    int expected = 0;
+    if (!g_big_state.compare_exchange_strong(expected, 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+        while ((s = g_big_state.load(std::memory_order_acquire)) == 1) {
+        }
+        return s == 2;
+    }
+    size_t reserved = 0;
+    void *base =
+        os_reserve_largest(kBigRegionBytes, kBigRegionMinBytes, &reserved);
+    if (base == nullptr) {
+        /* Sin region grande NO se apaga nada: las clases grandes se siguen
+         * sirviendo del trozo pequeno como siempre, solo que desperdiciando.
+         * Degradar aqui es aceptable porque es reversible y no cambia el
+         * resultado; lo que no seria aceptable es que fuera mudo, y por eso el
+         * estado 3 se consulta al decidir. */
+        g_big_state.store(3, std::memory_order_release);
+        return false;
+    }
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    /* La base tiene que estar alineada al trozo GRANDE, que es lo que la
+     * mascara da por hecho.  Se pierde como mucho un trozo. */
+    const uintptr_t aligned =
+        (b + kBigChunkBytes - 1) & ~(uintptr_t)(kBigChunkBytes - 1);
+    detail::g_big_base.store(aligned, std::memory_order_relaxed);
+    detail::g_big_end.store(b + reserved, std::memory_order_relaxed);
+    g_big_state.store(2, std::memory_order_release);
+    return true;
+}
+
+/// Aparta @p count trozos grandes seguidos.  Cero si la region no da mas.
+uintptr_t take_big_chunks(size_t count) noexcept {
+    if (!ensure_big_region()) return 0;
+    const size_t idx = g_big_next.fetch_add(count, std::memory_order_acq_rel);
+    const uintptr_t base = detail::g_big_base.load(std::memory_order_relaxed);
+    const uintptr_t addr = base + idx * kBigChunkBytes;
+    if (addr + count * kBigChunkBytes >
+        detail::g_big_end.load(std::memory_order_relaxed))
+        return 0;
+    return addr;
+}
+
+/**
  * @brief El cache de ESTE hilo; lo da de alta la primera vez.
  *
  * Solo se llama desde los caminos LENTOS.  El rapido usa
@@ -281,24 +370,154 @@ bool ensure_region() noexcept {
  * cache, el asignador esta activo y la tabla de clases construida --: quien
  * llega hasta aqui ya paso por @c allocator_active, que es quien la construye.
  */
+/// Lo que devuelve @c take_cache_id cuando no queda ninguno.
+constexpr uint32_t kNoCacheId = 0xFFFFFFFFu;
+
+/**
+ * @brief Que identificadores estan LIBRES, un bit cada uno.
+ *
+ * UN MAPA DE BITS Y NO UN CONTADOR, y las dos razones importan:
+ *
+ *  - **Se pueden devolver.**  Un contador que solo sube no admite reciclar, y
+ *    sin reciclar el tope no cuenta hilos vivos sino hilos que hayan existido
+ *    alguna vez.  Ver @c kMaxThreads.
+ *  - **Agotado no cuesta nada.**  Repartir con `fetch_add` es un
+ *    read-modify-write: se lleva la linea a Exclusive y se la quita a los demas
+ *    nucleos.  Con el mostrador vacio eso lo hacian TODOS los hilos en CADA
+ *    reserva -- y en cada liberacion ajena, porque @c host_free_remote pide el
+ *    cache solo para sumar un contador --, moviendo esa linea entre nucleos sin
+ *    que nadie sacara nada.  Medido con VTune, 24 hilos, mostrador agotado:
+ *    `cache` 3,17 s y `host_free_remote` 2,33 s de CPU, todo ahi.  Con el mapa,
+ *    vacio es `m == 0` y se sale con una LECTURA de una linea que ya nadie
+ *    escribe -- Shared en todos los nucleos, acierto local.
+ *
+ * Cabe en una palabra porque @c kMaxThreads son 64, que es justo lo que mide.
+ * Si alguien la cambia, el @c static_assert de abajo lo dice en vez de dejar
+ * identificadores inalcanzables en silencio.
+ */
+static_assert(kMaxThreads == 64,
+              "el reparto de identificadores es un mapa de bits de UNA palabra;"
+              " con otro kMaxThreads hay que cambiar el mapa, no el tope");
+/// Todos libres menos @c kSharedCacheId, que es del cache compartido.
+std::atomic<uint64_t> g_free_ids{~(uint64_t(1) << kSharedCacheId)};
+
+/// Cuantas veces se pidio identificador y no quedaba.  Ver @c take_cache_id.
+std::atomic<uint64_t> g_no_cache_id{0};
+
+/// El bit mas bajo puesto.  Sin `<bit>`, que es de C++20 y esto es C++17.
+[[gnu::always_inline]] inline uint32_t lowest_set(uint64_t m) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return uint32_t(__builtin_ctzll(m));
+#elif defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward64(&i, m);
+    return uint32_t(i);
+#else
+    uint32_t i = 0;
+    while ((m & 1u) == 0u) {
+        m >>= 1;
+        ++i;
+    }
+    return i;
+#endif
+}
+
+/**
+ * @brief Un identificador libre, o @c kNoCacheId si no queda.
+ *
+ * EN LINEA a proposito, aunque parezca camino frio.  Lo es mientras queden
+ * identificadores -- una vez por hilo --, pero en cuanto se agotan @c cache lo
+ * llama en CADA reserva, y entonces lo unico que se ejecuta es la carga y la
+ * comparacion de arriba.  Dejarlo fuera convertiria eso en una llamada.
+ */
+[[gnu::always_inline]] inline uint32_t take_cache_id() noexcept {
+    uint64_t m = g_free_ids.load(std::memory_order_relaxed);
+    while (__builtin_expect(m != 0, 1)) {
+        /* `m & (m - 1)` apaga justo el bit mas bajo, que es el que se lleva.
+         * Si el intercambio falla, `m` se queda con lo que habia de verdad y se
+         * reintenta con otro bit; no hace falta releer. */
+        if (g_free_ids.compare_exchange_weak(m, m & (m - 1),
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed))
+            return lowest_set(m);
+    }
+    /* SE CUENTA, porque si no esta cota se cruza en silencio: quien se queda
+     * sin identificador no falla, pasa a servirse de las listas compartidas
+     * detras del unico cerrojo que hay, y desde fuera lo unico que se nota es
+     * que todo va mas lento sin ninguna razon visible.  Es la misma regla que
+     * `g_gave_up`, y por el mismo motivo. */
+    g_no_cache_id.fetch_add(1, std::memory_order_relaxed);
+    return kNoCacheId;
+}
+
+/**
+ * @brief Devuelve un identificador al reparto.
+ *
+ * Lo que queda dentro de ese cache -- listas libres, tramos guardados, y la
+ * pila de lo que otros le soltaron -- NO se toca: son bloques validos de trozos
+ * que siguen siendo nuestros, y quien tome el identificador despues los HEREDA.
+ * Tirarlos seria devolverlos al sistema uno a uno; dejarlos sin dueno era lo
+ * que se hacia antes, y es una fuga.
+ *
+ * Es una sola escritura atomica a proposito: esto corre durante el desmontaje
+ * de un hilo.  Ver `util/thread_exit.h`.
+ */
+[[gnu::cold]] void give_cache_id(uint32_t id) noexcept {
+    if (__builtin_expect(id >= kSharedCacheId, 0)) return;
+    g_free_ids.fetch_or(uint64_t(1) << id, std::memory_order_release);
+}
+
+/**
+ * @brief Lo que corre al morir un hilo que tenia cache.
+ *
+ * FRIO Y MINIMO, y lo segundo no es estilo: esto se ejecuta DURANTE el
+ * desmontaje del hilo, que es donde este proyecto ya se colgo una vez.  Una
+ * escritura de ranura y una operacion atomica; ni reservar, ni liberar, ni
+ * tomar el cerrojo, ni llamar al sistema.
+ *
+ * Se limpia la ranura ANTES de soltar el identificador.  Si no, algo que
+ * reservara despues del aviso -- un destructor estatico, otra devolucion de
+ * llamada del desmontaje -- seguiria viendo el cache por la ranura mientras
+ * otro hilo ya lo tiene: dos duenos para una sola estructura.  Limpiandola
+ * primero, ese caso pide un identificador nuevo, que es correcto.
+ */
+[[gnu::cold]] void on_thread_exit(void *value) noexcept {
+    ThreadCache *c = static_cast<ThreadCache *>(value);
+    if (c == nullptr) return;
+    g_cache_slot.set(nullptr);
+    give_cache_id(c->id);
+}
+
 ThreadCache *cache() noexcept {
     if (!g_cache_slot.ensure()) return nullptr;
     ThreadCache *c = static_cast<ThreadCache *>(g_cache_slot.get());
     if (c != nullptr) return c;
-    const uint32_t id = g_next_id.fetch_add(1, std::memory_order_acq_rel);
     /* Sin listas propias.  Devolver nulo NO significa "al sistema": significa
      * "por el camino lento", que es donde estan las listas COMPARTIDAS.  Ver
      * @c alloc_shared.
      *
-     * Y ojo con el contador: solo sube, no se recicla al morir un hilo, asi que
-     * el tope no es de hilos VIVOS sino de hilos que hayan existido alguna vez.
-     * Reciclarlos exige un aviso de fin de hilo, y la ranura rapida (`TlsAlloc`)
-     * no lo da.  Mientras tanto, pasarse cuesta un cerrojo -- no cuesta salirse
-     * del asignador, que es lo que costaba antes. */
-    if (id >= kSharedCacheId) return nullptr;
+     * Y pasarse NO cuesta "un cerrojo", que es lo que ponia aqui: cuesta que
+     * todas las reservas de todos los hilos desbordados pasen por el MISMO
+     * cerrojo de giro.  Medido con 24 hilos y el mismo binario, con la unica
+     * diferencia de 70 hilos que nacieron, reservaron una vez y murieron:
+     * 1,73 -> 447,86 ns por operacion, 259 veces mas, con 69,58 s de CPU
+     * girando dentro de `SharedLock`.  Con los identificadores reciclados ese
+     * caso deja de ser el de cualquier programa que use hilos y pasa a ser lo
+     * que dice ser: mas de 63 duenos a la vez. */
+    const uint32_t id = take_cache_id();
+    if (__builtin_expect(id == kNoCacheId, 0)) return nullptr;
     c = &g_caches[id];
     c->id = id;
     c->used = true;
+    /* Lo que hubiera dejado el dueno anterior se HEREDA -- bloques validos de
+     * trozos nuestros --, menos su etiqueta: el proposito con el que reservaba
+     * otro hilo no es el nuestro, y arrastrarla haria mentir al reparto por
+     * etiqueta desde la primera reserva. */
+    c->tag = 0;
+    /* El aviso se pide ANTES de dejar el valor: es @c set quien lo arma, asi
+     * que al reves este hilo se quedaria sin avisar y su identificador no
+     * volveria. */
+    g_cache_slot.notify_on_exit(&on_thread_exit);
     g_cache_slot.set(c);
     return c;
 }
@@ -343,7 +562,7 @@ std::atomic_flag g_span_lock = ATOMIC_FLAG_INIT;
  * a partir de ahi los tramos que se suelten devuelvan sus paginas.
  */
 /**
- * @brief Marca en `ChunkHeader::_pad` de un tramo que esta LIBRE.
+ * @brief Marca en `ChunkHeader::extra` de un tramo que esta LIBRE.
  *
  * Hace falta para poder mirar si el vecino de al lado se puede absorber, que es
  * de lo que va todo lo de abajo.
@@ -412,7 +631,7 @@ inline ChunkHeader *header_of(SpanNode *n) noexcept {
 
 /// Si @p h es un tramo nuestro que ahora mismo esta libre.
 inline bool is_free_span(const ChunkHeader *h) noexcept {
-    return h->magic == kSpanMagic && h->_pad == kSpanFree;
+    return h->magic == kSpanMagic && h->extra == kSpanFree;
 }
 
 void list_insert(ChunkHeader *h) noexcept {
@@ -422,7 +641,7 @@ void list_insert(ChunkHeader *h) noexcept {
     n->next = g_span_free[k];
     if (n->next != nullptr) n->next->prev = n;
     g_span_free[k] = n;
-    h->_pad = kSpanFree;
+    h->extra = kSpanFree;
 }
 
 void list_remove(ChunkHeader *h) noexcept {
@@ -432,7 +651,7 @@ void list_remove(ChunkHeader *h) noexcept {
     else
         g_span_free[h->cls] = n->next;
     if (n->next != nullptr) n->next->prev = n->prev;
-    h->_pad = 0;
+    h->extra = 0;
 }
 
 /// El vecino de la derecha, si esta DENTRO de lo ya repartido.  nullptr si el
@@ -577,6 +796,23 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     uintptr_t addr = 0;
     bool reused = false;
 
+    /* Lo primero, lo que este hilo tenga guardado del mismo tamano: eso NO toca
+     * el cerrojo ni las listas compartidas, que es de donde sale casi todo el
+     * coste de este camino.  Ver `kSpanCacheSlots`. */
+    if (c != nullptr && chunks <= kSpanCacheSlots &&
+        c->span_cache[chunks - 1] != nullptr) {
+        ChunkHeader *h = c->span_cache[chunks - 1];
+        c->span_cache[chunks - 1] = nullptr;
+        h->magic = kSpanMagic;
+        h->cls = chunks;
+        h->owner = c->id;
+        h->extra = 0;
+        c->stats.large_allocs++;
+        // Reusado: su memoria ya estaba comprometida y NO viene a cero.
+        return reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(h) +
+                                        sizeof(ChunkHeader));
+    }
+
     bool needs_commit = false;
     if (chunks <= kMaxSpanChunks) {
         SpanLock lk;
@@ -604,7 +840,7 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     h->magic = kSpanMagic;
     h->cls = chunks;  // en un tramo, `cls` guarda CUANTOS trozos ocupa
     h->owner = c != nullptr ? c->id : 0;
-    h->_pad = 0;
+    h->extra = 0;
     if (c != nullptr) {
         c->stats.large_allocs++;
         // Solo se apunta lo que se pide POR PRIMERA VEZ; reusar no compromete
@@ -624,6 +860,20 @@ void free_span(ChunkHeader *h) noexcept {
     ThreadCache *c = cache();
     if (c != nullptr) c->stats.large_frees++;
 
+    /* Si este hilo no tiene guardado uno de ese tamano, se lo queda: soltar y
+     * volver a pedir el mismo tamano es el patron de un bufer que se recicla, y
+     * asi no pasa por el cerrojo ni una sola vez.  Ver `kSpanCacheSlots`.
+     *
+     * Se guarda SIN marca de libre: no esta en ninguna lista, asi que nadie mas
+     * lo puede absorber ni entregar, y por eso tampoco hace falta el cerrojo
+     * para dejarlo aqui. */
+    if (c != nullptr && h->cls <= kSpanCacheSlots &&
+        c->span_cache[h->cls - 1] == nullptr) {
+        h->extra = 0;
+        c->span_cache[h->cls - 1] = h;
+        return;
+    }
+
     SpanLock lk;
     /* Se absorbe a los vecinos libres de la derecha ANTES de entrar en ninguna
      * lista.  Asi los trozos vuelven a estar juntos y sirven para lo que venga
@@ -640,7 +890,7 @@ void free_span(ChunkHeader *h) noexcept {
      * Lo retenido esta acotado por el pico de tramos libres a la vez, que es
      * memoria que el programa ya llego a tener.  Devolverla, si hace falta,
      * es cosa de una llamada explicita entre fases. */
-    h->_pad = 0;
+    h->extra = 0;
     coalesce_right(h);
 
     if (h->cls > kMaxSpanChunks) {
@@ -661,12 +911,84 @@ void free_span(ChunkHeader *h) noexcept {
 /// Recoge de un golpe lo que otros hilos soltaron de esta clase.
 void *take_remote(ThreadCache *c, uint32_t k) noexcept {
     void *head =
-        g_remote[c->id][k].exchange(nullptr, std::memory_order_acq_rel);
+        g_remote[c->id].head[k].exchange(nullptr, std::memory_order_acq_rel);
+    return head;
+}
+
+/**
+ * @brief Parte un trozo GRANDE en bloques de la clase @p k.
+ *
+ * Identico a `grow` salvo en de donde sale la memoria y en el tamano del trozo,
+ * y esa segunda diferencia es toda la ganancia: en 64 KiB una clase de 16 KiB
+ * saca TRES bloques y deja el 25% muerto; en 1 MiB saca sesenta y tres y deja
+ * el 1,56%.  El bloque no cruza ningun limite porque el trozo grande ES la
+ * unidad de mascara: no hay nada dentro que cruzar.
+ */
+void *grow_big(ThreadCache *c, uint32_t k) noexcept {
+    const size_t slot = kSizes[k];
+    const size_t total = (kBigChunkBytes - sizeof(ChunkHeader)) / slot;
+
+    /* Se sigue con el trozo que este hilo ya tenia abierto para esta clase, si
+     * le queda algo.  Estrenar uno por cada recarga desperdiciaria justo lo que
+     * el trozo grande viene a evitar. */
+    ChunkHeader *h = c->big_run[k];
+    if (h == nullptr || h->extra >= total) {
+        const uintptr_t addr = take_big_chunks(1);
+        if (addr == 0) return nullptr;
+        /* Solo la cabecera de momento: lo demas se compromete segun se
+         * entrega.  Ver mas abajo por que. */
+        if (!os_commit(reinterpret_cast<void *>(addr), sizeof(ChunkHeader)))
+            return nullptr;
+        h = reinterpret_cast<ChunkHeader *>(addr);
+        /* La MISMA marca que un trozo pequeno: lo que distingue a los dos no es
+         * la cabecera sino de que region viene el puntero, y eso ya se sabe
+         * antes de llegar a mirarla.  Con marcas distintas habria que comprobar
+         * las dos en el camino de liberar, que es justo lo que se evita. */
+        h->magic = kChunkMagic;
+        h->cls = k;
+        h->owner = c->id;
+        h->extra = 0; // cuantos bloques van entregados de este trozo
+        c->big_run[k] = h;
+        c->stats.chunks++;
+    }
+
+    /* SE ENCADENA POR TANDAS, no el trozo entero.  Encadenar escribe un puntero
+     * dentro de CADA bloque, asi que encadenar 1 MiB lo toca entero y lo
+     * compromete entero: medido, una sola reserva de 16 KiB dejaba 759 KiB
+     * residentes, doce veces lo que costaba antes.  Con una tanda del tamano de
+     * un trozo pequeno se compromete lo mismo que antes y el desperdicio del
+     * final se sigue repartiendo entre todo el trozo grande, que es para lo que
+     * el trozo es grande. */
+    const size_t per_batch = kChunkBytes / slot > 0 ? kChunkBytes / slot : 1;
+    const size_t done = h->extra;
+    size_t take = total - done;
+    if (take > per_batch) take = per_batch;
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(h) + sizeof(ChunkHeader);
+    const uintptr_t first = base + done * slot;
+    if (!os_commit(reinterpret_cast<void *>(first), take * slot))
+        return nullptr;
+
+    // Al reves, para que el primero que se entregue sea el de menor direccion.
+    void *head = nullptr;
+    for (size_t i = take; i-- > 0;) {
+        void *b = reinterpret_cast<void *>(first + i * slot);
+        *reinterpret_cast<void **>(b) = head;
+        head = b;
+    }
+    h->extra = uint32_t(done + take);
+    c->stats.bytes_reserved += take * slot;
     return head;
 }
 
 /// Pide un trozo nuevo y lo parte en bloques de la clase @p k.
 void *grow(ThreadCache *c, uint32_t k) noexcept {
+    /* Las clases grandes salen de su propia region.  Si esa no se pudo montar,
+     * se sigue por el camino de siempre: se desperdicia, pero funciona. */
+    if (kSizes[k] >= kBigClassMin) {
+        void *p = grow_big(c, k);
+        if (p != nullptr) return p;
+    }
     if (!ensure_region()) return nullptr;
     const size_t idx = g_chunk_next.fetch_add(1, std::memory_order_acq_rel);
     const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
@@ -678,7 +1000,7 @@ void *grow(ThreadCache *c, uint32_t k) noexcept {
     h->magic = kChunkMagic;
     h->cls = k;
     h->owner = c->id;
-    h->_pad = 0;
+    h->extra = 0;
 
     const size_t slot = kSizes[k];
     const size_t count = (kChunkBytes - sizeof(ChunkHeader)) / slot;
@@ -816,9 +1138,26 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept {
                      p, (void *)h, h->magic, kChunkMagic, kSpanMagic);
 }
 
+void host_free_big(void *p) noexcept {
+    /* La misma decision que el camino pequeno, con la otra mascara.  Esta
+     * FUERA de linea a proposito: son el 0,9% de las liberaciones, y meterlo en
+     * la cabecera engordaria el camino que si es caliente. */
+    ChunkHeader *h = big_chunk_of(p);
+    if (h->magic != kChunkMagic) {
+        host_free_not_small(p, h);
+        return;
+    }
+    ThreadCache *c = current_cache();
+    if (c != nullptr && h->owner == c->id) {
+        push_block(c, p, h->cls);
+        return;
+    }
+    host_free_remote(p, h);
+}
+
 void host_free_remote(void *p, ChunkHeader *h) noexcept {
     // De otro hilo: a su pila, sin bloquear a nadie.
-    std::atomic<void *> &head = g_remote[h->owner][h->cls];
+    std::atomic<void *> &head = g_remote[h->owner].head[h->cls];
     void *old = head.load(std::memory_order_relaxed);
     do {
         *reinterpret_cast<void **>(p) = old;
@@ -855,6 +1194,9 @@ HostAllocStats host_alloc_stats() {
         for (uint32_t b = 0; b < kSizeBuckets; ++b)
             t.size_hist[b] += s.size_hist[b];
     }
+    /* Esta no se lleva por hilo -- quien la incrementa es justamente el que NO
+     * consiguio hilo --, asi que sale del contador global. */
+    t.no_owner_id = g_no_cache_id.load(std::memory_order_relaxed);
     return t;
 }
 
@@ -868,12 +1210,17 @@ bool host_alloc_active() {
  * las estadisticas lo tratan como a cualquier otro. */
 SingleOwnerAllocator::SingleOwnerAllocator() noexcept : cache_(nullptr) {
     if (!allocator_active()) return;
-    const uint32_t id = g_next_id.fetch_add(1, std::memory_order_acq_rel);
-    if (id >= kSharedCacheId) return; // sin almacen: se ira por el general
+    const uint32_t id = take_cache_id();
+    if (id == kNoCacheId) return; // sin almacen: se ira por el general
     ThreadCache *c = &g_caches[id];
     c->id = id;
     c->used = true;
+    c->tag = 0; // la etiqueta del dueno anterior no es la nuestra
     cache_ = c;
+}
+
+SingleOwnerAllocator::~SingleOwnerAllocator() noexcept {
+    if (cache_ != nullptr) give_cache_id(cache_->id);
 }
 
 HostAllocStats SingleOwnerAllocator::stats() const noexcept {
@@ -888,7 +1235,13 @@ HostAllocStats SingleOwnerAllocator::stats() const noexcept {
 }
 
 size_t host_usable_size(const void *p) noexcept {
-    if (p == nullptr || !in_region(p)) return 0;
+    if (p == nullptr) return 0;
+    if (!in_region(p)) {
+        // De la region grande: misma cuenta, otra mascara.
+        if (!in_big_region(p)) return 0;
+        const ChunkHeader *bh = big_chunk_of(const_cast<void *>(p));
+        return bh->magic == kChunkMagic ? kSizes[bh->cls] : 0;
+    }
     const ChunkHeader *h = chunk_of(const_cast<void *>(p));
     if (h->magic == kChunkMagic) return kSizes[h->cls];
     if (h->magic == kSpanMagic)
@@ -903,6 +1256,18 @@ void *host_realloc(void *p, size_t n) noexcept {
         return nullptr;
     }
     if (!in_region(p)) {
+        if (in_big_region(p)) {
+            /* De la region grande.  No se estira en su sitio -- son bloques de
+             * clase, no tramos --, asi que se copia y se suelta, que es lo que
+             * hace el camino general un poco mas abajo. */
+            const size_t old_big = host_usable_size(p);
+            if (old_big >= n) return p;
+            void *q = host_alloc(n);
+            if (q == nullptr) return nullptr;
+            vesta_memcpy(q, p, old_big < n ? old_big : n);
+            host_free(p);
+            return q;
+        }
         /* No es nuestro: vino del sistema y tiene que volver al sistema.
          * Mezclar los dos asignadores seria pasarle a `free` un puntero que no
          * reconoce. */
@@ -1009,6 +1374,15 @@ StatsDump::~StatsDump() {
                      "short, these were NOT served here",
                      (unsigned long long)gave_up);
     std::fprintf(stderr, "\n");
+    /* Y la otra cota que degradaba callando: quedarse sin identificador manda
+     * a ese hilo a las listas compartidas, detras del unico cerrojo. */
+    const uint64_t no_id = g_no_cache_id.load(std::memory_order_relaxed);
+    if (no_id != 0)
+        std::fprintf(stderr,
+                     "[allocator] OUT OF OWNER IDS %llu times  <- more than "
+                     "%u live owners; those threads were served from the "
+                     "SHARED lists, behind the lock\n",
+                     (unsigned long long)no_id, kMaxThreads - 1);
     /* Reparto por PROPOSITO.  Es la cifra que dice cuanto queda por migrar: lo
      * que sale como "no se" es exactamente lo que todavia no declara nada.  Se
      * imprime siempre que haya reservas, no solo lo que no sea cero, para que

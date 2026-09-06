@@ -239,6 +239,41 @@ int main() {
         check(arr_ok, "`new[]` de un tipo sobre-alineado tambien la respeta");
     }
 
+    /* Los identificadores de cache se DEVUELVEN al morir el hilo.
+     *
+     * Es lo unico que separa "el tope son 63 duenos a la vez" de "el tope son
+     * 63 hilos en toda la vida del proceso".  Sin devolverlos, un programa que
+     * crea y destruye hilos -- o sea, cualquiera -- agota el mostrador y a
+     * partir de ahi TODAS las reservas de TODOS los hilos se sirven de las
+     * listas compartidas, detras del unico cerrojo del asignador.  Medido con
+     * 24 hilos y el mismo binario: 1,73 -> 447,86 ns por operacion.
+     *
+     * Se comprueba por ESTRUCTURA y no por tiempo: despues de crear y destruir
+     * muchas mas veces el tope, un hilo nuevo tiene que seguir teniendo cache
+     * propio.  Un test de tiempo aqui seria un test que a veces pasa. */
+    if (util::host_alloc_active()) {
+        constexpr unsigned kVueltas = util::kMaxThreads * 3;
+        for (unsigned i = 0; i < kVueltas; ++i)
+            std::thread([] { util::host_free(util::host_alloc(64)); }).join();
+
+        std::atomic<bool> propio{false};
+        /* Arranca en un valor IMPOSIBLE.  Con cero, un hilo que se quedara sin
+         * cache dejaria el cero puesto y la comprobacion de abajo pasaria por
+         * no haber medido nada -- que es peor que fallar. */
+        std::atomic<unsigned> id{util::kMaxThreads};
+        std::thread([&propio, &id] {
+            util::host_free(util::host_alloc(64));
+            const util::detail::ThreadCache *c = util::detail::current_cache();
+            propio.store(c != nullptr, std::memory_order_relaxed);
+            if (c != nullptr) id.store(c->id, std::memory_order_relaxed);
+        }).join();
+
+        check(propio.load(),
+              "tras crear y destruir 192 hilos, uno nuevo sigue teniendo cache");
+        check(id.load() < util::kMaxThreads - 1,
+              "y su identificador es de los suyos, no el del cache compartido");
+    }
+
     const util::HostAllocStats s = util::host_alloc_stats();
     std::printf(
         "  reservas=%llu  sueltas=%llu  ajenas=%llu  trozos=%llu\n",

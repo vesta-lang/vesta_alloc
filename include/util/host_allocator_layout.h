@@ -89,6 +89,33 @@ namespace util {
  * pagina de 4 KiB lo que se pide son paginas completas, y trocearlas en clases
  * dentro de un trozo solo anade desperdicio -- el sistema ya sabe entregar
  * paginas.
+ *
+ * ------------------------------------------------------------------------
+ * Y POR QUE NO 64 KiB, HABIENDO SITIO
+ * ------------------------------------------------------------------------
+ *
+ * Con la region grande (`kBigChunkBytes`) las clases de 16 a 64 KiB SI caben:
+ * 64 KiB da quince bloques en un trozo de 1 MiB, y en uno de 64 KiB no cabia ni
+ * uno.  Se probo, y **no se queda**.  Medido con `bench_vs_malloc`, igual en
+ * Windows y en Linux (aqui las cifras de Linux, ns por operacion):
+ *
+ *     caso            16 KiB    64 KiB
+ *     hot 64K           5,96      2,34     <- 2,5x mejor
+ *     burst 64K        19,61     10,36     <- 1,9x mejor
+ *     churn 64K         8,03      3,58     <- 2,2x mejor
+ *     grow to 64K      29,38     92,85     <- 3,2x PEOR, y pierde con glibc
+ *     grow to 1M       22,52    135,68     <- 6x PEOR, y pierde con glibc
+ *
+ * La razon no es el redondeo: un bloque de clase **no se puede estirar en el
+ * sitio** y un tramo si (`try_extend_span`).  Al subir el tope, cada duplicacion
+ * entre 16 y 64 KiB dejo de estirarse y paso a copiarse -- que es justo lo que
+ * hace un contenedor que crece --.  Cambiar dos victorias por dos derrotas
+ * contra el sistema no es un afinado, es una regresion.
+ *
+ * QUE HARIA FALTA para tenerlas.  Distinguir la reserva que CRECE de la que no,
+ * y mandar la que crece a un tramo aunque quepa en una clase.  Ese eje ya esta
+ * previsto -- es `AllocShape` de `util/alloc_tag.h` --, asi que es trabajo de
+ * encaminamiento y no de geometria.  Hasta entonces, 16 KiB.
  */
 inline constexpr size_t kMaxSmall = 16384;
 
@@ -187,7 +214,68 @@ inline constexpr size_t kRegionMinBytes = size_t(64) << 20; // 64 MiB
 /// Cuantos trozos caben en la region.  Lo necesita quien indexe POR trozo.
 inline constexpr size_t kMaxChunks = kRegionBytes / kChunkBytes;
 
-/// Tope de hilos con listas propias.  Al pasarse, ese hilo va al sistema.
+/**
+ * @brief El trozo de las clases GRANDES, que no es el mismo que el de las
+ *        pequenas y por eso vive en su propia region.
+ *
+ * POR QUE OTRO TAMANO.  Un trozo de 64 KiB con la cabecera delante deja
+ * `65536 - 16` bytes utiles, y eso no divide bien las potencias de dos: la
+ * clase de 16 KiB saca TRES bloques y deja 16.368 bytes muertos, un 25% del
+ * trozo, retenidos mientras viva un solo bloque.  Con 8 KiB es el 12,5% y con
+ * 4 KiB el 6,2%.  No es teorico -- lo saca `bench_vs_malloc` en su tabla de
+ * memoria --.
+ *
+ * Con un trozo de 1 MiB la misma cuenta da 63 bloques y **un 1,56%**, y ademas
+ * hace viable una clase de 64 KiB, que en un trozo de 64 KiB no cabe ni una
+ * vez.
+ *
+ * POR QUE UNA REGION APARTE Y NO EL MISMO SITIO.  Porque un puntero se resuelve
+ * ENMASCARANDO, y la mascara depende del tamano de trozo: con las dos cosas
+ * mezcladas en un rango, el camino de liberar tendria que averiguar de cual es
+ * ANTES de enmascarar, y eso lo pagarian tambien las reservas pequenas -- que
+ * son el 81% --.  Con dos rangos, la comprobacion nueva cae dentro de la rama
+ * "no es de la region pequena", a la que un bloque pequeno NUNCA llega: su
+ * camino de liberacion no cambia ni una instruccion.  Comprobado desensamblando,
+ * no supuesto.
+ *
+ * Es la misma idea que gobierna todo el asignador: una necesidad de UNA clase
+ * de reservas se resuelve especializando, no cambiando lo que usan todas.
+ */
+inline constexpr size_t kBigChunkBytes = size_t(1) << 20; // 1 MiB
+
+/**
+ * @brief Desde que tamano de clase se sirve de la region grande.
+ *
+ * Por debajo de 2 KiB el desperdicio de un trozo de 64 KiB se queda en el 3% y
+ * casi siempre por debajo del 1,5%, asi que mudarlas no compraria nada y en
+ * cambio comprometeria 1 MiB por clase y por hilo.  Desde 2 KiB el desperdicio
+ * empieza a subir y no para.
+ */
+inline constexpr size_t kBigClassMin = 2048;
+
+/// Direcciones que se apalabran para las clases grandes.  Mucho menos que la
+/// region pequena porque estas reservas son raras -- el 0,9% --, y aun asi
+/// sobrado: son 16.384 trozos de 1 MiB.
+inline constexpr size_t kBigRegionBytes = size_t(16) << 30;   // 16 GiB
+inline constexpr size_t kBigRegionMinBytes = size_t(32) << 20; // 32 MiB
+
+/**
+ * @brief Tope de identificadores de cache: cuantos duenos distintos puede
+ *        nombrar la cabecera de un trozo.
+ *
+ * NO es "hilos vivos".  Un hilo pide su identificador la primera vez que
+ * reserva y lo devuelve al morir (ver el reciclado en el `.cpp`), asi que lo
+ * que esto limita son los duenos SIMULTANEOS.  Antes no se devolvia y el tope
+ * era de hilos que hubieran existido alguna vez, que es otra cosa muy distinta:
+ * un programa que crea y destruye hilos lo agotaba sin tener nunca mas de un
+ * punado a la vez.
+ *
+ * PASARSE NO ES "irse al sistema", que es lo que ponia aqui.  El hilo se queda
+ * sin listas propias y pasa a servirse de las COMPARTIDAS, que estan detras del
+ * unico cerrojo del asignador; a partir de ahi todas las reservas de todos los
+ * hilos desbordados se serializan ahi.  Medido con 24 hilos, mismo binario:
+ * 1,73 ns por operacion con identificadores de sobra, 447,86 sin ellos.
+ */
 inline constexpr uint32_t kMaxThreads = 64;
 
 /// Marca de un trozo troceado en clases, el del asignador normal.
@@ -221,17 +309,69 @@ inline constexpr uint32_t kSpanMagic = 0x5350414eu; // 'SPAN'
 inline constexpr uint32_t kMaxSpanChunks = 256;
 
 /**
+ * @brief Cuantos tamanos de tramo se guarda cada hilo para si, sin cerrojo.
+ *
+ * POR QUE.  El camino de tramos toma un cerrojo global para reservar y otro
+ * para soltar, y eso es CASI TODO lo que cuesta: medido, un par
+ * reservar/soltar de 64 KiB va a 6,27 ns y solo el cerrojo son 4,75 -- el
+ * **76%** --.  Era el unico sitio del asignador donde el camino rapido
+ * sincronizaba, y tambien el unico donde perdiamos contra el sistema
+ * (`churn 64K`, 0,87x).
+ *
+ * Con un tramo guardado por hilo y por tamano, soltar y volver a pedir el mismo
+ * tamano -- que es lo que hace un bufer que se recicla -- no toca el cerrojo ni
+ * las listas compartidas.  Es lo mismo que el asignador ya hace con los
+ * bloques pequenos, aplicado donde faltaba.
+ *
+ * POR QUE SOLO DOS.  Porque un tramo guardado esta RETENIDO: no lo ve ninguna
+ * otra parte y, si el hilo muere, se pierde.  Con dos tamanos (uno y dos
+ * trozos, o sea hasta 128 KiB) el techo es de 192 KiB por hilo, y ahi caen el
+ * 90% de las reservas grandes segun el reparto medido.  Subirlo cambiaria unos
+ * nanosegundos raros por memoria retenida en todos los hilos.
+ */
+inline constexpr uint32_t kSpanCacheSlots = 2;
+
+/**
  * @brief Cabecera al principio de cada trozo.
  *
  * Ocupa una alineacion completa para que los bloques que van detras sigan
  * alineados a 16.  De aqui sale, con solo enmascarar el puntero, TODO lo que
  * hace falta para liberar: de que tamano es y de quien es.
+ *
+ * NO SE MUEVE PARA ABARATAR LA SOBRE-ALINEACION, y conviene saber por que
+ * porque la idea se le ocurre a cualquiera que llegue hasta aqui.  Como los
+ * bloques empiezan en `trozo + 16` y el trozo esta alineado a 64 KiB, toda
+ * direccion de bloque es `= 16 (mod align)`: ninguna esta alineada a 32 o mas,
+ * y por eso un tipo con `alignas(64)` tiene que servirse pidiendo de mas y
+ * subiendo el puntero (ver @c util::host_alloc_aligned).  Quitar ese 16 --
+ * empezando los bloques en `trozo + clase`, o sacando la cabecera a una tabla
+ * lateral -- lo arreglaria... haciendo que TODOS los trozos de TODAS las clases
+ * paguen: la primera forma pierde `clase - 16` bytes por trozo, un 25% en las
+ * clases grandes, para abaratar a los pocos tipos sobre-alineados.
+ *
+ * La regla, que vale para mas cosas que esta: una necesidad de UNA clase de
+ * reservas se resuelve con una especializacion que el llamante elige, no
+ * cambiando la estructura que usan todas.  La pregunta que lo detecta es *quien
+ * paga esto*.  Escrito con sus numeros en D18 de `doc/PLAN_RESERVAS.md`.
  */
 struct alignas(kAlign) ChunkHeader {
     uint32_t magic;
     uint32_t cls;
     uint32_t owner;
-    uint32_t _pad;
+    /**
+     * @brief Un campo con SENTIDO, que depende de la marca.  No es relleno.
+     *
+     *   - `kSpanMagic`  -- vale `kSpanFree` si el tramo esta libre.
+     *   - `kChunkMagic` en un trozo pequeno -- cero, no se usa.
+     *   - `kChunkMagic` en un trozo GRANDE  -- cuantos bloques van entregados,
+     *     que es por donde sigue la proxima tanda; ver `grow_big`.
+     *
+     * Se llamaba `_pad` de cuando de verdad lo era.  Los tres usos no se pisan
+     * porque la marca los separa, pero el nombre viejo decia que ahi no habia
+     * nada y ya no era cierto: un campo que se lee y se escribe llamado relleno
+     * es una invitacion a que alguien lo use para otra cosa.
+     */
+    uint32_t extra;
 };
 static_assert(sizeof(ChunkHeader) == kAlign,
               "la cabecera descuadra los bloques");
@@ -259,6 +399,12 @@ namespace detail {
  */
 extern std::atomic<uintptr_t> g_region_base;
 extern std::atomic<uintptr_t> g_region_end;
+
+/// Los limites de la region de las clases GRANDES.  Ver @c kBigChunkBytes.
+/// Empiezan a cero y siguen a cero mientras nadie pida una reserva grande: la
+/// region se apalabra la primera vez que hace falta, no al arrancar.
+extern std::atomic<uintptr_t> g_big_base;
+extern std::atomic<uintptr_t> g_big_end;
 
 /**
  * @brief Tabla de tamano pedido -> clase, en pasos de 16 bytes.
@@ -312,6 +458,32 @@ extern uint8_t g_class_of[(kMaxSmall / kAlign) + 1];
 [[gnu::always_inline]] inline ChunkHeader *chunk_of(void *p) noexcept {
     return reinterpret_cast<ChunkHeader *>(reinterpret_cast<uintptr_t>(p) &
                                            ~(uintptr_t)(kChunkBytes - 1));
+}
+
+/**
+ * @brief Si @p p sale de la region de las clases GRANDES.
+ *
+ * Se pregunta SOLO cuando @c in_region ya ha dicho que no, asi que un bloque
+ * pequeno nunca ejecuta esto: su camino de liberacion es el mismo que antes de
+ * que esta region existiera.  Con la region sin montar, base y fin valen cero y
+ * la respuesta es que no, sin caso especial.
+ */
+[[gnu::always_inline]] inline bool in_big_region(const void *p) noexcept {
+    const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return v >= detail::g_big_base.load(std::memory_order_relaxed) &&
+           v < detail::g_big_end.load(std::memory_order_relaxed);
+}
+
+/**
+ * @brief La cabecera del trozo grande al que pertenece @p p.
+ *
+ * La MISMA operacion que @c chunk_of con otra constante, que es justo lo que
+ * hace falta para que las dos clases de trozo convivan sin que ninguna pague
+ * por la otra.  Solo vale si @c in_big_region.
+ */
+[[gnu::always_inline]] inline ChunkHeader *big_chunk_of(void *p) noexcept {
+    return reinterpret_cast<ChunkHeader *>(reinterpret_cast<uintptr_t>(p) &
+                                           ~(uintptr_t)(kBigChunkBytes - 1));
 }
 
 /**

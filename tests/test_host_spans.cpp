@@ -63,11 +63,17 @@ int main() {
         return 0;
     }
 
-    // Tamanos repartidos por toda la cola medida: desde justo por encima del
-    // tope de las clases hasta varios megas.
-    const size_t sizes[] = {2049,    3000,     8192,    40000,
-                            65536,   100000,   500000,  1u << 20,
-                            4u << 20};
+    /* Tamanos repartidos por toda la cola medida: desde justo por encima del
+     * tope de las clases hasta varios megas.
+     *
+     * SE DERIVAN DE `kMaxSmall`, no se escriben.  Estaban escritos, y al subir
+     * el tope de las clases la mitad dejaron de ser grandes sin que el test lo
+     * supiera: seguia comprobando el camino de TRAMOS con reservas que ya no
+     * pasaban por ahi.  Un test que lleva dentro una constante del codigo que
+     * prueba deja de probarlo en cuanto esa constante cambia, y no avisa. */
+    const size_t big = util::kMaxSmall + 1;
+    const size_t sizes[] = {big,      big + 951,  big * 2,  big * 3,
+                            100000,   500000,     1u << 20, 4u << 20};
     const int kN = int(sizeof(sizes) / sizeof(sizes[0]));
 
     // 1. Se sirven, estan alineadas, y son escribibles ENTERAS.
@@ -108,7 +114,8 @@ int main() {
     {
         const util::HostAllocStats before = util::host_alloc_stats();
         for (int vuelta = 0; vuelta < 200; ++vuelta) {
-            void *a = util::host_alloc(40000);
+            // Las dos POR ENCIMA del tope de las clases; ver la nota de arriba.
+            void *a = util::host_alloc(util::kMaxSmall + 1);
             void *b = util::host_alloc(300000);
             util::host_free(a);
             util::host_free(b);
@@ -123,6 +130,35 @@ int main() {
               "las 400 grandes se contaron como tales");
         check(after.large_frees - before.large_frees == 400,
               "y las 400 devoluciones tambien");
+    }
+
+    // 2b. El tramo pequeno vuelve a ESTE hilo sin pasar por el cerrojo.
+    //
+    // Se comprueba por la DIRECCION: si soltar y volver a pedir el mismo tamano
+    // devuelve el mismo bloque, es que salio de la reserva del propio hilo.  Si
+    // hubiera ido a las listas compartidas podria volver otro, y sobre todo
+    // habria pasado por el cerrojo -- que es el 76% de lo que costaba este
+    // camino, y la razon de que exista `kSpanCacheSlots`.
+    {
+        const size_t n = util::kMaxSmall + 1; // un solo trozo de tramo
+        bool mismo = true;
+        void *primero = util::host_alloc(n);
+        for (int i = 0; i < 50; ++i) {
+            util::host_free(primero);
+            void *otra = util::host_alloc(n);
+            if (otra != primero) mismo = false;
+            primero = otra;
+        }
+        util::host_free(primero);
+        check(mismo, "un tramo pequeno vuelve al hilo que lo solto, sin cerrojo");
+
+        /* Y un tamano por encima de lo que se guarda tiene que seguir yendo por
+         * el camino compartido: guardarlo todo retendria memoria en cada hilo.
+         * Aqui no se exige que la direccion coincida, solo que siga sirviendo. */
+        void *grande = util::host_alloc(size_t(util::kSpanCacheSlots + 2) *
+                                        util::kChunkBytes);
+        check(grande != nullptr, "y uno mayor sigue sirviendose por el comun");
+        util::host_free(grande);
     }
 
     // 3. No se cae al sistema.  Es lo que distingue "funciona" de "sigue
