@@ -214,14 +214,28 @@ endif()
 #  Pruebas.  Cada `.cpp` es un binario suelto que sale con 0 o con 1, que es la
 #  convencion del proyecto de donde sale esto.
 # -----------------------------------------------------------------------------
+#
+# Los ejecutables se agrupan en una carpeta del IDE (`FOLDER`) para que, metidos
+# en un proyecto grande, no se pierdan entre los suyos.
+#
+# `enable_testing()` y `add_test` SOLO en modo suelto: el proyecto que nos
+# incluye puede no usar ctest -- VestaVM no lo usa, cada prueba es un binario
+# que sale con 0 o con 1 --, y registrar ahi pruebas ajenas ensuciaria su
+# tanda.  Los binarios existen igual y se pueden lanzar desde el IDE.
 if(VESTA_ALLOC_BUILD_TESTS)
-    enable_testing()
+    if(VESTA_ALLOC_STANDALONE)
+        enable_testing()
+    endif()
     foreach(_t IN ITEMS test_host_allocator test_host_spans test_alloc_tag
                         test_thread_slot test_scratch_arena)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)
-        add_test(NAME vesta_alloc_${_t} COMMAND vesta_alloc_${_t})
+        set_target_properties(vesta_alloc_${_t} PROPERTIES
+                FOLDER "vesta_alloc/tests")
+        if(VESTA_ALLOC_STANDALONE)
+            add_test(NAME vesta_alloc_${_t} COMMAND vesta_alloc_${_t})
+        endif()
     endforeach()
 endif()
 
@@ -232,9 +246,11 @@ endif()
 # -----------------------------------------------------------------------------
 if(VESTA_ALLOC_BUILD_EXAMPLES)
     foreach(_e IN ITEMS basic_usage purpose_tags phase_arena)
-        add_executable(vesta_alloc_ejemplo_${_e} examples/${_e}.cpp
+        add_executable(vesta_alloc_example_${_e} examples/${_e}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
-        target_link_libraries(vesta_alloc_ejemplo_${_e} PRIVATE vesta_alloc)
+        target_link_libraries(vesta_alloc_example_${_e} PRIVATE vesta_alloc)
+        set_target_properties(vesta_alloc_example_${_e} PROPERTIES
+                FOLDER "vesta_alloc/examples")
     endforeach()
 
     # Los de C se compilan COMO C, y eso no es un detalle de presentacion: es
@@ -243,19 +259,29 @@ if(VESTA_ALLOC_BUILD_EXAMPLES)
     # defecto, un namespace -- y nadie se enteraria hasta que un usuario en C
     # intentara incluirla.
     #
-    # Y hay que forzar el enlazador de C++: el ejecutable solo tiene fuentes en
-    # C, asi que CMake elegiria el de C y faltaria la biblioteca estandar de
-    # C++.  Es la misma trampa que se encuentra cualquiera que use esto desde
-    # un proyecto en C; esta escrito en el README.
-    foreach(_e IN ITEMS c_basic c_library_hook)
-        add_executable(vesta_alloc_ejemplo_${_e} examples/${_e}.c
-                $<TARGET_OBJECTS:vesta_alloc>)
-        target_link_libraries(vesta_alloc_ejemplo_${_e} PRIVATE vesta_alloc)
-        set_target_properties(vesta_alloc_ejemplo_${_e} PROPERTIES
-                LINKER_LANGUAGE CXX
-                C_STANDARD 99
-                C_STANDARD_REQUIRED ON)
-    endforeach()
+    # Hace falta que el proyecto tenga el lenguaje C habilitado.  Si no lo
+    # tiene, se SALTAN y se DICE, en vez de fallar con un error del generador
+    # que no explica nada.
+    get_property(_va_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+    if("C" IN_LIST _va_langs)
+        # Y hay que forzar el enlazador de C++: el ejecutable solo tiene
+        # fuentes en C, asi que CMake elegiria el de C y faltaria la biblioteca
+        # estandar de C++.  Es la misma trampa que se encuentra cualquiera que
+        # use esto desde un proyecto en C; esta escrito en el README.
+        foreach(_e IN ITEMS c_basic c_library_hook)
+            add_executable(vesta_alloc_example_${_e} examples/${_e}.c
+                    $<TARGET_OBJECTS:vesta_alloc>)
+            target_link_libraries(vesta_alloc_example_${_e} PRIVATE vesta_alloc)
+            set_target_properties(vesta_alloc_example_${_e} PROPERTIES
+                    LINKER_LANGUAGE CXX
+                    C_STANDARD 99
+                    C_STANDARD_REQUIRED ON
+                    FOLDER "vesta_alloc/examples")
+        endforeach()
+    else()
+        message(STATUS "[vesta_alloc] sin lenguaje C habilitado: los ejemplos "
+                "en C no se compilan (anadir C a project(... LANGUAGES ...))")
+    endif()
 endif()
 
 # -----------------------------------------------------------------------------
@@ -267,6 +293,8 @@ if(VESTA_ALLOC_BUILD_BENCH)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)
+        set_target_properties(vesta_alloc_${_b} PROPERTIES
+                FOLDER "vesta_alloc/bench")
     endforeach()
 endif()
 
