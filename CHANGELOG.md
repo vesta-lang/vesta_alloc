@@ -81,13 +81,18 @@ compilador de VestaVM, en `src/util/` e `include/util/`.
 - La dependencia del registro de mandos del compilador.  Era un `#include` que
   no se usaba, y era lo unico que ataba esto al arbol de VestaVM.
 
-### Notas de la licencia
+### Licencia
 
-Se quitaron las dos excepciones de la licencia de VestaVM porque aqui no
-aplican: la de la salida del compilador (esto no compila nada) y la de OpenSSL
-(no se enlaza con el).  Una excepcion que no aplica no es inofensiva: invita a
-creer que ampara.  Queda pendiente decidir si se anade una excepcion de enlace,
-sin la cual la GPLv2 contagia a quien enlace.
+**MIT**, no la GPLv2 del resto de VestaVM.  Sigue siendo parte de la familia del
+compilador; lo que cambia es que este componente esta pensado para llevarselo, y
+con copyleft no se lo puede llevar casi nadie: arrastraria a la misma licencia a
+todo programa que lo enlace.  Al reves no hay friccion -- codigo MIT entra en un
+proyecto GPLv2 sin problema --, que es justo lo que hace VestaVM con esto.
+
+De paso desaparecen las dos excepciones que se arrastraban de la licencia del
+compilador y que aqui no aplicaban: la de la salida (esto no compila nada) y la
+de OpenSSL (no se enlaza con el).  Una excepcion que no aplica no es inofensiva:
+invita a creer que ampara.
 
 ---
 
@@ -162,10 +167,16 @@ compiler, under `src/util/` and `include/util/`.
 - The dependency on the compiler's environment-flag registry.  It was an unused
   `#include`, and the only thing tying this to the VestaVM tree.
 
-### License note
+### License
 
-Both exceptions from the VestaVM license were dropped because neither applies
-here: the compiler-output one (this compiles nothing) and the OpenSSL one (it
-links no OpenSSL).  An exception that does not apply is not harmless -- it
-invites the belief that it covers you.  Whether to add a linking exception, without
-which GPLv2 is viral on linking, is still open.
+**MIT**, not the GPLv2 the rest of VestaVM uses.  This is still part of the
+compiler's family; what changes is that this component is meant to be taken
+away, and under copyleft almost nobody can take it -- it would drag every
+program that links it under the same terms.  The other direction has no
+friction: MIT code goes into a GPLv2 project fine, which is exactly what VestaVM
+does with this.
+
+That also drops the two exceptions carried over from the compiler's license that
+did not apply here: the compiler-output one (this compiles nothing) and the
+OpenSSL one (it links no OpenSSL).  An exception that does not apply is not
+harmless -- it invites the belief that it covers you.

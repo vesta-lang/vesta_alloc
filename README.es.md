@@ -167,9 +167,12 @@ o enlazar con `g++`/`clang++` en vez de con `gcc`/`clang`.
 
 ## Licencia
 
-GPLv2 -- ver `LICENSE`.  **Ojo**: a diferencia de la licencia de VestaVM, aqui
-NO hay excepcion de salida del compilador (esto no compila nada) ni de OpenSSL
-(no se enlaza con el).  Y la GPLv2 contagia al enlazar, asi que si la intencion
-es que esta biblioteca se pueda reusar libremente hace falta anadir de forma
-explicita una excepcion de enlace o pasar a LGPL.  Esta escrito en `LICENSE`
-como decision pendiente, no como algo dado por supuesto.
+**MIT** -- ver `LICENSE`.  Usala, distribuyela, cambiala, vendela; solo hay que
+conservar el aviso de copyright.
+
+Forma parte de la familia de VestaVM, pero con una licencia mas permisiva que la
+del compilador, que es GPLv2.  Es deliberado: una biblioteca de proposito
+general con licencia copyleft no es reutilizable de verdad, porque arrastraria a
+la misma licencia a todo programa que la enlace.  Y en la otra direccion no hay
+friccion ninguna: codigo MIT entra en un proyecto GPLv2 sin problema, que es
+justo lo que hace VestaVM con esto.

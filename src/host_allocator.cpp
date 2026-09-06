@@ -2,7 +2,7 @@
  * VestaVM -- Maquina Virtual Distribuida
  *
  * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
- * Licencia: GPLv2 + excepcion de runtime (ver LICENSE).
+ * Licencia: MIT (ver LICENSE).  Parte de la familia de VestaVM.
  */
 
 /**
