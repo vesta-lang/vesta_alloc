@@ -114,11 +114,16 @@ else()
     set(VESTA_ALLOC_STANDALONE OFF)
 endif()
 
-# Avisar si se va a construir sin optimizar, sea cual sea el motivo.  Es legitimo
-# -- para depurar el propio asignador hace falta --, pero no puede pasar sin que
-# nadie se entere: las cifras del README no se parecen en nada a las de una
+# Avisar si se construye sin optimizar, pero SOLO cuando esto se construye
+# suelto.  Ahi el tipo de construccion es una eleccion sobre ESTA biblioteca y
+# conviene decir que las cifras del README no se parecen en nada a las de una
 # construccion sin optimizar.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+#
+# Metido en otro proyecto NO se avisa, y no por cortesia: compilar en Debug es
+# el flujo normal de desarrollo de quien nos incluye, asi que el aviso saldria
+# en cada configuracion sin que haya nada que decidir.  Un aviso que sale
+# siempre deja de leerse, y arrastra con el a los que si importan.
+if(VESTA_ALLOC_STANDALONE AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(WARNING "[vesta_alloc] construccion Debug: el asignador ira MUCHO "
             "mas lento que el del sistema.  Correcto para depurarlo; no para "
             "medirlo ni para enviarlo.")

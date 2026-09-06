@@ -71,6 +71,84 @@ void query_os_sizes() noexcept;
 } // namespace detail
 
 /**
+ * @brief Permisos de una region de memoria.
+ *
+ * Bits sueltos para poder combinarlos con `|`.  Se traducen a lo que entienda
+ * el sistema DENTRO del `.cpp`; quien llama no tiene que saber si esto acaba en
+ * un `PAGE_EXECUTE_READWRITE` o en un `PROT_READ | PROT_EXEC`, que es
+ * justamente lo que permite que esta cabecera no incluya nada del sistema.
+ */
+enum class OsProt : unsigned {
+    None = 0,
+    Read = 1u << 0,
+    Write = 1u << 1,
+    Exec = 1u << 2, ///< paginas de codigo generado (JIT)
+};
+
+constexpr OsProt operator|(OsProt a, OsProt b) {
+    return static_cast<OsProt>(static_cast<unsigned>(a) |
+                               static_cast<unsigned>(b));
+}
+constexpr bool has_prot(OsProt set, OsProt bit) {
+    return (static_cast<unsigned>(set) & static_cast<unsigned>(bit)) != 0;
+}
+
+/// Lo que se pide casi siempre: leer y escribir.
+inline constexpr OsProt kOsReadWrite = OsProt::Read | OsProt::Write;
+
+/**
+ * @brief Apalabra y ENTREGA de una vez, con los permisos pedidos.
+ * @param bytes Se redondea a paginas hacia arriba.
+ * @return La base del bloque, o nullptr si el sistema no puede.
+ *
+ * Es lo que quiere quien solo necesita un bloque y ya: apalabrar y entregar
+ * por separado solo compensa cuando se va a entregar POR PARTES.
+ *
+ * @par Hilos
+ * Segura desde cualquier hilo.
+ *
+ * @code
+ *   // Una pagina de codigo generado.
+ *   void *code = util::os_alloc(4096, util::OsProt::Read |
+ *                                     util::OsProt::Write |
+ *                                     util::OsProt::Exec);
+ *   if (code == nullptr) return false;
+ *   ...
+ *   util::os_free(code, 4096);
+ * @endcode
+ */
+void *os_alloc(size_t bytes, OsProt prot) noexcept;
+
+/**
+ * @brief Suelta un bloque de @c os_alloc.
+ * @param bytes El mismo tamano que se pidio, antes de redondear.
+ *
+ * @par Hilos
+ * Segura.
+ */
+void os_free(void *addr, size_t bytes) noexcept;
+
+/**
+ * @brief Cambia los permisos de un tramo ya entregado.
+ * @return false si el sistema no lo permite.
+ *
+ * Lo usa quien escribe codigo y luego quiere ejecutarlo: se entrega con
+ * escritura, se rellena, y se pasa a ejecucion.  Tener las dos cosas a la vez
+ * funciona, pero deja paginas escribibles Y ejecutables, que es lo que ningun
+ * sistema operativo moderno quiere ver.
+ *
+ * @par Hilos
+ * Segura mientras los tramos no se solapen.
+ *
+ * @code
+ *   std::memcpy(code, bytes, n);                       // escribir
+ *   util::os_protect(code, n, util::OsProt::Read |
+ *                             util::OsProt::Exec);     // y ya solo ejecutar
+ * @endcode
+ */
+bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept;
+
+/**
  * @brief Apalabra @p bytes de DIRECCIONES sin gastar memoria.
  * @return La base del rango, o nullptr si el sistema no puede.
  *
@@ -115,7 +193,7 @@ void *os_reserve(size_t bytes) noexcept;
  *   usados += 64 * 1024;
  * @endcode
  */
-bool os_commit(void *addr, size_t bytes) noexcept;
+bool os_commit(void *addr, size_t bytes, OsProt prot = kOsReadWrite) noexcept;
 
 /**
  * @brief Devuelve la memoria de un tramo al sistema, CONSERVANDO su direccion.

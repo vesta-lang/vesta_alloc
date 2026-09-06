@@ -82,6 +82,13 @@ inline size_t round_up(size_t n, size_t a) noexcept {
     return (n + a - 1) & ~(a - 1);
 }
 
+/// Los tres bits de permisos como indice.  El enmascarado sobra si el valor
+/// viene de @c OsProt, pero cuesta cero y evita salirse de la tabla si alguien
+/// convierte un entero cualquiera.
+constexpr unsigned prot_index(OsProt p) noexcept {
+    return static_cast<unsigned>(p) & 7u;
+}
+
 } // namespace
 
 /* `os_page_size` y `os_reserve_granularity` estan EN LINEA en la cabecera: son
@@ -91,6 +98,36 @@ inline size_t round_up(size_t n, size_t a) noexcept {
 
 #if defined(_WIN32)
 
+/**
+ * @brief Traduce nuestros permisos a la constante del sistema.
+ *
+ * Los permisos son TRES BITS, asi que la traduccion es una TABLA: ocho
+ * combinaciones y ni una rama.  Y siendo `constexpr`, en los sitios donde los
+ * permisos son una constante escrita a mano -- que son casi todos, porque nadie
+ * calcula si quiere ejecucion -- el compilador resuelve el indexado y lo que
+ * queda es el numero.
+ *
+ * Vive AQUI y no en la cabecera a proposito: es lo unico que necesita las
+ * constantes `PAGE_*`, y tenerlo dentro es lo que permite que la cabecera no
+ * incluya `windows.h`.  Esa cabecera define `VOID` como macro y rompe cualquier
+ * `enum class` que use ese nombre; ya obligo a aislar dos ficheros del proyecto.
+ *
+ * Dos casillas repetidas no son un descuido: Windows no tiene proteccion de
+ * SOLO escritura ni de escritura MAS ejecucion sin lectura, asi que las dos
+ * suben a la variante con lectura.  Es lo unico que se puede hacer, y esta
+ * anotado para que no parezca un error de copia.
+ */
+constexpr DWORD kWinProt[8] = {
+    PAGE_NOACCESS,          // 000  ---
+    PAGE_READONLY,          // 001  R
+    PAGE_READWRITE,         // 010  -W-   -> no existe solo escritura
+    PAGE_READWRITE,         // 011  RW
+    PAGE_EXECUTE,           // 100  --X
+    PAGE_EXECUTE_READ,      // 101  R-X
+    PAGE_EXECUTE_READWRITE, // 110  -WX   -> no existe sin lectura
+    PAGE_EXECUTE_READWRITE, // 111  RWX
+};
+
 void *os_reserve(size_t bytes) noexcept {
     if (bytes == 0) return nullptr;
     /* `PAGE_READWRITE` en una reserva no entrega nada: es el permiso que
@@ -99,9 +136,29 @@ void *os_reserve(size_t bytes) noexcept {
     return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);
 }
 
-bool os_commit(void *addr, size_t bytes) noexcept {
+bool os_commit(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    return VirtualAlloc(addr, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    return VirtualAlloc(addr, bytes, MEM_COMMIT,
+                        kWinProt[prot_index(prot)]) != nullptr;
+}
+
+void *os_alloc(size_t bytes, OsProt prot) noexcept {
+    if (bytes == 0) return nullptr;
+    return VirtualAlloc(nullptr, round_up(bytes, os_page_size()),
+                        MEM_COMMIT | MEM_RESERVE,
+                        kWinProt[prot_index(prot)]);
+}
+
+void os_free(void *addr, size_t bytes) noexcept {
+    (void)bytes; // con MEM_RELEASE hay que pasar cero; el tamano no se usa
+    if (addr != nullptr) VirtualFree(addr, 0, MEM_RELEASE);
+}
+
+bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept {
+    if (addr == nullptr || bytes == 0) return false;
+    DWORD previous = 0;
+    return VirtualProtect(addr, round_up(bytes, os_page_size()),
+                          kWinProt[prot_index(prot)], &previous) != 0;
 }
 
 bool os_decommit(void *addr, size_t bytes) noexcept {
@@ -149,6 +206,25 @@ OsSystemMemory os_system_memory() noexcept {
 
 #else // ---------------------------------------------------------------- POSIX
 
+/**
+ * @brief La misma tabla que en Windows, con las constantes de aqui.
+ *
+ * Aqui el mapeo si es un OR de bits directo, asi que la tabla no ahorra ramas
+ * -- no las habia --, pero se mantiene por dos motivos: que las dos ramas del
+ * fichero se lean igual, y que el compilador pliegue el resultado cuando los
+ * permisos son constantes, que es lo que pasa en casi todos los sitios.
+ */
+constexpr int kPosixProt[8] = {
+    PROT_NONE,                            // 000  ---
+    PROT_READ,                            // 001  R
+    PROT_WRITE,                           // 010  -W-
+    PROT_READ | PROT_WRITE,               // 011  RW
+    PROT_EXEC,                            // 100  --X
+    PROT_READ | PROT_EXEC,                // 101  R-X
+    PROT_WRITE | PROT_EXEC,               // 110  -WX
+    PROT_READ | PROT_WRITE | PROT_EXEC,   // 111  RWX
+};
+
 void *os_reserve(size_t bytes) noexcept {
     if (bytes == 0) return nullptr;
     /* `PROT_NONE` mas `MAP_NORESERVE` es el equivalente de apalabrar sin
@@ -159,10 +235,28 @@ void *os_reserve(size_t bytes) noexcept {
     return p == MAP_FAILED ? nullptr : p;
 }
 
-bool os_commit(void *addr, size_t bytes) noexcept {
+bool os_commit(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
     return mprotect(addr, round_up(bytes, os_page_size()),
-                    PROT_READ | PROT_WRITE) == 0;
+                    kPosixProt[prot_index(prot)]) == 0;
+}
+
+void *os_alloc(size_t bytes, OsProt prot) noexcept {
+    if (bytes == 0) return nullptr;
+    void *p = mmap(nullptr, round_up(bytes, os_page_size()),
+                   kPosixProt[prot_index(prot)],
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+
+void os_free(void *addr, size_t bytes) noexcept {
+    if (addr != nullptr) munmap(addr, round_up(bytes, os_page_size()));
+}
+
+bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept {
+    if (addr == nullptr || bytes == 0) return false;
+    return mprotect(addr, round_up(bytes, os_page_size()),
+                    kPosixProt[prot_index(prot)]) == 0;
 }
 
 bool os_decommit(void *addr, size_t bytes) noexcept {
