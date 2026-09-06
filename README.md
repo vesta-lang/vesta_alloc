@@ -30,6 +30,72 @@ part of the compiler it came from.
 | `include/util/scratch_arena.h` | Bump arena for memory that all dies together. |
 | `include/util/os_memory.h` | The only place that talks to the OS about memory. Reserve and commit are separate. |
 | `include/util/thread_slot.h` | A per-thread pointer that does not go through emulated TLS. |
+| `include/util/vesta_memcpy.h` | Copy (and overlap-tolerant move) without calling the C library. |
+| `include/util/vesta_memset.h` | Fill, likewise. |
+| `include/util/mem/` | The implementations: **one folder per architecture, one file per micro-ISA**.  See below. |
+
+### The memory primitives
+
+`memcpy` and `memset` are not asked of the C library.  The strong reason is
+that they were the **last two unresolved symbols**: without them the allocator
+runs where there is no libc.  The second is small sizes, which in an allocator
+are the common case: under 16 bytes this calls nobody -- overlapping blocks, no
+loop -- and wins there by 2x to 4.5x.
+
+They are laid out like this, and the layout is the point: **adding NEON means
+creating `mem/arm/` and one branch in the dispatcher**, touching nothing in the
+x86 code.
+
+```
+util/vesta_memcpy.h          <- the only thing included from outside
+util/vesta_memset.h
+util/mem/mem_config.h        what is compiled in, and why
+util/mem/mem_inline.h        under 16 bytes: no ISA, no loop, no call
+util/mem/x86/x86_vec.h       vector types
+util/mem/x86/x86_cpuid.h     CPUID and XGETBV, wrapped and nothing else
+util/mem/x86/x86_cpu.h       what this CPU can do (it reads the above)
+util/mem/x86/sse2_memcpy.h   base path, the only one that can be inlined
+util/mem/x86/sse2_memset.h
+util/mem/x86/avx2_memcpy.h   only if the CPU has it
+util/mem/x86/avx2_memset.h
+util/mem/x86/erms_memcpy.h   `rep movsb`: microcode does the work
+util/mem/x86/erms_memset.h
+util/mem/generic/scalar_*.h  where there is no folder of its own yet
+```
+
+Dispatch goes cheapest first:
+
+| size | what it does |
+| :--- | :--- |
+| < 16 B | overlapping blocks: no loop, no call |
+| 16 - 128 B | up to eight moves addressed from both ends, **no loop** |
+| 128 B - 2 KiB | vector loop, **with the destination aligned before entering** |
+| > 2 KiB | `rep movsb` / `rep stosb`, microcode does the work |
+
+**The thresholds come from measurement**, and each one carries its table in the
+file where it lives; none of them was copied from anybody.
+
+Two of those decisions came not from a benchmark but from **disassembling
+glibc**, and are worth calling out: that there is no loop below 128 bytes, and
+that the loop aligns the destination before starting.  The second is the bigger
+one -- an unaligned store that crosses a cache line is split in two, and in a
+loop you pay that every iteration --: on a 1 KiB copy it is 9.6 ns against 5.2.
+
+There are **two entry points per operation**, and the difference is whether a
+call can happen:
+
+| | |
+| :--- | :--- |
+| `vesta_memcpy` / `vesta_memset` | Dispatch on CPU.  On a machine with AVX2 they pay one call, which pays off from 32 bytes up. |
+| `vesta_memcpy_inline` / `vesta_memset_inline` | **Never call anybody.**  They stay on the base path -- a function with `target("avx2")` cannot be inlined into one without it -- and with a constant size the compiler expands it. |
+
+**These are C headers, not C++ ones.**  For a C dependency to avoid paying a
+call, its compiler has to see the body; a C++ layer behind a C wrapper would
+hand it exactly the cost being removed.  In C++ they are also available as
+`util::vesta_memcpy` and friends.  `examples/c_mem_ops.c` is compiled **as C**
+and is what keeps that true.
+
+What each path costs, measured against libc: `bench_memcpy` and `bench_memset`.
 
 ## Building
 

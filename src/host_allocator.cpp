@@ -22,11 +22,12 @@
 
 #include "util/os_memory.h"
 #include "util/thread_slot.h"
+#include "util/vesta_memcpy.h"
+#include "util/vesta_memset.h"
 
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
-#include <cstring>
 #include <new>
 
 /* Ya no hace falta `windows.h` ni `sys/mman.h`: todo el trato con el sistema
@@ -922,7 +923,7 @@ void *host_realloc(void *p, size_t n) noexcept {
 
     void *fresh = host_alloc(n);
     if (fresh == nullptr) return nullptr; // `p` sigue valido, como manda
-    std::memcpy(fresh, p, old < n ? old : n);
+    vesta_memcpy(fresh, p, old < n ? old : n);
     host_free(p);
     return fresh;
 }
@@ -939,13 +940,13 @@ void *host_alloc_zeroed(size_t n) noexcept {
             bool already_zero = false;
             void *p = alloc_span(c, n, &already_zero);
             if (p != nullptr) {
-                if (!already_zero) std::memset(p, 0, n);
+                if (!already_zero) vesta_memset(p, 0, n);
                 return p;
             }
         }
     }
     void *p = host_alloc(n);
-    if (p != nullptr) std::memset(p, 0, n);
+    if (p != nullptr) vesta_memset(p, 0, n);
     return p;
 }
 

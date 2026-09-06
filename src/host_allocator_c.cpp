@@ -18,7 +18,6 @@
 
 #include "util/host_allocator.h"
 
-#include <cstring>
 #include <cstdlib>
 
 

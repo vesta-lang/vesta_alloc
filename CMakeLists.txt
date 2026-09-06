@@ -156,6 +156,31 @@ set(VESTA_ALLOC_HEADERS
         include/util/os_memory.h
         include/util/scratch_arena.h
         include/util/thread_slot.h
+        include/util/vesta_memcpy.h
+        include/util/vesta_memset.h
+)
+
+# Las primitivas de memoria van por dentro de `util/mem/`, una carpeta por
+# arquitectura.  Se instalan aparte porque conservan su subdirectorio: las dos
+# cabeceras de arriba las incluyen por ruta.
+set(VESTA_ALLOC_MEM_HEADERS
+        include/util/mem/mem_config.h
+        include/util/mem/mem_inline.h
+)
+set(VESTA_ALLOC_MEM_X86_HEADERS
+        include/util/mem/x86/avx2_memcpy.h
+        include/util/mem/x86/avx2_memset.h
+        include/util/mem/x86/erms_memcpy.h
+        include/util/mem/x86/erms_memset.h
+        include/util/mem/x86/sse2_memcpy.h
+        include/util/mem/x86/sse2_memset.h
+        include/util/mem/x86/x86_cpu.h
+        include/util/mem/x86/x86_cpuid.h
+        include/util/mem/x86/x86_vec.h
+)
+set(VESTA_ALLOC_MEM_GENERIC_HEADERS
+        include/util/mem/generic/scalar_memcpy.h
+        include/util/mem/generic/scalar_memset.h
 )
 
 # -----------------------------------------------------------------------------
@@ -227,7 +252,8 @@ if(VESTA_ALLOC_BUILD_TESTS)
         enable_testing()
     endif()
     foreach(_t IN ITEMS test_host_allocator test_host_spans test_alloc_tag
-                        test_single_owner test_thread_slot test_scratch_arena)
+                        test_single_owner test_thread_slot test_scratch_arena
+                        test_mem_ops)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)
@@ -268,7 +294,7 @@ if(VESTA_ALLOC_BUILD_EXAMPLES)
         # fuentes en C, asi que CMake elegiria el de C y faltaria la biblioteca
         # estandar de C++.  Es la misma trampa que se encuentra cualquiera que
         # use esto desde un proyecto en C; esta escrito en el README.
-        foreach(_e IN ITEMS c_basic c_library_hook)
+        foreach(_e IN ITEMS c_basic c_library_hook c_mem_ops)
             add_executable(vesta_alloc_example_${_e} examples/${_e}.c
                     $<TARGET_OBJECTS:vesta_alloc>)
             target_link_libraries(vesta_alloc_example_${_e} PRIVATE vesta_alloc)
@@ -289,7 +315,8 @@ endif()
 #  numero que fluctua no puede decidir si un cambio pasa o no.
 # -----------------------------------------------------------------------------
 if(VESTA_ALLOC_BUILD_BENCH)
-    foreach(_b IN ITEMS bench_allocator bench_vs_malloc bench_reserve_cost)
+    foreach(_b IN ITEMS bench_allocator bench_vs_malloc bench_reserve_cost
+                        bench_memcpy bench_memset)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)
@@ -305,6 +332,12 @@ if(VESTA_ALLOC_STANDALONE)
     include(GNUInstallDirs)
     install(FILES ${VESTA_ALLOC_HEADERS}
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/util)
+    install(FILES ${VESTA_ALLOC_MEM_HEADERS}
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/util/mem)
+    install(FILES ${VESTA_ALLOC_MEM_X86_HEADERS}
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/util/mem/x86)
+    install(FILES ${VESTA_ALLOC_MEM_GENERIC_HEADERS}
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/util/mem/generic)
     if(VESTA_ALLOC_BUILD_STATIC)
         install(TARGETS vesta_alloc_static
                 ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

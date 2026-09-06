@@ -10,6 +10,43 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ---
 
+## [Sin publicar]
+
+### Anadido
+
+- **`vesta_memcpy` y `vesta_memset`** (`util/vesta_memcpy.h`,
+  `util/vesta_memset.h`, y las implementaciones en `util/mem/`).  Copiar y
+  rellenar sin llamar a la biblioteca C: tipos vectoriales con despacho por
+  capacidad de la CPU en tiempo de ejecucion, y por debajo de 16 bytes bloques
+  solapados EN LINEA, sin llamada y sin bucle.
+
+  **Una carpeta por arquitectura y un fichero por micro-ISA**
+  (`mem/x86/sse2_memcpy.h`, `mem/x86/avx2_memset.h`, `mem/generic/scalar_*.h`).
+  No es orden por el orden: con todo en un fichero, cada extension nueva lo
+  ensucia mas y anadir ARM obliga a tocar el codigo de x86.  Asi, anadir NEON es
+  crear `mem/arm/` y una rama en el despachador.
+
+  **Dos entradas por operacion**: la que despacha por CPU, y
+  `vesta_memcpy_inline` / `vesta_memset_inline`, que NO llaman a nadie nunca --
+  se quedan en el camino base, porque una funcion con `target("avx2")` no se
+  puede meter en linea en otra que no lo lleve, y con tamano constante lo
+  expande el compilador --.
+
+  **Son cabeceras de C**, valen en los dos lenguajes.  Para que una dependencia
+  en C no pague una llamada, su compilador tiene que VER el cuerpo; una capa en
+  C++ con envoltorio en C daria justo el coste que se esta quitando.
+  `examples/c_mem_ops.c` se compila como C y es lo que lo comprueba.
+
+  Con esto **la libreria ya no deja ni un simbolo de la libc sin resolver por
+  memoria**: `memcpy` y `memset` eran los dos ultimos, y venian de `host_realloc`
+  y de `host_alloc_zeroed`.  Eso es lo que hace falta para que el asignador
+  pueda funcionar donde no hay libc.
+
+  No es codigo nuevo: las dos implementaciones ya existian en el compilador de
+  VestaVM, en dos sitios distintos y ninguno de los dos era el suyo -- la copia
+  en un `simd_copy.h` suelto, y el relleno DENTRO del `.cpp` del interprete, sin
+  cabecera, donde no lo podia usar nadie mas.  Un hecho, un productor.
+
 ## [1.0.0] -- 2026-09-06
 
 Primera version como biblioteca separada.  Hasta aqui vivia dentro del
@@ -99,6 +136,42 @@ invita a creer que ampara.
 <a name="changelog-english"></a>
 
 # Changelog (English)
+
+## [Unreleased]
+
+### Added
+
+- **`vesta_memcpy` and `vesta_memset`** (`util/vesta_memcpy.h`,
+  `util/vesta_memset.h`, implementations under `util/mem/`).  Copy and fill
+  without calling the C library: vector types with runtime dispatch on CPU
+  capability, and under 16 bytes overlapping blocks INLINE -- no call, no loop.
+
+  **One folder per architecture, one file per micro-ISA**
+  (`mem/x86/sse2_memcpy.h`, `mem/x86/avx2_memset.h`, `mem/generic/scalar_*.h`).
+  Not tidiness for its own sake: with everything in one file each new extension
+  makes it worse, and adding ARM would mean touching the x86 code.  This way,
+  adding NEON is creating `mem/arm/` plus one branch in the dispatcher.
+
+  **Two entry points per operation**: the one that dispatches on CPU, and
+  `vesta_memcpy_inline` / `vesta_memset_inline`, which never call anybody --
+  they stay on the base path, because a function with `target("avx2")` cannot
+  be inlined into one without it, and with a constant size the compiler expands
+  it.
+
+  **They are C headers**, valid in both languages.  For a C dependency to avoid
+  paying a call, its compiler has to SEE the body; a C++ layer behind a C
+  wrapper would hand it exactly the cost being removed.
+  `examples/c_mem_ops.c` is compiled as C and is what checks it.
+
+  With this the library **no longer leaves a single libc symbol unresolved for
+  memory**: `memcpy` and `memset` were the last two, coming from `host_realloc`
+  and `host_alloc_zeroed`.  That is what the allocator needs in order to run
+  where there is no libc.
+
+  Not new code: both implementations already existed in the VestaVM compiler,
+  in two different places and neither was the right one -- the copy in a
+  standalone `simd_copy.h`, the fill INSIDE the interpreter's `.cpp` with no
+  header, where nobody else could use it.  One fact, one producer.
 
 ## [1.0.0] -- 2026-09-06
 

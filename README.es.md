@@ -31,6 +31,72 @@ terceros, ni de ninguna parte del compilador del que salio.
 | `include/util/scratch_arena.h` | Arena de golpe para memoria que muere junta. |
 | `include/util/os_memory.h` | El unico sitio que habla de memoria con el sistema.  Apalabrar y entregar van por separado. |
 | `include/util/thread_slot.h` | Un puntero por hilo que NO pasa por la TLS emulada. |
+| `include/util/vesta_memcpy.h` | Copiar (y mover con solape) sin llamar a la biblioteca C. |
+| `include/util/vesta_memset.h` | Rellenar, igual. |
+| `include/util/mem/` | Las implementaciones: **una carpeta por arquitectura, un fichero por micro-ISA**.  Ver abajo. |
+
+### Las primitivas de memoria
+
+`memcpy` y `memset` no se le piden a la biblioteca C.  La razon de peso es que
+eran los **dos ultimos simbolos** que quedaban sin resolver: sin ellos, el
+asignador funciona donde no hay libc.  La segunda es el tamano pequeno, que en
+un asignador es el caso comun: por debajo de 16 bytes esto no llama a nadie
+-- bloques solapados, sin bucle -- y ahi gana entre 2x y 4,5x.
+
+Estan repartidas asi, y el reparto es el punto: **anadir NEON es crear
+`mem/arm/` y una rama en el despachador**, sin tocar nada de x86.
+
+```
+util/vesta_memcpy.h          <- lo unico que se incluye desde fuera
+util/vesta_memset.h
+util/mem/mem_config.h        que hay compilado, y por que
+util/mem/mem_inline.h        menos de 16 bytes: sin ISA, sin bucle, sin llamada
+util/mem/x86/x86_vec.h       tipos vectoriales
+util/mem/x86/x86_cpuid.h     CPUID y XGETBV, envueltas y nada mas
+util/mem/x86/x86_cpu.h       que sabe hacer esta CPU (interpreta lo anterior)
+util/mem/x86/sse2_memcpy.h   camino base, el unico que se puede meter en linea
+util/mem/x86/sse2_memset.h
+util/mem/x86/avx2_memcpy.h   solo si la CPU lo admite
+util/mem/x86/avx2_memset.h
+util/mem/x86/erms_memcpy.h   `rep movsb`: lo resuelve el microcodigo
+util/mem/x86/erms_memset.h
+util/mem/generic/scalar_*.h  donde todavia no hay carpeta propia
+```
+
+El despacho va de mas barato a mas caro:
+
+| tamano | que hace |
+| :--- | :--- |
+| < 16 B | bloques solapados: sin bucle, sin llamada |
+| 16 - 128 B | hasta ocho movimientos direccionados desde los dos extremos, **sin bucle** |
+| 128 B - 2 KiB | bucle vectorial, **con el destino alineado antes de entrar** |
+| > 2 KiB | `rep movsb` / `rep stosb`, que lo resuelve el microcodigo |
+
+**Los umbrales salen de medir**, y cada uno lleva su tabla en el fichero donde
+vive; no se copiaron de nadie.
+
+Dos de esas decisiones no salieron de un banco sino de **desensamblar glibc**, y
+valen la pena por separado: que hasta 128 bytes no haya bucle, y que el bucle
+alinee el destino antes de empezar.  Lo segundo es lo que mas pesa -- una
+escritura sin alinear que cruza linea de cache se parte en dos, y en un bucle
+eso se paga cada vuelta --: en una copia de 1 KiB son 9,6 ns contra 5,2.
+
+Hay **dos entradas por operacion**, y la diferencia es si puede haber una
+llamada:
+
+| | |
+| :--- | :--- |
+| `vesta_memcpy` / `vesta_memset` | Despachan por CPU.  Con AVX2 en la maquina pagan una llamada, que a partir de 32 bytes sale a cuenta. |
+| `vesta_memcpy_inline` / `vesta_memset_inline` | **No llaman a nadie, nunca.**  Se quedan en el camino base -- una funcion con `target("avx2")` no se puede meter en linea en otra que no lo lleve -- y con tamano constante lo expande el compilador. |
+
+**Son cabeceras de C**, no de C++.  Para que una dependencia en C no pague una
+llamada, su compilador tiene que ver el cuerpo; una capa en C++ con envoltorio
+en C daria justo el coste que se esta quitando.  En C++ estan ademas como
+`util::vesta_memcpy` y companyia.  `examples/c_mem_ops.c` se compila **como C**
+y es lo que comprueba que siga siendo cierto.
+
+Lo que cuesta cada camino, medido contra la libc: `bench_memcpy` y
+`bench_memset`.
 
 ## Construir
 
