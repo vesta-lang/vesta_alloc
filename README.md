@@ -89,10 +89,13 @@ the cases it wins is not telling you anything. On Linux against glibc:
 
 | case | ours | glibc | why |
 | :--- | ---: | ---: | :--- |
-| 16-64 B, one at a time | ~3.6 ns | ~2.2 ns | glibc's per-thread tcache is a very short path for exactly this. We win on bursts of the same sizes (1.5x), which is the shape that actually shows up. |
-| 4 KiB - 64 KiB | ~9.5 ns | ~6.5 ns | **A design gap**: size classes stop at 2 KiB and a chunk is 64 KiB, so a 4 KiB request takes a whole chunk and goes through the span path with a lock. Serving 2 KiB-64 KiB from multi-chunk spans would close it. |
-| `calloc` of 16-64 B | ~3.6 ns | ~2.3 ns | Small blocks come off a free list, so they carry the previous tenant's bytes and must be cleared. Nothing to skip. |
-| `realloc` growing | ~72 ns | ~48 ns | Was 30x worse until spans learned to split and coalesce; now a growing buffer absorbs its free neighbour instead of copying. The rest is glibc's `mremap`, which we cannot use: it would move the block **out of our region**, and then `in_region` would stop recognising it. |
+| `burst` of 4 KiB | 16.9 ns | 9.0 ns | **A design gap**: size classes stop at 2 KiB and a chunk is 64 KiB, so a 4 KiB request takes a **whole 64 KiB chunk** -- 16x the waste -- and goes through the span path, which takes a lock. Serving 2 KiB-64 KiB from classes carved out of multi-chunk spans would close it. |
+| `churn` of 4 KiB / 64 KiB | 10.8 / 13.0 ns | 8.7 / 10.1 ns | Same gap. |
+| `realloc` growing past 64 KiB | 70-120 ns | 60-68 ns | glibc uses `mremap`, which remaps pages to a new address **without copying**. We cannot: it would move the block **out of our region**, and `in_region` -- two comparisons, which is what makes freeing cheap -- would stop recognising it. Spans absorb their free neighbour instead, which fixed the case from 30x worse to 0.86x. |
+
+Everything else we now win, from 1.0x to 36x. The small sizes were losing at
+0.83-0.98x until the thread slot stopped calling `pthread_getspecific` on every
+allocation and started reading the thread pointer with one instruction.
 
 On Windows the picture is different: we win everywhere by 2x to 500x, because
 msvcrt's allocator is much weaker. The `<- system wins` rows above are a Linux

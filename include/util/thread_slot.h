@@ -64,6 +64,58 @@ uint32_t thread_slot_alloc_api() noexcept;
 
 namespace detail {
 
+#if !defined(_WIN32) && defined(__x86_64__)
+#define VESTA_THREAD_SLOT_FS_FAST 1
+
+/**
+ * @brief Cuantos hilos caben en la tabla directa de POSIX.
+ *
+ * Potencia de dos: el indice sale de enmascarar, sin dividir.
+ */
+constexpr uint32_t kTpSlots = 256;
+
+/// Puntero de hilo que ocupa cada casilla.  Cero = libre.
+extern std::atomic<uintptr_t> g_tp_key[kTpSlots];
+/// Los valores de cada ranura, por hilo.  `[ranura][hilo]`.
+extern void *g_tp_value[64][kTpSlots];
+
+/// Da de alta este hilo en la tabla y devuelve su casilla.  Fuera de linea:
+/// pasa una vez por hilo.  @c kTpSlots si no queda sitio.
+uint32_t register_thread_pointer(uintptr_t tp) noexcept;
+
+/**
+ * @brief El puntero de este hilo, con UNA instruccion.
+ *
+ * En x86-64 la ABI de TLS pone el puntero de hilo en `%fs:0` -- la cabecera
+ * del bloque de control apunta a si misma --, asi que leerlo es un `mov` con
+ * prefijo de segmento.  No se toca nada de la biblioteca C: solo se usa ese
+ * valor como IDENTIDAD del hilo, no como sitio donde escribir.
+ */
+[[gnu::always_inline]] inline uintptr_t thread_pointer() noexcept {
+    uintptr_t tp;
+    /* `volatile` por el mismo motivo que en la rama de Windows: sin el, el
+     * compilador puede tratarlo como una constante y reusar el valor de un
+     * hilo en otro despues de un cambio de contexto que el no ve. */
+    asm volatile("movq %%fs:0, %0" : "=r"(tp));
+    return tp;
+}
+
+/**
+ * @brief La casilla de este hilo en la tabla directa.
+ *
+ * Los bloques de control estan alineados, asi que los bits bajos del puntero
+ * no distinguen: se toman a partir del sexto.  Una colision no es un error --
+ * se resuelve por el camino lento --, solo cuesta una llamada.
+ */
+[[gnu::always_inline]] inline uint32_t thread_index() noexcept {
+    const uintptr_t tp = thread_pointer();
+    const uint32_t i = uint32_t(tp >> 6) & (kTpSlots - 1);
+    if (g_tp_key[i].load(std::memory_order_relaxed) == tp) return i;
+    return register_thread_pointer(tp);
+}
+
+#endif
+
 /**
  * @brief Si la lectura directa del TEB quedo validada.
  *
@@ -140,6 +192,19 @@ class ThreadSlot {
                          : "r"(static_cast<uint64_t>(s)));
             return v;
         }
+#elif defined(VESTA_THREAD_SLOT_FS_FAST)
+        /* Camino rapido de Linux: el puntero de hilo con un `mov` y una tabla
+         * directa.  NADA de `pthread_getspecific` ni de `__thread`.
+         *
+         * Antes esto caia a la API y costaba DOS llamadas por reserva -- una a
+         * `thread_slot_get_api` y otra a `pthread_getspecific` --, mientras que
+         * el cache por hilo de glibc se lee con una sola instruccion.  Era el
+         * motivo de que le perdieramos en las reservas pequenas. */
+        if (s < 64) {
+            const uint32_t i = detail::thread_index();
+            if (i < detail::kTpSlots) return detail::g_tp_value[s][i];
+            return nullptr; // mas hilos que casillas: se sirve por el general
+        }
 #endif
         return thread_slot_get_api(s);
     }
@@ -159,7 +224,17 @@ class ThreadSlot {
     /// vez por hilo, no en el camino caliente.
     void set(void *v) noexcept {
         const uint32_t s = slot_.load(std::memory_order_acquire);
-        if (s != kNoThreadSlot) thread_slot_set_api(s, v);
+        if (s == kNoThreadSlot) return;
+#if defined(VESTA_THREAD_SLOT_FS_FAST)
+        if (s < 64) {
+            const uint32_t i = detail::thread_index();
+            if (i < detail::kTpSlots) {
+                detail::g_tp_value[s][i] = v;
+                return;
+            }
+        }
+#endif
+        thread_slot_set_api(s, v);
     }
 
   private:

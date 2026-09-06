@@ -91,10 +91,14 @@ casos que gana no esta diciendo nada.  En Linux contra glibc:
 
 | caso | nuestro | glibc | por que |
 | :--- | ---: | ---: | :--- |
-| 16-64 B, de uno en uno | ~3,6 ns | ~2,2 ns | El cache por hilo de glibc es un camino cortisimo para exactamente esto.  Nosotros ganamos en RAFAGAS de esos mismos tamanos (1,5x), que es la forma que de verdad aparece. |
-| 4 KiB - 64 KiB | ~9,5 ns | ~6,5 ns | **Hueco de diseno**: las clases de tamano se paran en 2 KiB y un trozo son 64 KiB, asi que una peticion de 4 KiB se lleva un trozo ENTERO y pasa por el camino de tramos, con cerrojo.  Servir el rango 2 KiB-64 KiB desde tramos de varios trozos lo cerraria. |
-| `calloc` de 16-64 B | ~3,6 ns | ~2,3 ns | Los bloques pequenos salen de una lista de libres, asi que llevan lo que dejo el inquilino anterior y HAY que limpiarlos.  No hay nada que saltarse. |
-| `realloc` que crece | ~72 ns | ~48 ns | Era 30 veces peor hasta que los tramos aprendieron a partirse y juntarse; ahora un bufer que crece absorbe a su vecino libre en vez de copiar.  Lo que queda es el `mremap` de glibc, que aqui NO se puede usar: moveria el bloque **fuera de nuestra region** y `in_region` dejaria de reconocerlo. |
+| `burst` de 4 KiB | 16,9 ns | 9,0 ns | **Hueco de diseno**: las clases de tamano se paran en 2 KiB y un trozo son 64 KiB, asi que una peticion de 4 KiB se lleva un trozo ENTERO -- 16 veces de desperdicio -- y pasa por el camino de tramos, que toma cerrojo.  Servir el rango 2 KiB-64 KiB con clases talladas de tramos de varios trozos lo cerraria. |
+| `churn` de 4 KiB / 64 KiB | 10,8 / 13,0 ns | 8,7 / 10,1 ns | El mismo hueco. |
+| `realloc` que crece de 64 KiB | 70-120 ns | 60-68 ns | glibc usa `mremap`, que remapea las paginas a otra direccion **sin copiar**.  Nosotros no podemos: moveria el bloque **fuera de nuestra region**, y `in_region` -- dos comparaciones, que es lo que hace barato liberar -- dejaria de reconocerlo.  Los tramos absorben a su vecino libre en su lugar, lo que llevo este caso de 30 veces peor a 0,86x. |
+
+Todo lo demas lo ganamos ahora, entre 1,0x y 36x.  Los tamanos pequenos perdian
+por 0,83-0,98x hasta que la ranura por hilo dejo de llamar a
+`pthread_getspecific` en CADA reserva y paso a leer el puntero de hilo con una
+instruccion.
 
 En Windows el cuadro es otro: ganamos en todo entre 2x y 500x, porque el
 asignador de msvcrt es mucho mas flojo.  Las filas de arriba son un resultado de

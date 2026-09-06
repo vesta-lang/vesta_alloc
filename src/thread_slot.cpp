@@ -25,6 +25,45 @@ namespace detail {
 /// La bandera vive aqui; el porque de que se DECLARE en la cabecera esta alli.
 std::atomic<int> g_direct_state{0};
 
+#if defined(VESTA_THREAD_SLOT_FS_FAST)
+
+std::atomic<uintptr_t> g_tp_key[kTpSlots];
+void *g_tp_value[64][kTpSlots];
+
+/**
+ * @brief Da de alta un hilo en la tabla directa.
+ *
+ * Sondeo lineal desde su casilla natural.  Con 256 casillas y los pocos hilos
+ * que tiene un proceso, la primera suele estar libre; el bucle esta por los
+ * casos raros, no por el normal.
+ *
+ * El `compare_exchange` es lo que hace que dos hilos que lleguen a la vez no se
+ * pisen: el que pierde sigue buscando.  Y si su clave YA esta puesta, es que
+ * otro le gano la carrera reclamando la misma casilla para el mismo hilo, cosa
+ * imposible -- un puntero de hilo solo lo tiene un hilo --, asi que basta con
+ * quedarse con ella.
+ *
+ * Las casillas NO se liberan al morir un hilo: no hay aviso de fin de hilo sin
+ * volver a depender de la biblioteca C, que es justo lo que se esta quitando.
+ * Es el mismo limite que ya tienen los identificadores del asignador, y se
+ * comporta igual -- al pasarse, se sirve por el camino general.
+ */
+uint32_t register_thread_pointer(uintptr_t tp) noexcept {
+    const uint32_t start = uint32_t(tp >> 6) & (kTpSlots - 1);
+    for (uint32_t n = 0; n < kTpSlots; ++n) {
+        const uint32_t i = (start + n) & (kTpSlots - 1);
+        uintptr_t expected = 0;
+        if (g_tp_key[i].compare_exchange_strong(expected, tp,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire))
+            return i;
+        if (expected == tp) return i; // ya era nuestra
+    }
+    return kTpSlots; // sin sitio: el que llama se va por el camino general
+}
+
+#endif
+
 } // namespace detail
 
 using detail::g_direct_state;
