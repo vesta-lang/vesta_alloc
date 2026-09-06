@@ -10,10 +10,26 @@
  * @brief Implementacion de ThreadSlot.  El contrato y los motivos, en la
  *        cabecera; aqui solo lo que necesita las cabeceras del sistema.
  */
+/* ANTES DE NADA, y por eso esta por encima incluso de nuestra propia cabecera:
+ * `FlsAlloc` -- el aviso de fin de hilo -- es de Vista, y las cabeceras de
+ * MinGW la esconden si nadie pide esa version.  Pedirla despues del primer
+ * include no vale: cualquier cabecera estandar arrastra `_mingw.h`, que ya deja
+ * `_WIN32_WINNT` puesto en su valor por defecto, y entonces esto no haria nada
+ * -- que es justo lo que pasaba.
+ *
+ * Se pide SOLO si quien nos incluye no ha pedido otra version: subirle el
+ * minimo a su espalda seria peor que quedarse sin reciclar identificadores.  Y
+ * si acaba sin declararse, `thread_exit_alloc_api` devuelve "no hay canal" y
+ * quien lo pidio se entera por el valor de retorno. */
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include "util/thread_slot.h"
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <fibersapi.h>
 #else
 #include <pthread.h>
 #endif
@@ -25,42 +41,13 @@ namespace detail {
 /// La bandera vive aqui; el porque de que se DECLARE en la cabecera esta alli.
 std::atomic<int> g_direct_state{0};
 
-#if defined(VESTA_THREAD_SLOT_FS_FAST)
+#if defined(VESTA_THREAD_SLOT_TLS_FAST)
 
-std::atomic<uintptr_t> g_tp_key[kTpSlots];
-void *g_tp_value[64][kTpSlots];
-
-/**
- * @brief Da de alta un hilo en la tabla directa.
- *
- * Sondeo lineal desde su casilla natural.  Con 256 casillas y los pocos hilos
- * que tiene un proceso, la primera suele estar libre; el bucle esta por los
- * casos raros, no por el normal.
- *
- * El `compare_exchange` es lo que hace que dos hilos que lleguen a la vez no se
- * pisen: el que pierde sigue buscando.  Y si su clave YA esta puesta, es que
- * otro le gano la carrera reclamando la misma casilla para el mismo hilo, cosa
- * imposible -- un puntero de hilo solo lo tiene un hilo --, asi que basta con
- * quedarse con ella.
- *
- * Las casillas NO se liberan al morir un hilo: no hay aviso de fin de hilo sin
- * volver a depender de la biblioteca C, que es justo lo que se esta quitando.
- * Es el mismo limite que ya tienen los identificadores del asignador, y se
- * comporta igual -- al pasarse, se sirve por el camino general.
- */
-uint32_t register_thread_pointer(uintptr_t tp) noexcept {
-    const uint32_t start = tp_index(tp); // el MISMO reparto que el camino rapido
-    for (uint32_t n = 0; n < kTpSlots; ++n) {
-        const uint32_t i = (start + n) & (kTpSlots - 1);
-        uintptr_t expected = 0;
-        if (g_tp_key[i].compare_exchange_strong(expected, tp,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_acquire))
-            return i;
-        if (expected == tp) return i; // ya era nuestra
-    }
-    return kTpSlots; // sin sitio: el que llama se va por el camino general
-}
+/* La definicion.  El modelo se repite aqui porque tiene que coincidir con el de
+ * la declaracion: si difieren, el compilador genera accesos de otro modelo y se
+ * pierde justamente lo que se venia a ganar. */
+__thread void *g_tls_slots[kDirectSlots]
+    __attribute__((tls_model("initial-exec")));
 
 #endif
 
@@ -136,6 +123,29 @@ uint32_t thread_slot_alloc_api() noexcept {
     return (s == TLS_OUT_OF_INDEXES) ? kNoThreadSlot : static_cast<uint32_t>(s);
 }
 
+#if defined(FLS_OUT_OF_INDEXES)
+
+uint32_t thread_exit_alloc_api(ThreadExitFn fn) noexcept {
+    /* `PFLS_CALLBACK_FUNCTION` es `void __stdcall (PVOID)`.  En x64 solo hay
+     * una convencion de llamada, asi que la conversion no puede mentir; en
+     * x86-32 si son distintas, y por eso `ThreadExitFn` se declara SIN
+     * convencion explicita -- ahi el compilador rechaza la conversion en vez de
+     * aceptarla y dejar la pila descuadrada al volver del aviso. */
+    const DWORD s = FlsAlloc(reinterpret_cast<PFLS_CALLBACK_FUNCTION>(fn));
+    return (s == FLS_OUT_OF_INDEXES) ? kNoThreadSlot : static_cast<uint32_t>(s);
+}
+
+void thread_exit_arm_api(uint32_t channel, void *value) noexcept {
+    FlsSetValue(static_cast<DWORD>(channel), value);
+}
+
+#else // sin FLS: no hay aviso, y se DICE por el valor de retorno
+
+uint32_t thread_exit_alloc_api(ThreadExitFn) noexcept { return kNoThreadSlot; }
+void thread_exit_arm_api(uint32_t, void *) noexcept {}
+
+#endif
+
 #else // !_WIN32
 
 void *thread_slot_get_api(uint32_t slot) noexcept {
@@ -151,6 +161,20 @@ uint32_t thread_slot_alloc_api() noexcept {
     if (i >= kMaxKeys) return kNoThreadSlot;
     if (pthread_key_create(&g_keys[i], nullptr) != 0) return kNoThreadSlot;
     return i;
+}
+
+/* El aviso sale del MISMO array de claves: aqui una clave con destructor es
+ * exactamente el mecanismo que hace falta, asi que no hay nada especifico que
+ * anadir -- solo pasar el destructor en vez de nulo. */
+uint32_t thread_exit_alloc_api(ThreadExitFn fn) noexcept {
+    const uint32_t i = g_key_count.fetch_add(1, std::memory_order_acq_rel);
+    if (i >= kMaxKeys) return kNoThreadSlot;
+    if (pthread_key_create(&g_keys[i], fn) != 0) return kNoThreadSlot;
+    return i;
+}
+
+void thread_exit_arm_api(uint32_t channel, void *value) noexcept {
+    if (channel < kMaxKeys) pthread_setspecific(g_keys[channel], value);
 }
 
 #endif // _WIN32
@@ -175,6 +199,25 @@ bool ThreadSlot::reserve_slot() noexcept {
     }
     if (g_direct_state.load(std::memory_order_acquire) == 0)
         validate_direct_read(mine);
+    return true;
+}
+
+bool ThreadSlot::reserve_exit(ThreadExitFn fn) noexcept {
+    // Se vuelve a mirar: dos hilos pueden haber pasado la comprobacion en linea.
+    if (exit_.load(std::memory_order_acquire) != kNoThreadSlot) return true;
+
+    const uint32_t mine = thread_exit_alloc_api(fn);
+    if (mine == kNoThreadSlot) return false;
+
+    /* Misma carrera y mismo desenlace que en @c reserve_slot: quien pierde se
+     * queda con un canal de mas sin usar.  Devolverlo costaria mas de lo que
+     * ahorra -- pasa como mucho una vez en la vida del proceso -- y en POSIX ni
+     * siquiera se puede: las claves salen de un array que no se recicla. */
+    uint32_t expected = kNoThreadSlot;
+    if (!exit_.compare_exchange_strong(expected, mine,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_acquire))
+        return true; // gano otro; el canal bueno ya esta puesto
     return true;
 }
 

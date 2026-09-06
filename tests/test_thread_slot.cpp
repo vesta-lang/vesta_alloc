@@ -25,11 +25,22 @@ namespace {
 
 util::ThreadSlot g_slot;
 util::ThreadSlot g_other; // una segunda, para ver que no se pisan
+util::ThreadSlot g_exit;  // una tercera, para el aviso de fin de hilo
 int g_failures = 0;
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
     if (!ok) ++g_failures;
+}
+
+std::atomic<int> g_exit_count{0};
+std::atomic<void *> g_exit_value{nullptr};
+
+/// Lo que el sistema llama al morir un hilo.  Minimo a proposito: corre durante
+/// el desmontaje del hilo.
+void on_exit(void *value) {
+    g_exit_value.store(value, std::memory_order_relaxed);
+    g_exit_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace
@@ -74,6 +85,33 @@ int main() {
         t.join();
     check(wrong.load() == 0, "cada hilo ve SOLO lo suyo");
     check(g_slot.get() == &a, "el hilo principal conserva el suyo");
+
+    // --- el aviso de fin de hilo -----------------------------------------
+    //
+    // Es lo que permite reciclar el identificador de cache del asignador.  Sin
+    // el, el tope de `kMaxThreads` deja de contar hilos VIVOS y pasa a contar
+    // hilos que hayan existido alguna vez, y un programa que crea y destruye
+    // hilos acaba sirviendose entero por las listas compartidas.
+    {
+        g_exit_count.store(0, std::memory_order_relaxed);
+        g_exit_value.store(nullptr, std::memory_order_relaxed);
+        const bool armed = g_exit.ensure() && g_exit.notify_on_exit(&on_exit);
+        check(armed, "el sistema da un canal de aviso de fin de hilo");
+
+        if (armed) {
+            int marca = 0;
+            std::thread([&marca] { g_exit.set(&marca); }).join();
+            check(g_exit_count.load() == 1, "al morir un hilo con valor, avisa");
+            check(g_exit_value.load() == &marca, "y avisa con SU valor");
+
+            /* Un hilo que nunca puso nada no tiene de que avisar.  Importa:
+             * si avisara con nulo, quien recicle identificadores tendria que
+             * distinguirlo, y ese es el tipo de caso que se olvida. */
+            g_exit_count.store(0, std::memory_order_relaxed);
+            std::thread([] {}).join();
+            check(g_exit_count.load() == 0, "un hilo sin valor no avisa nada");
+        }
+    }
 
     // --- coste -----------------------------------------------------------
     constexpr long kIters = 20000000;
