@@ -28,18 +28,75 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-/* Con la version 2 de la API, `GetProcessMemoryInfo` se resuelve a
- * `K32GetProcessMemoryInfo`, que vive en `kernel32.dll` -- ya enlazada -- en
- * vez de en `psapi.dll`.  Asi preguntar por la memoria del proceso no anade una
- * biblioteca al enlace de los treinta y tantos objetivos del proyecto. */
-#define PSAPI_VERSION 2
+/* Ya no hace falta `psapi` ni pedir su version 2: la memoria del proceso se le
+ * pregunta a ntdll (`NtQueryInformationProcess`), que es a quien acababa
+ * preguntando `GetProcessMemoryInfo`. */
 #include <windows.h>
-#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+extern "C" {
+LONG __stdcall NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                                       ULONG_PTR ZeroBits, PSIZE_T RegionSize,
+                                       ULONG AllocationType, ULONG Protect);
+LONG __stdcall NtFreeVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                                   PSIZE_T RegionSize, ULONG FreeType);
+LONG __stdcall NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                                      PSIZE_T RegionSize, ULONG NewProtect,
+                                      PULONG OldProtect);
+/* Las dos consultas, para no tener que llamar a kernel32 ni para preguntar.  No
+ * son camino caliente -- una pasa una vez y la otra es diagnostico --, asi que
+ * aqui el motivo no es el tiempo: es que la capa de memoria deje de depender de
+ * kernel32, que es la direccion en la que va el proyecto. */
+LONG __stdcall NtQuerySystemInformation(ULONG SystemInformationClass,
+                                        PVOID SystemInformation,
+                                        ULONG SystemInformationLength,
+                                        PULONG ReturnLength);
+LONG __stdcall NtQueryInformationProcess(HANDLE ProcessHandle,
+                                         ULONG ProcessInformationClass,
+                                         PVOID ProcessInformation,
+                                         ULONG ProcessInformationLength,
+                                         PULONG ReturnLength);
+}
+
+/// Lo que devuelve `NtQuerySystemInformation` con la clase 0.  Se escribe aqui
+/// porque `<winternl.h>` la declara recortada y lo que hace falta -- el tamano
+/// de pagina y la granularidad -- esta pasada la parte que declara.
+struct VestaSystemBasicInformation {
+    ULONG Reserved;
+    ULONG TimerResolution;
+    ULONG PageSize;
+    ULONG NumberOfPhysicalPages;
+    ULONG LowestPhysicalPageNumber;
+    ULONG HighestPhysicalPageNumber;
+    ULONG AllocationGranularity;
+    ULONG_PTR MinimumUserModeAddress;
+    ULONG_PTR MaximumUserModeAddress;
+    ULONG_PTR ActiveProcessorsAffinityMask;
+    CCHAR NumberOfProcessors;
+};
+
+/// Contadores de memoria del proceso, clase 3 de `NtQueryInformationProcess`.
+/// Es lo mismo que `GetProcessMemoryInfo` devuelve, sin pasar por psapi.
+struct VestaVmCounters {
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivateUsage;
+};
 #endif
 
 namespace util {
@@ -55,10 +112,20 @@ std::atomic<size_t> g_granularity{0};
 
 void query_os_sizes() noexcept {
 #if defined(_WIN32)
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    g_page_size.store(si.dwPageSize, std::memory_order_relaxed);
-    g_granularity.store(si.dwAllocationGranularity, std::memory_order_relaxed);
+    /* Se le pregunta a ntdll, no a `GetSystemInfo`: aquella rellena cuarenta
+     * bytes de estructura de los que aqui interesan dos campos.  Y si por lo
+     * que fuera fallara, se usan los valores de siempre de x86-64 en vez de
+     * quedarse a cero, que dejaria a `page_range` dividiendo por nada. */
+    VestaSystemBasicInformation sbi;
+    if (NtQuerySystemInformation(0 /* SystemBasicInformation */, &sbi,
+                                 sizeof(sbi), nullptr) >= 0) {
+        g_page_size.store(sbi.PageSize, std::memory_order_relaxed);
+        g_granularity.store(sbi.AllocationGranularity,
+                            std::memory_order_relaxed);
+    } else {
+        g_page_size.store(4096, std::memory_order_relaxed);
+        g_granularity.store(64 * 1024, std::memory_order_relaxed);
+    }
 #else
     const long ps = sysconf(_SC_PAGESIZE);
     const size_t v = ps > 0 ? (size_t)ps : 4096;
@@ -80,6 +147,32 @@ namespace {
 /// Redondea @p n hacia arriba al multiplo de @p a.  @p a es potencia de dos.
 inline size_t round_up(size_t n, size_t a) noexcept {
     return (n + a - 1) & ~(a - 1);
+}
+
+/**
+ * @brief Lleva un rango a paginas ENTERAS: la base hacia abajo y el final hacia
+ *        arriba.
+ *
+ * POR QUE HACE FALTA, y por que es un arreglo y no una comodidad.  `mprotect` y
+ * `madvise` EXIGEN que la direccion este en una pagina y fallan si no lo esta;
+ * `VirtualAlloc` de Windows la redondea sola.  O sea que la misma llamada
+ * funcionaba en un sistema y fallaba en el otro -- y fallaba devolviendo
+ * `false`, que quien llama lee como "no hay memoria" y resuelve degradandose.
+ *
+ * Costo encontrarlo: en Linux las clases grandes se salian de su region y
+ * volvian al camino de siempre sin que nada lo dijera, porque el respaldo
+ * funciona.  Lo destapo una prueba que comprobaba de QUE region sale cada
+ * reserva; el tiempo y la memoria no se movian lo bastante para notarlo.
+ *
+ * Normalizando aqui, @c os_commit y @c os_decommit significan lo MISMO en los
+ * dos sistemas, que es justo lo que se le pide a esta capa.
+ */
+inline void page_range(void *&addr, size_t &bytes) noexcept {
+    const size_t page = os_page_size();
+    const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t base = a & ~(uintptr_t)(page - 1);
+    bytes = round_up(bytes + size_t(a - base), page);
+    addr = reinterpret_cast<void *>(base);
 }
 
 /// Los tres bits de permisos como indice.  El enmascarado sobra si el valor
@@ -128,37 +221,91 @@ constexpr DWORD kWinProt[8] = {
     PAGE_EXECUTE_READWRITE, // 111  RWX
 };
 
+// -------------------------------------------------------------------------
+//  La memoria se le pide a NTDLL, no a kernel32
+// -------------------------------------------------------------------------
+//
+// SE LE PIDE A NTDLL, y ENLAZANDO, no resolviendo.
+//
+// `VirtualAlloc`, `VirtualFree` y `VirtualProtect` no hacen el trabajo: validan
+// argumentos, traducen banderas y acaban llamando a estas tres.  Saltarse esa
+// capa aqui SI cuenta, al reves que en un lector de ficheros: `os_commit` se
+// llama en cada recarga de trozo, o sea a lo largo de toda una compilacion, no
+// una vez por fichero.
+//
+// Y enlazadas, no resueltas con `GetProcAddress`.  Un intento anterior las
+// guardaba en punteros atomicos, y eso mete en CADA llamada una carga y una
+// comparacion con nulo que el enlazado no necesita -- el sitio de llamada queda
+// en un `call` indirecto por la tabla de importacion, que es lo mismo que
+// costaba llamar a `VirtualAlloc` --.  Ademas convierte un simbolo que falta
+// -- que no seria una version antigua sino un sistema roto -- en un fallo que
+// aparece tarde y lejos, en vez de al cargar el proceso.
+//
+// El prototipo se escribe aqui y no se saca de `<winternl.h>`: esa cabecera
+// declara la mitad de estas y arrastra tipos que no hacen falta.
+
+/// El proceso actual.  Es una pseudo-asa constante; no hay que cerrarla.
+#define VESTA_NT_SELF (reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1)))
+
+
+/// Suelta el rango ENTERO.  Con `MEM_RELEASE` el tamano tiene que ir a cero y
+/// la base tiene que ser la que devolvio la reserva.
+void release_range(void *addr) noexcept {
+    if (addr == nullptr) return;
+    PVOID base = addr;
+    SIZE_T size = 0;
+    NtFreeVirtualMemory(VESTA_NT_SELF, &base, &size, MEM_RELEASE);
+}
+
 void *os_reserve(size_t bytes) noexcept {
     if (bytes == 0) return nullptr;
     /* `PAGE_READWRITE` en una reserva no entrega nada: es el permiso que
      * tendran las paginas cuando se comprometan.  Mientras no se comprometan,
      * tocarlas falla igual. */
-    return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);
+    PVOID base = nullptr;
+    SIZE_T size = bytes;
+    return NtAllocateVirtualMemory(VESTA_NT_SELF, &base, 0, &size, MEM_RESERVE,
+                                   PAGE_READWRITE) >= 0
+               ? base
+               : nullptr;
 }
 
 bool os_commit(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    return VirtualAlloc(addr, bytes, MEM_COMMIT,
-                        kWinProt[prot_index(prot)]) != nullptr;
+    /* Se normaliza aqui aunque `NtAllocateVirtualMemory` redondee sola: asi
+     * esta funcion significa lo mismo en Windows y en POSIX por CONTRATO, y no
+     * porque dos implementaciones ajenas coincidan.  Ver `page_range`. */
+    page_range(addr, bytes);
+    PVOID base = addr;
+    SIZE_T size = bytes;
+    return NtAllocateVirtualMemory(VESTA_NT_SELF, &base, 0, &size, MEM_COMMIT,
+                                   kWinProt[prot_index(prot)]) >= 0;
 }
 
 void *os_alloc(size_t bytes, OsProt prot) noexcept {
     if (bytes == 0) return nullptr;
-    return VirtualAlloc(nullptr, round_up(bytes, os_page_size()),
-                        MEM_COMMIT | MEM_RESERVE,
-                        kWinProt[prot_index(prot)]);
+    PVOID base = nullptr;
+    SIZE_T size = round_up(bytes, os_page_size());
+    return NtAllocateVirtualMemory(VESTA_NT_SELF, &base, 0, &size,
+                                   MEM_COMMIT | MEM_RESERVE,
+                                   kWinProt[prot_index(prot)]) >= 0
+               ? base
+               : nullptr;
 }
 
 void os_free(void *addr, size_t bytes) noexcept {
     (void)bytes; // con MEM_RELEASE hay que pasar cero; el tamano no se usa
-    if (addr != nullptr) VirtualFree(addr, 0, MEM_RELEASE);
+    release_range(addr);
 }
 
 bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    DWORD previous = 0;
-    return VirtualProtect(addr, round_up(bytes, os_page_size()),
-                          kWinProt[prot_index(prot)], &previous) != 0;
+    page_range(addr, bytes);
+    PVOID base = addr;
+    SIZE_T size = bytes;
+    ULONG previous = 0;
+    return NtProtectVirtualMemory(VESTA_NT_SELF, &base, &size,
+                                  kWinProt[prot_index(prot)], &previous) >= 0;
 }
 
 bool os_decommit(void *addr, size_t bytes) noexcept {
@@ -166,27 +313,31 @@ bool os_decommit(void *addr, size_t bytes) noexcept {
     /* `MEM_DECOMMIT` devuelve las paginas pero CONSERVA la reserva, que es
      * justo lo que hace falta: el rango sigue siendo nuestro y se puede volver
      * a comprometer sin que nadie se meta en medio. */
-    return VirtualFree(addr, bytes, MEM_DECOMMIT) != 0;
+    page_range(addr, bytes);
+    PVOID base = addr;
+    SIZE_T size = bytes;
+    return NtFreeVirtualMemory(VESTA_NT_SELF, &base, &size, MEM_DECOMMIT) >= 0;
 }
 
 void os_release(void *addr, size_t bytes) noexcept {
     (void)bytes; // con MEM_RELEASE hay que pasar cero; el tamano no se usa
-    if (addr != nullptr) VirtualFree(addr, 0, MEM_RELEASE);
+    release_range(addr);
 }
 
 OsProcessMemory os_process_memory() noexcept {
     OsProcessMemory m;
-    PROCESS_MEMORY_COUNTERS_EX pmc;
-    pmc.cb = sizeof(pmc);
-    if (GetProcessMemoryInfo(GetCurrentProcess(),
-                             reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc),
-                             sizeof(pmc))) {
-        m.working_set = pmc.WorkingSetSize;
-        m.working_set_peak = pmc.PeakWorkingSetSize;
+    /* `GetProcessMemoryInfo` no hace mas que esto, y de paso obligaba a pedir
+     * la version 2 de psapi para que no arrastrara otra biblioteca al enlace.
+     * Preguntando directo, esa dependencia desaparece del todo. */
+    VestaVmCounters vm;
+    if (NtQueryInformationProcess(VESTA_NT_SELF, 3 /* ProcessVmCounters */, &vm,
+                                  sizeof(vm), nullptr) >= 0) {
+        m.working_set = vm.WorkingSetSize;
+        m.working_set_peak = vm.PeakWorkingSetSize;
         /* `PrivateUsage` es lo comprometido POR ESTE proceso; `PagefileUsage`
          * mide lo mismo en la practica pero esta documentado como historico. */
-        m.commit = pmc.PrivateUsage;
-        m.commit_peak = pmc.PeakPagefileUsage;
+        m.commit = vm.PrivateUsage;
+        m.commit_peak = vm.PeakPagefileUsage;
     }
     return m;
 }
@@ -348,8 +499,8 @@ void *os_reserve(size_t bytes) noexcept {
 
 bool os_commit(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    return sys_mprotect(addr, round_up(bytes, os_page_size()),
-                        kPosixProt[prot_index(prot)]);
+    page_range(addr, bytes); // ver `page_range`: sin esto falla si no es pagina
+    return sys_mprotect(addr, bytes, kPosixProt[prot_index(prot)]);
 }
 
 void *os_alloc(size_t bytes, OsProt prot) noexcept {
@@ -371,7 +522,8 @@ bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept {
 
 bool os_decommit(void *addr, size_t bytes) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    const size_t n = round_up(bytes, os_page_size());
+    page_range(addr, bytes);
+    const size_t n = bytes;
     /* Dos pasos, y los dos hacen falta: `MADV_DONTNEED` es lo que de verdad
      * suelta las paginas, y volver a `PROT_NONE` es lo que hace que tocarlas
      * falle en vez de devolver ceros en silencio.  Sin lo segundo, un uso
