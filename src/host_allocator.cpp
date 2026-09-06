@@ -337,19 +337,51 @@ std::atomic_flag g_span_lock = ATOMIC_FLAG_INIT;
  * 64 MiB es de AFINADO, no de capacidad: pasarse no rompe nada, solo hace que
  * a partir de ahi los tramos que se suelten devuelvan sus paginas.
  */
-constexpr size_t kSpanRetainBudget = size_t(64) << 20; // 64 MiB
+/**
+ * @brief Marca en `ChunkHeader::_pad` de un tramo que esta LIBRE.
+ *
+ * Hace falta para poder mirar si el vecino de al lado se puede absorber, que es
+ * de lo que va todo lo de abajo.
+ */
+constexpr uint32_t kSpanFree = 0x46524545u; // 'FREE'
 
-/// Bytes de tramos libres que ahora mismo conservan su memoria.
-std::atomic<size_t> g_span_retained{0};
+/**
+ * @brief Enlaces de la lista de tramos libres.
+ *
+ * Viven DENTRO del propio tramo, justo detras de su cabecera: mientras esta
+ * libre nadie usa esos bytes, asi que la lista no gasta memoria aparte.
+ *
+ * Doblemente enlazada, y no es un capricho: al absorber un vecino hay que
+ * sacarlo de SU lista, y con una lista simple eso seria recorrerla entera.
+ */
+struct SpanNode {
+    SpanNode *prev;
+    SpanNode *next;
+};
 
-/// Marca en `ChunkHeader::_pad` de un tramo libre al que se le devolvieron las
-/// paginas.  Al reusarlo hay que volver a pedirlas.
-constexpr uint32_t kSpanDecommitted = 1;
-
-/// Listas de tramos libres por numero EXACTO de trozos.  Sin partir ni juntar:
-/// las fases piden y sueltan los mismos tamanos una y otra vez, asi que el
-/// ajuste exacto acierta casi siempre y no hay nada que reorganizar.
-void *g_span_free[kMaxSpanChunks + 1];
+/**
+ * @brief Listas de tramos libres, por numero de trozos.
+ *
+ * ANTES ERAN DE AJUSTE EXACTO Y SIN PARTIR NI JUNTAR, y eso tenia un modo de
+ * fallo que solo se ve con un banco: un tramo de diecisiete trozos no puede
+ * servir una peticion de uno, asi que un bufer que crece -- reservar, duplicar,
+ * duplicar -- dejaba en la lista de 17 lo que la siguiente vuelta pedia de 1, y
+ * tenia que ir a por region NUEVA cada vez.  Medido: crecer hasta 1 MiB costaba
+ * 3.583 ns por paso y el pico de memoria subia de 21 a 144 MiB.
+ *
+ * Con partir y juntar:
+ *
+ *   - al reservar, si no hay del tamano exacto se coge uno MAYOR y se parte; el
+ *     resto vuelve a su lista;
+ *   - al soltar, si el tramo de al lado tambien esta libre se ABSORBE, de modo
+ *     que los trozos vuelven a estar juntos y sirven para lo que venga.
+ *
+ * Y de ahi sale gratis lo que de verdad importaba: un `realloc` que crece puede
+ * tragarse al vecino libre y NO COPIAR NADA.  Es lo que hace `mremap` en
+ * `glibc`, que aqui no se puede usar porque moveria el bloque fuera de nuestra
+ * region.
+ */
+SpanNode *g_span_free[kMaxSpanChunks + 1];
 
 struct SpanLock {
     SpanLock() noexcept {
@@ -359,8 +391,157 @@ struct SpanLock {
     ~SpanLock() { g_span_lock.clear(std::memory_order_release); }
 };
 
+// -------------------------------------------------------------------------
+//  Listas de tramos libres.  TODO lo de aqui exige tener el cerrojo.
+// -------------------------------------------------------------------------
+
+/// Los enlaces de un tramo libre viven detras de su cabecera.
+inline SpanNode *node_of(ChunkHeader *h) noexcept {
+    return reinterpret_cast<SpanNode *>(reinterpret_cast<char *>(h) +
+                                        sizeof(ChunkHeader));
+}
+inline ChunkHeader *header_of(SpanNode *n) noexcept {
+    return reinterpret_cast<ChunkHeader *>(reinterpret_cast<char *>(n) -
+                                           sizeof(ChunkHeader));
+}
+
+/// Si @p h es un tramo nuestro que ahora mismo esta libre.
+inline bool is_free_span(const ChunkHeader *h) noexcept {
+    return h->magic == kSpanMagic && h->_pad == kSpanFree;
+}
+
+void list_insert(ChunkHeader *h) noexcept {
+    const uint32_t k = h->cls;
+    SpanNode *n = node_of(h);
+    n->prev = nullptr;
+    n->next = g_span_free[k];
+    if (n->next != nullptr) n->next->prev = n;
+    g_span_free[k] = n;
+    h->_pad = kSpanFree;
+}
+
+void list_remove(ChunkHeader *h) noexcept {
+    SpanNode *n = node_of(h);
+    if (n->prev != nullptr)
+        n->prev->next = n->next;
+    else
+        g_span_free[h->cls] = n->next;
+    if (n->next != nullptr) n->next->prev = n->prev;
+    h->_pad = 0;
+}
+
+/// El vecino de la derecha, si esta DENTRO de lo ya repartido.  nullptr si el
+/// tramo termina donde acaba lo repartido, o si se sale de la region.
+ChunkHeader *right_neighbour(ChunkHeader *h) noexcept {
+    const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(h);
+    const uintptr_t next = addr + size_t(h->cls) * kChunkBytes;
+    const uintptr_t handed =
+        base + g_chunk_next.load(std::memory_order_relaxed) * kChunkBytes;
+    if (next >= handed) return nullptr;
+    return reinterpret_cast<ChunkHeader *>(next);
+}
+
+/**
+ * @brief Absorbe vecinos libres a la derecha mientras los haya.
+ *
+ * Solo hacia la derecha: hacerlo tambien hacia la izquierda exigiria un pie de
+ * pagina en cada tramo para poder retroceder, y el caso que importa -- un bufer
+ * que crece -- avanza siempre hacia delante.
+ */
+void coalesce_right(ChunkHeader *h) noexcept {
+    for (;;) {
+        ChunkHeader *r = right_neighbour(h);
+        if (r == nullptr || !is_free_span(r)) return;
+        if (size_t(h->cls) + r->cls > kMaxSpanChunks) return;
+        list_remove(r);
+        h->cls += r->cls;
+        r->magic = 0; // deja de ser una cabecera: ahora es parte de `h`
+    }
+}
+
+/// Parte @p h dejandole @p want trozos y devolviendo el resto a su lista.
+void split_span(ChunkHeader *h, uint32_t want) noexcept {
+    const uint32_t rest = h->cls - want;
+    if (rest == 0) return;
+    ChunkHeader *r = reinterpret_cast<ChunkHeader *>(
+        reinterpret_cast<char *>(h) + size_t(want) * kChunkBytes);
+    r->magic = kSpanMagic;
+    r->cls = rest;
+    r->owner = h->owner;
+    h->cls = want;
+    list_insert(r);
+}
+
+/// Saca de las listas un tramo de al menos @p want trozos, partiendolo si hace
+/// falta.  nullptr si no hay ninguno.
+ChunkHeader *take_from_free_lists(uint32_t want) noexcept {
+    for (uint32_t k = want; k <= kMaxSpanChunks; ++k) {
+        SpanNode *n = g_span_free[k];
+        if (n == nullptr) continue;
+        ChunkHeader *h = header_of(n);
+        list_remove(h);
+        split_span(h, want);
+        return h;
+    }
+    return nullptr;
+}
+
 /// Trozos ya entregados por la region y nunca devueltos, para no repartir dos
 /// veces el mismo.  Es el mismo contador que usa `grow`.
+/**
+ * @brief Estira un tramo SIN moverlo, si se puede.
+ * @return true si se consiguio; entonces @p h ya cubre @p want trozos.
+ *
+ * Se intenta por dos vias, y hay que tener el cerrojo de tramos:
+ *
+ *  1. **Absorbiendo al vecino de la derecha si esta libre.**  Es la que
+ *     importa: un bufer que crece suelta su version anterior justo delante de
+ *     donde va a crecer, asi que el vecino suele ser suyo.
+ *  2. **Tomando mas region**, si el tramo termina justo donde va el reparto.
+ *     Vale para el primer crecimiento, cuando aun no hay vecino que absorber.
+ *
+ * POR QUE NO `mremap`, que es lo que usa glibc para no copiar: moveria el
+ * bloque FUERA de nuestra region, y con eso `in_region` dejaria de
+ * reconocerlo.  Ese reconocimiento de dos comparaciones es de donde sale que
+ * liberar sea barato, asi que no es negociable.
+ */
+bool try_extend_span(ChunkHeader *h, uint32_t want) noexcept {
+    // 1. Tragarse vecinos libres mientras no baste.
+    while (h->cls < want) {
+        ChunkHeader *r = right_neighbour(h);
+        if (r == nullptr || !is_free_span(r)) break;
+        list_remove(r);
+        h->cls += r->cls;
+        r->magic = 0;
+    }
+    if (h->cls >= want) {
+        // Puede haber sobrado: lo que sobre vuelve a la lista.
+        split_span(h, want);
+        return true;
+    }
+
+    // 2. Si estamos al final de lo repartido, se toma mas region.
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(h);
+    const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
+    const size_t idx = (addr - base) / kChunkBytes;
+    size_t expected = idx + h->cls;
+    if (!g_chunk_next.compare_exchange_strong(expected, idx + want,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed))
+        return false; // hay algo detras: no queda mas que copiar
+
+    if (addr + size_t(want) * kChunkBytes >
+        g_region_end.load(std::memory_order_relaxed))
+        return false;
+    const uintptr_t fresh_addr = addr + size_t(h->cls) * kChunkBytes;
+    if (!os_commit(reinterpret_cast<void *>(fresh_addr),
+                   size_t(want - h->cls) * kChunkBytes))
+        return false;
+    h->cls = want;
+    return true;
+}
+
 uintptr_t take_chunks(size_t count) noexcept {
     if (!ensure_region()) return 0;
     const size_t idx = g_chunk_next.fetch_add(count, std::memory_order_acq_rel);
@@ -394,18 +575,13 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     bool needs_commit = false;
     if (chunks <= kMaxSpanChunks) {
         SpanLock lk;
-        void *head = g_span_free[chunks];
-        if (head != nullptr) {
-            g_span_free[chunks] = *reinterpret_cast<void **>(head);
-            addr = reinterpret_cast<uintptr_t>(head);
+        /* Del tamano exacto si lo hay, y si no de uno mayor PARTIENDOLO.  Sin
+         * esto, un tramo grande libre no puede servir una peticion pequena y
+         * hay que ir a por region nueva; ver la nota de `g_span_free`. */
+        ChunkHeader *h = take_from_free_lists(chunks);
+        if (h != nullptr) {
+            addr = reinterpret_cast<uintptr_t>(h);
             reused = true;
-            /* Solo hay que volver a pedir paginas si se le quitaron al
-             * soltarlo, que es lo que pasa cuando el presupuesto estaba lleno.
-             * En el caso normal no se toca el sistema NI UNA vez. */
-            needs_commit =
-                reinterpret_cast<ChunkHeader *>(addr)->_pad == kSpanDecommitted;
-            if (!needs_commit)
-                g_span_retained.fetch_sub(bytes, std::memory_order_relaxed);
         }
     }
     if (addr == 0) {
@@ -440,48 +616,41 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
  * Segura.  Toma el cerrojo de tramos para tocar las listas de libres.
  */
 void free_span(ChunkHeader *h) noexcept {
-    const uint32_t chunks = h->cls;
-    const size_t bytes = size_t(chunks) * kChunkBytes;
     ThreadCache *c = cache();
     if (c != nullptr) c->stats.large_frees++;
 
-    /* UN TRAMO QUE SE GUARDA, SE GUARDA CON SU MEMORIA.  Aqui hubo dos intentos
-     * de devolver paginas al soltarlo, y los dos se midieron y se retiraron:
+    SpanLock lk;
+    /* Se absorbe a los vecinos libres de la derecha ANTES de entrar en ninguna
+     * lista.  Asi los trozos vuelven a estar juntos y sirven para lo que venga
+     * despues, en vez de quedarse atrapados en la lista de su tamano exacto.
      *
-     *   - por TAMANO (devolver las de todo tramo de mas de 1 MiB): convierte
-     *     cada par reservar/soltar en tres llamadas al sistema.  1.438 ns por
-     *     operacion frente a los 9,6 de `malloc`.  Cien veces peor.
-     *   - por PRESUPUESTO (conservar hasta 64 MiB): peor todavia, y de forma
-     *     mas dificil de ver.  Una fase que suelta 512 tramos de 1 MiB llena el
-     *     presupuesto con SESENTA Y CUATRO de ellos, que se quedan ahi
-     *     pinchados porque nadie vuelve a pedir ese tamano -- y a partir de ese
-     *     momento CUALQUIER liberacion, de cualquier tamano, ve el presupuesto
-     *     lleno y devuelve sus paginas.  Una llamada al sistema por reserva,
-     *     para siempre.  Medido: `calloc` de 4 KiB paso de 19 ns a 4.341.
+     * UN TRAMO QUE SE GUARDA, SE GUARDA CON SU MEMORIA.  Aqui hubo dos intentos
+     * de devolver paginas al soltarlo y los dos se midieron y se retiraron: por
+     * tamano, convierte cada par reservar/soltar en tres llamadas al sistema
+     * (1.438 ns por operacion frente a 9,6 de `malloc`); por presupuesto, peor
+     * todavia y mas dificil de ver -- una fase que suelta 512 tramos de 1 MiB
+     * deja sesenta y cuatro pinchados, nadie vuelve a pedir ese tamano, y a
+     * partir de ahi CUALQUIER liberacion ve el presupuesto lleno.
      *
-     * Lo que queda retenido esta acotado por el pico de tramos libres a la vez,
-     * que es memoria que el programa ya llego a tener.  Si algun dia hace falta
-     * devolverla, lo suyo es una llamada EXPLICITA que el anfitrion haga entre
-     * fases -- donde se sabe que no va a volver a hacer falta --, no una
-     * decision tomada en cada liberacion sin saber que viene despues. */
+     * Lo retenido esta acotado por el pico de tramos libres a la vez, que es
+     * memoria que el programa ya llego a tener.  Devolverla, si hace falta,
+     * es cosa de una llamada explicita entre fases. */
     h->_pad = 0;
-    if (chunks > kMaxSpanChunks) {
-        /* Estos si devuelven sus paginas, porque no se guardan: se pierde el
-         * rango de direcciones y quedarse ademas con la memoria seria regalar
-         * las dos cosas. */
+    coalesce_right(h);
+
+    if (h->cls > kMaxSpanChunks) {
+        /* Demasiado grande para guardarlo.  Sus paginas SI vuelven al sistema
+         * -- quedarse con el rango y ademas con la memoria seria regalar las
+         * dos cosas --, y se cuenta, para que no sea mudo si deja de ser raro. */
+        const size_t bytes = size_t(h->cls) * kChunkBytes;
         const size_t page = os_page_size();
         if (bytes > page)
             os_decommit(reinterpret_cast<char *>(h) + page, bytes - page);
-        /* Mas grande de lo que merece la pena guardar.  Sus paginas ya se
-         * devolvieron arriba; el rango de direcciones se pierde, y eso es
-         * asumible: la region son 256 GiB y esto pasa una vez entre cien mil.
-         * Se cuenta, para que no sea mudo si algun dia deja de ser raro. */
+        h->magic = 0;
         g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    SpanLock lk;
-    *reinterpret_cast<void **>(h) = g_span_free[chunks];
-    g_span_free[chunks] = h;
+    list_insert(h);
 }
 
 /// Recoge de un golpe lo que otros hilos soltaron de esta clase.
@@ -686,6 +855,76 @@ HostAllocStats host_alloc_stats() {
 
 bool host_alloc_active() {
     return allocator_active();
+}
+
+/* Un almacen propio se pide igual que el de un hilo -- mismo array, mismo
+ * contador --, y por eso todo lo demas funciona sin ningun caso especial: su id
+ * va en la cabecera de cada trozo, asi que las liberaciones desde otro hilo y
+ * las estadisticas lo tratan como a cualquier otro. */
+SingleOwnerAllocator::SingleOwnerAllocator() noexcept : cache_(nullptr) {
+    if (!allocator_active()) return;
+    const uint32_t id = g_next_id.fetch_add(1, std::memory_order_acq_rel);
+    if (id >= kSharedCacheId) return; // sin almacen: se ira por el general
+    ThreadCache *c = &g_caches[id];
+    c->id = id;
+    c->used = true;
+    cache_ = c;
+}
+
+HostAllocStats SingleOwnerAllocator::stats() const noexcept {
+    /* Sin almacen propio no hay nada suyo que contar: todo a cero, que es la
+     * respuesta correcta, no una inventada. */
+    if (cache_ == nullptr) return HostAllocStats{};
+    HostAllocStats s = cache_->stats;
+    // El total no se lleva en el camino caliente: ES la suma del reparto.
+    for (uint32_t g = 0; g < AllocTag::kSlots; ++g)
+        s.small_allocs += s.by_tag[g];
+    return s;
+}
+
+size_t host_usable_size(const void *p) noexcept {
+    if (p == nullptr || !in_region(p)) return 0;
+    const ChunkHeader *h = chunk_of(const_cast<void *>(p));
+    if (h->magic == kChunkMagic) return kSizes[h->cls];
+    if (h->magic == kSpanMagic)
+        return size_t(h->cls) * kChunkBytes - sizeof(ChunkHeader);
+    return 0; // marca desconocida: no inventamos un tamano
+}
+
+void *host_realloc(void *p, size_t n) noexcept {
+    if (p == nullptr) return host_alloc(n);
+    if (n == 0) {
+        host_free(p);
+        return nullptr;
+    }
+    if (!in_region(p)) {
+        /* No es nuestro: vino del sistema y tiene que volver al sistema.
+         * Mezclar los dos asignadores seria pasarle a `free` un puntero que no
+         * reconoce. */
+        return std::realloc(p, n);
+    }
+
+    const size_t old = host_usable_size(p);
+    if (old >= n) return p; // ya cabe; el redondeo a clase juega a favor
+
+    /* Estirar en su sitio si es un tramo y esta al final de lo repartido.  Es
+     * lo que evita la copia en un bufer que crece; ver la cabecera. */
+    ChunkHeader *h = chunk_of(p);
+    if (h->magic == kSpanMagic) {
+        const uint32_t want = chunks_for(n);
+        if (want > h->cls) {
+            // CON EL CERROJO: estirar toca las listas de libres al absorber al
+            // vecino, y sin el dos hilos creciendo a la vez las corromperian.
+            SpanLock lk;
+            if (try_extend_span(h, want)) return p;
+        }
+    }
+
+    void *fresh = host_alloc(n);
+    if (fresh == nullptr) return nullptr; // `p` sigue valido, como manda
+    std::memcpy(fresh, p, old < n ? old : n);
+    host_free(p);
+    return fresh;
 }
 
 void *host_alloc_zeroed(size_t n) noexcept {

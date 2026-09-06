@@ -81,6 +81,27 @@ and will not give it up for a DLL or `.so` loaded later, so the replacement is
 not reliable there. The C interface (`vesta_host_alloc` and friends) works fine
 either way. That is why the shared build is off by default.
 
+## Where it loses, and why
+
+Run `vesta_alloc_bench_vs_malloc` and you get a table with rows marked
+`<- system wins`. They are there on purpose: an allocator that only publishes
+the cases it wins is not telling you anything. On Linux against glibc:
+
+| case | ours | glibc | why |
+| :--- | ---: | ---: | :--- |
+| 16-64 B, one at a time | ~3.6 ns | ~2.2 ns | glibc's per-thread tcache is a very short path for exactly this. We win on bursts of the same sizes (1.5x), which is the shape that actually shows up. |
+| 4 KiB - 64 KiB | ~9.5 ns | ~6.5 ns | **A design gap**: size classes stop at 2 KiB and a chunk is 64 KiB, so a 4 KiB request takes a whole chunk and goes through the span path with a lock. Serving 2 KiB-64 KiB from multi-chunk spans would close it. |
+| `calloc` of 16-64 B | ~3.6 ns | ~2.3 ns | Small blocks come off a free list, so they carry the previous tenant's bytes and must be cleared. Nothing to skip. |
+| `realloc` growing | ~72 ns | ~48 ns | Was 30x worse until spans learned to split and coalesce; now a growing buffer absorbs its free neighbour instead of copying. The rest is glibc's `mremap`, which we cannot use: it would move the block **out of our region**, and then `in_region` would stop recognising it. |
+
+On Windows the picture is different: we win everywhere by 2x to 500x, because
+msvcrt's allocator is much weaker. The `<- system wins` rows above are a Linux
+result, and glibc is a strong opponent.
+
+**What is NOT a reason.** None of these is measurement noise, and none is
+explained away by "the benchmark is unfair". Two of them are real design gaps
+with a known fix, written down above.
+
 ## Thread safety
 
 Every function is documented with a `@par Hilos` section saying which of three

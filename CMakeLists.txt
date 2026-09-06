@@ -227,7 +227,7 @@ if(VESTA_ALLOC_BUILD_TESTS)
         enable_testing()
     endif()
     foreach(_t IN ITEMS test_host_allocator test_host_spans test_alloc_tag
-                        test_thread_slot test_scratch_arena)
+                        test_single_owner test_thread_slot test_scratch_arena)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)

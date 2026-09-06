@@ -412,6 +412,102 @@ class AllocScope {
 HostAllocStats host_alloc_stats();
 
 /**
+ * @brief Un asignador de UN SOLO DUENO, sin nada que sincronizar.
+ *
+ * CONVIVE con el general, no lo sustituye, y por eso NO es una opcion de
+ * compilacion: eso obligaria a elegir una de las dos para todo el programa, y
+ * lo que hace falta es poder mezclarlas.  Los bloques son intercambiables: uno
+ * que salga de aqui se puede soltar con @c host_free -- o llegar a
+ * `operator delete`, que es lo que pasara si lo suelta un `std::vector` -- y
+ * acabara donde debe.
+ *
+ * QUE SE AHORRA.  En el camino rapido del general no hay ni un atomico: las
+ * listas ya son por hilo.  Lo que cuesta no es sincronizar, es LLEGAR al cache,
+ * leyendo la ranura del hilo en cada reserva.  Este tiene el puntero, asi que
+ * se salta esa lectura y su comprobacion; y al soltar se ahorra ademas comparar
+ * el dueno.
+ *
+ * PARA QUE SIRVE.  Para lo que tiene dueno declarado y no se comparte: una fase
+ * de compilacion, un hilo trabajador con su propio almacen, una libreria de
+ * terceros que sabemos que se usa desde un hilo.  **Nunca** detras de
+ * `operator new`, que sirve a todo el proceso.
+ *
+ * @par Hilos
+ * **NO es segura, y ESE es el punto.**  Un objeto de estos lo usa UN hilo.  Lo
+ * que si es seguro es que OTRO hilo suelte un bloque suyo: eso va por la pila
+ * atomica de siempre, igual que entre hilos normales.
+ *
+ * Las reservas GRANDES siguen pasando por el camino comun, que si toma un
+ * cerrojo: son una de cada cien mil operaciones y no compensa duplicar la
+ * maquinaria de tramos.  Lo que se ahorra aqui es el camino caliente.
+ *
+ * @code
+ *   util::SingleOwnerAllocator local;              // suyo, de este hilo
+ *   void *p = local.alloc(64);
+ *   local.free(p);
+ *   util::host_free(local.alloc(64));       // y esto tambien vale
+ * @endcode
+ */
+class SingleOwnerAllocator {
+  public:
+    /**
+     * @brief Da de alta un almacen propio.
+     *
+     * Si no quedan, @c valid() sale false y todo se sirve por el camino
+     * general -- que funciona igual, solo que pasando por la ranura del hilo.
+     * Degradar asi es a proposito: quedarse sin almacen no puede convertirse en
+     * un fallo del programa que lo usa.
+     */
+    SingleOwnerAllocator() noexcept;
+
+    SingleOwnerAllocator(const SingleOwnerAllocator &) = delete;
+    SingleOwnerAllocator &operator=(const SingleOwnerAllocator &) = delete;
+
+    /// true si consiguio almacen propio.
+    bool valid() const noexcept { return cache_ != nullptr; }
+
+    /// Sirve @p n bytes.  Sin leer ninguna ranura de hilo.
+    [[gnu::always_inline]] void *alloc(size_t n) noexcept {
+        if (cache_ == nullptr || n - 1 >= kMaxSmall) return host_alloc(n);
+        if (detail::g_measure) detail::record_size(cache_, n);
+        const uint32_t k = class_of(n);
+        void *p = detail::pop_block(cache_, k);
+        if (p == nullptr) return detail::host_alloc_refill(cache_, k, n);
+        return p;
+    }
+
+    /// Devuelve un bloque.  Vale aunque lo reservara otro.
+    [[gnu::always_inline]] void free(void *p) noexcept {
+        if (p == nullptr) return;
+        if (cache_ == nullptr || !in_region(p)) {
+            host_free(p);
+            return;
+        }
+        ChunkHeader *h = chunk_of(p);
+        if (h->magic == kChunkMagic && h->owner == cache_->id) {
+            detail::push_block(cache_, p, h->cls);
+            return;
+        }
+        host_free(p); // de otro dueno, o un tramo: por el camino de siempre
+    }
+
+    /**
+     * @brief Lo que lleva contado ESTE almacen, sin sumar el de nadie mas.
+     *
+     * Por VALOR y no por referencia a proposito: `small_allocs` no se
+     * incrementa en el camino caliente -- el total es la suma de `by_tag`, que
+     * es lo que hace que contar por proposito salga gratis --, asi que hay que
+     * rellenarlo al pedirlo.  Devolviendo una referencia, ese campo saldria
+     * SIEMPRE a cero y nadie se enteraria: un dato que miente en silencio es
+     * peor que uno que falta.
+     */
+    HostAllocStats stats() const noexcept;
+
+  private:
+    detail::ThreadCache *cache_;
+};
+
+/**
  * @brief Sirve @p n bytes PUESTOS A CERO.
  * @return nullptr solo si tampoco pudo el asignador del sistema.
  *
@@ -438,6 +534,39 @@ HostAllocStats host_alloc_stats();
  * @endcode
  */
 void *host_alloc_zeroed(size_t n) noexcept;
+
+/**
+ * @brief Bytes UTILIZABLES de @p p, que pueden ser mas de los que se pidieron.
+ * @return 0 si @p p no salio de aqui (vino del sistema, o es nulo).
+ *
+ * El redondeo a clase no es desperdicio si se aprovecha: pedir 40 bytes da 48.
+ *
+ * @par Hilos
+ * Segura desde cualquier hilo.  Solo lee la cabecera del trozo.
+ */
+size_t host_usable_size(const void *p) noexcept;
+
+/**
+ * @brief Cambia el tamano de @p p a @p n bytes.
+ * @return nullptr si no se pudo; en ese caso @p p SIGUE SIENDO VALIDO, igual
+ *         que manda `realloc`.
+ *
+ * Evita copiar en dos casos, y el segundo es el que importa:
+ *
+ *  1. Si ya cabe en lo que tiene, devuelve el mismo puntero.
+ *  2. Si es una reserva grande y su tramo es **lo ultimo que se tomo de la
+ *     region**, lo ESTIRA en su sitio.  Ese es el patron de un bufer que crece
+ *     -- reservar, duplicar, duplicar --, y sin esto cada duplicacion copiaba
+ *     el contenido entero: crecer hasta 1 MiB costaba 1.450 ns por paso frente
+ *     a los 49 de `realloc`, que usa `mremap` y no copia.
+ *
+ * `mremap` aqui no vale, y conviene saber por que: moveria el bloque FUERA de
+ * nuestra region y `in_region` dejaria de reconocerlo.
+ *
+ * @par Hilos
+ * Segura desde cualquier hilo.  Vale aunque @p p lo reservara otro.
+ */
+void *host_realloc(void *p, size_t n) noexcept;
 
 /// true si el asignador esta sirviendo (false con `VESTA_NO_HOST_SLAB=1`).
 /// @par Hilos

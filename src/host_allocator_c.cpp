@@ -17,31 +17,10 @@
 #include "util/host_allocator_c.h"
 
 #include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
 
 #include <cstring>
 #include <cstdlib>
 
-namespace {
-
-/**
- * @brief Bytes utilizables de @p p, o 0 si no lo sabemos.
- *
- * Cero significa "no es nuestro": vino del asignador del sistema, sea porque el
- * nuestro esta apagado o porque en su momento no pudo servirlo.  No significa
- * que el bloque este vacio.
- */
-size_t usable_of(const void *p) noexcept {
-    if (p == nullptr || !util::in_region(p)) return 0;
-    const util::ChunkHeader *h =
-        util::chunk_of(const_cast<void *>(p));
-    if (h->magic == util::kChunkMagic) return util::kSizes[h->cls];
-    if (h->magic == util::kSpanMagic)
-        return size_t(h->cls) * util::kChunkBytes - sizeof(util::ChunkHeader);
-    return 0; // marca desconocida: no inventamos un tamano
-}
-
-} // namespace
 
 extern "C" {
 
@@ -62,27 +41,11 @@ void *vesta_host_calloc(size_t count, size_t size) {
 }
 
 void *vesta_host_realloc(void *p, size_t n) {
-    if (p == nullptr) return util::host_alloc(n);
-    if (n == 0) {
-        util::host_free(p);
-        return nullptr;
-    }
-    if (!util::in_region(p)) {
-        /* No es nuestro: vino del sistema, asi que tiene que volver al sistema.
-         * Mezclar los dos asignadores en un `realloc` seria pasarle a `free` un
-         * puntero que no reconoce. */
-        return std::realloc(p, n);
-    }
-    const size_t old = usable_of(p);
-    /* Si ya cabe, no se toca.  El redondeo a clase juega a favor aqui: pedir de
-     * 40 a 48 bytes no mueve nada porque los dos caen en la clase de 48. */
-    if (old >= n) return p;
-
-    void *fresh = util::host_alloc(n);
-    if (fresh == nullptr) return nullptr; // `p` sigue siendo valido, como manda
-    std::memcpy(fresh, p, old < n ? old : n);
-    util::host_free(p);
-    return fresh;
+    /* Toda la logica -- incluido estirar un tramo en su sitio en vez de copiar
+     * -- vive en la capa de C++.  Aqui no se repite ni una decision: dos
+     * implementaciones del mismo `realloc` acabarian divergiendo, y la que se
+     * quedara corta seria la que menos se mira. */
+    return util::host_realloc(p, n);
 }
 
 void vesta_host_free(void *p) {
@@ -90,7 +53,7 @@ void vesta_host_free(void *p) {
 }
 
 size_t vesta_host_usable_size(const void *p) {
-    return usable_of(p);
+    return util::host_usable_size(p);
 }
 
 unsigned vesta_host_push_tag(unsigned use, unsigned shape) {

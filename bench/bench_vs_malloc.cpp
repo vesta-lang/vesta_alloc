@@ -90,6 +90,22 @@ struct Ours {
     static void release(void *p) noexcept { util::host_free(p); }
 };
 
+/// El de un solo dueno: la misma maquinaria sin pasar por la ranura del hilo.
+/// Es un objeto, no un modo global, asi que convive con los otros dos.
+util::SingleOwnerAllocator g_owned;
+struct Owned {
+    static void *alloc(size_t n) noexcept { return g_owned.alloc(n); }
+    static void *zeroed(size_t n) noexcept {
+        void *p = g_owned.alloc(n);
+        if (p != nullptr) std::memset(p, 0, n);
+        return p;
+    }
+    static void *grow(void *p, size_t n) noexcept {
+        return util::host_realloc(p, n);
+    }
+    static void release(void *p) noexcept { g_owned.free(p); }
+};
+
 struct System {
     static void *alloc(size_t n) noexcept { return std::malloc(n); }
     static void *zeroed(size_t n) noexcept { return std::calloc(1, n); }
@@ -186,6 +202,7 @@ template <class A> double grow(size_t size, int rounds) {
 
 struct Pair {
     double ours = 0.0;
+    double owned = 0.0;
     double sys = 0.0;
 };
 
@@ -233,11 +250,14 @@ struct GrowCase {
 /// @param f  Called as `f.template operator()<Alloc>()`, returns ns/op.
 template <class F> Pair abba(F run) {
     const double a1 = run.template operator()<Ours>();
+    const double c1 = run.template operator()<Owned>();
     const double b1 = run.template operator()<System>();
     const double b2 = run.template operator()<System>();
+    const double c2 = run.template operator()<Owned>();
     const double a2 = run.template operator()<Ours>();
     Pair p;
     p.ours = (a1 + a2) / 2.0;
+    p.owned = (c1 + c2) / 2.0;
     p.sys = (b1 + b2) / 2.0;
     return p;
 }
@@ -251,16 +271,21 @@ void row(const char *label, size_t size, Pair p) {
     else
         std::snprintf(name, sizeof(name), "%s %zu", label, size);
 
-    const double ratio = p.ours > 0.0 ? p.sys / p.ours : 0.0;
-    std::printf("  %-16s %10.2f %10.2f   %6.2fx  %s\n", name, p.ours, p.sys,
-                ratio, ratio >= 1.0 ? "" : "<- system wins");
+    /* La proporcion se calcula contra la MEJOR de las dos nuestras, porque la
+     * pregunta es "que se puede conseguir con esta biblioteca", no "cual de sus
+     * dos formas escogimos".  Las dos columnas estan a la vista para poder ver
+     * cuanto cuesta compartir. */
+    const double best = (p.owned > 0.0 && p.owned < p.ours) ? p.owned : p.ours;
+    const double ratio = best > 0.0 ? p.sys / best : 0.0;
+    std::printf("  %-16s %9.2f %9.2f %9.2f  %6.2fx  %s\n", name, p.ours,
+                p.owned, p.sys, ratio, ratio >= 1.0 ? "" : "<- system wins");
 }
 
 void header(const char *title) {
     std::printf("\n%s\n", title);
-    std::printf("  %-16s %10s %10s   %7s\n", "case", "ours", "malloc",
-                "ratio");
-    std::printf("  ---------------- ---------- ----------   -------\n");
+    std::printf("  %-16s %9s %9s %9s  %8s\n", "case", "shared", "owned",
+                "malloc", "best/sys");
+    std::printf("  ---------------- --------- --------- ---------  --------\n");
 }
 
 const size_t kSizes[] = {16, 64, 256, 1024, 4096, 65536, 1u << 20};

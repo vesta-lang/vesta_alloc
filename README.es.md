@@ -83,6 +83,27 @@ ahi el reemplazo no es fiable.  La interfaz en C (`vesta_host_alloc` y
 companyia) funciona igual en los dos casos.  Por eso la version dinamica esta
 apagada por defecto.
 
+## Donde PIERDE, y por que
+
+Al ejecutar `vesta_alloc_bench_vs_malloc` salen filas marcadas
+`<- system wins`.  Estan ahi a proposito: un asignador que solo publica los
+casos que gana no esta diciendo nada.  En Linux contra glibc:
+
+| caso | nuestro | glibc | por que |
+| :--- | ---: | ---: | :--- |
+| 16-64 B, de uno en uno | ~3,6 ns | ~2,2 ns | El cache por hilo de glibc es un camino cortisimo para exactamente esto.  Nosotros ganamos en RAFAGAS de esos mismos tamanos (1,5x), que es la forma que de verdad aparece. |
+| 4 KiB - 64 KiB | ~9,5 ns | ~6,5 ns | **Hueco de diseno**: las clases de tamano se paran en 2 KiB y un trozo son 64 KiB, asi que una peticion de 4 KiB se lleva un trozo ENTERO y pasa por el camino de tramos, con cerrojo.  Servir el rango 2 KiB-64 KiB desde tramos de varios trozos lo cerraria. |
+| `calloc` de 16-64 B | ~3,6 ns | ~2,3 ns | Los bloques pequenos salen de una lista de libres, asi que llevan lo que dejo el inquilino anterior y HAY que limpiarlos.  No hay nada que saltarse. |
+| `realloc` que crece | ~72 ns | ~48 ns | Era 30 veces peor hasta que los tramos aprendieron a partirse y juntarse; ahora un bufer que crece absorbe a su vecino libre en vez de copiar.  Lo que queda es el `mremap` de glibc, que aqui NO se puede usar: moveria el bloque **fuera de nuestra region** y `in_region` dejaria de reconocerlo. |
+
+En Windows el cuadro es otro: ganamos en todo entre 2x y 500x, porque el
+asignador de msvcrt es mucho mas flojo.  Las filas de arriba son un resultado de
+LINUX, y glibc es un rival duro.
+
+**Lo que NO es explicacion.**  Ninguno de esos casos es ruido de medida, y
+ninguno se arregla diciendo que el banco es injusto.  Dos de ellos son huecos de
+diseno de verdad, con arreglo conocido y escrito ahi arriba.
+
 ## Seguridad entre hilos
 
 Cada funcion lleva una seccion `@par Hilos` que dice cual de las tres es, porque
