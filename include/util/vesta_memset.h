@@ -65,8 +65,8 @@
  * @endcode
  */
 VESTA_MEM_ALWAYS_INLINE void
-vesta_mem_fill_dispatch(void *dst, uint8_t v, size_t n,
-                        int wide) VESTA_MEM_NOEXCEPT {
+vesta_mem_fill_dispatch(void *dst, uint8_t v, size_t n, int wide,
+                        size_t known_align) VESTA_MEM_NOEXCEPT {
 #if VESTA_ALLOC_FREESTANDING
     uint8_t *d = (uint8_t *)dst;
 
@@ -89,13 +89,15 @@ vesta_mem_fill_dispatch(void *dst, uint8_t v, size_t n,
         return;
     }
 #endif
-    vesta_mem_sse2_fill(d, v, n);
+    vesta_mem_sse2_fill(d, v, n, known_align);
 #else
     vesta_mem_scalar_fill(d, v, n);
 #endif
     (void)wide;
+    (void)known_align;
 #else
     (void)wide;
+    (void)known_align;
     memset(dst, v, n); // respaldo: compilador sin las extensiones
 #endif
 }
@@ -116,7 +118,32 @@ vesta_mem_fill_dispatch(void *dst, uint8_t v, size_t n,
  */
 VESTA_MEM_ALWAYS_INLINE void vesta_memset(void *dst, uint8_t v,
                                           size_t n) VESTA_MEM_NOEXCEPT {
-    vesta_mem_fill_dispatch(dst, v, n, 1);
+    /* Desde C no se sabe nada de la alineacion; desde C++ hay una version con
+     * tipo que si la sabe. */
+    vesta_mem_fill_dispatch(dst, v, n, 1, 1);
+}
+
+/**
+ * @brief El mismo relleno, pero en una funcion de VERDAD: una llamada y ya.
+ *
+ * Ver @c vesta_memcpy_noinline, que lo explica: con tamanos grandes la
+ * expansion en linea son cientos de instrucciones en cada sitio, y ahi sale
+ * mas a cuenta la llamada.  Esta para poder ELEGIR; el camino en linea sigue.
+ *
+ * @param dst Destino.
+ * @param v   Byte a repetir.
+ * @param n   Cuantos bytes.
+ *
+ * @par Hilos
+ * Segura, mientras el bufer sea de quien llama.
+ *
+ * @code
+ *   vesta_memset_noinline(bloque, 0, muchos_bytes);
+ * @endcode
+ */
+VESTA_MEM_NOINLINE void vesta_memset_noinline(void *dst, uint8_t v,
+                                              size_t n) VESTA_MEM_NOEXCEPT {
+    vesta_mem_fill_dispatch(dst, v, n, 1, 1);
 }
 
 /**
@@ -146,9 +173,9 @@ VESTA_MEM_ALWAYS_INLINE void vesta_memset_inline(void *dst, uint8_t v,
         return;
     }
 #if defined(VESTA_MEM_TARGET_AVX2)
-    vesta_mem_fill_dispatch(dst, v, n, 1);
+    vesta_mem_fill_dispatch(dst, v, n, 1, 1);
 #else
-    vesta_mem_fill_dispatch(dst, v, n, 0);
+    vesta_mem_fill_dispatch(dst, v, n, 0, 1);
 #endif
 #else
     memset(dst, v, n);
@@ -156,7 +183,48 @@ VESTA_MEM_ALWAYS_INLINE void vesta_memset_inline(void *dst, uint8_t v,
 }
 
 #ifdef __cplusplus
+#include <type_traits>
+
 namespace util {
+
+/**
+ * @brief Pone a @p v los bytes de @p count objetos de tipo @p T.
+ *
+ * La version con TIPO, y se llama distinto de @c vesta_memset por lo mismo que
+ * @c util::vesta_memcopy: @c memset cuenta BYTES y @c memfill cuenta OBJETOS.
+ * Con el mismo nombre, la deduccion elegiria esta sin que nadie lo escriba y el
+ * tercer argumento cambiaria de unidad en silencio.
+ *
+ * Lo que gana con saber el tipo: @c sizeof(T) hace constante el tamano y
+ * @c alignof(T) quita el prologo de alineacion, que es lo que impedia
+ * desenrollar -- una copia de 256 bytes pasaba de linea recta a 97
+ * instrucciones con 5 ramas por culpa de ese prologo.  Ver
+ * @c util::vesta_memcopy, que lo cuenta entero.
+ *
+ * @tparam T   Tipo de los objetos.  Tiene que ser trivialmente copiable.
+ * @param dst   Destino.
+ * @param v     Byte a repetir.
+ * @param count Cuantos objetos.  Uno si no se dice.
+ *
+ * @par Hilos
+ * Segura, mientras el bufer sea de quien llama.
+ *
+ * @code
+ *   util::vesta_memfill(&cabecera, 0xFF);
+ * @endcode
+ */
+template <class T>
+[[gnu::always_inline]] inline void vesta_memfill(T *dst, uint8_t v,
+                                              size_t count = 1) noexcept {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "vesta_memfill solo vale para tipos trivialmente copiables");
+    ::vesta_mem_fill_dispatch(dst, v, sizeof(T) * count, 1, alignof(T));
+}
+
+/// @copydoc ::vesta_memset_noinline
+inline void vesta_memset_noinline(void *dst, uint8_t v, size_t n) noexcept {
+    ::vesta_memset_noinline(dst, v, n);
+}
 
 /// @copydoc ::vesta_memset
 [[gnu::always_inline]] inline void vesta_memset(void *dst, uint8_t v,

@@ -88,6 +88,53 @@ llamada:
 | :--- | :--- |
 | `vesta_memcpy` / `vesta_memset` | Despachan por CPU.  Con AVX2 en la maquina pagan una llamada, que a partir de 32 bytes sale a cuenta. |
 | `vesta_memcpy_inline` / `vesta_memset_inline` | **No llaman a nadie, nunca.**  Se quedan en el camino base -- una funcion con `target("avx2")` no se puede meter en linea en otra que no lo lleve -- y con tamano constante lo expande el compilador. |
+| `vesta_memcpy_noinline` / `vesta_memset_noinline` | Una llamada y ya.  Con tamanos grandes la expansion en linea son cientos de instrucciones EN CADA SITIO; aqui el sitio de llamada es minimo.  Estan para poder elegir, no para sustituir. |
+
+### Y en C++, la version con TIPO
+
+```cpp
+util::vesta_memcopy(&destino, &origen);       // UN objeto
+util::vesta_memcopy(v_dst, v_src, cuantos);   // `cuantos` OBJETOS
+util::vesta_memfill(&cabecera, 0);
+```
+
+`memcpy`/`memset` cuentan **bytes**; `memcopy`/`memfill` cuentan **objetos**.
+Los nombres son distintos a proposito: con el mismo nombre, la deduccion de
+plantilla elegiria la version con tipo sin que nadie lo escriba y el tercer
+argumento cambiaria de unidad en silencio.
+
+Lo que gana con saber el tipo: `sizeof(T)` hace constante el tamano y
+`alignof(T)` **quita el prologo que alinea el destino**.  Ese prologo calcula un
+desplazamiento en ejecucion, y eso convierte un tamano constante en variable, con
+lo que el bucle deja de desenrollarse.  Desensamblado, un relleno de 256 bytes
+pasa de 66 instrucciones con 4 ramas a **19 en linea recta**.
+
+Y esto **no se afirma con un cronometro sino con el desensamblado**, porque un
+banco tiene ruido y el codigo emitido no.  Instrucciones y ramas de la misma
+operacion, con el MISMO numero de bytes, en las dos secciones de
+`tests`/`validate`:
+
+| | GCC: C -> C++ | Clang: C -> C++ |
+| :--- | :--- | :--- |
+| relleno de 256 B | 94/12 ramas -> **12/1** | 49/9 -> **12/1** |
+| copia de 256 B | 92/9 -> **17/1** | 63/9 -> **16/1** |
+| relleno de 4 KiB | 204/38 -> **123/26** | 137/18 -> **97/10** |
+| copia de 1 KiB | 141/24 -> **65/14** | 108/14 -> **58/6** |
+| por debajo de 256 B | identico | identico |
+| tipo sin alineacion declarada | **identico** | **identico** |
+
+Las tres condiciones se cumplen en los dos compiladores: nunca emite mas, de
+256 en adelante emite bastante menos, y cuando el tipo no promete nada sale
+**exactamente el mismo codigo** -- el envoltorio no anade nada, que era el
+requisito.
+
+Por debajo de 256 las dos son identicas porque la cascada ya se plegaba sola:
+no habia nada que ganar, y eso es un resultado, no una decepcion.
+
+**Una trampa que costo encontrar**: un tipo sobrealineado NO puede tener un
+tamano que no sea multiplo de su alineacion -- `sizeof` se redondea hacia
+arriba, asi que un `alignas(32)` de 50 bytes mide 64 --.  Comparar "50 bytes por
+C contra un tipo de 50 declarado" es comparar 50 contra 64, y eso no mide nada.
 
 **Son cabeceras de C**, no de C++.  Para que una dependencia en C no pague una
 llamada, su compilador tiene que ver el cuerpo; una capa en C++ con envoltorio
@@ -96,7 +143,13 @@ en C daria justo el coste que se esta quitando.  En C++ estan ademas como
 y es lo que comprueba que siga siendo cierto.
 
 Lo que cuesta cada camino, medido contra la libc: `bench_memcpy` y
-`bench_memset`.
+`bench_memset`.  Las medidas NO se copian a este documento -- una tabla de
+nanosegundos aqui no dice en que maquina, en que nucleo ni con que compilador
+salio, y esas tres cosas la mueven mas que el propio codigo --: viven en
+[`bench/baseline/`](bench/baseline/), una tanda por compilador, con la ficha de
+la CPU al lado.  Ahi esta tambien lo que sigue MAL: siete filas donde la version
+con tipo pierde contra la de C, que por como esta construida no deberia poder
+pasar.
 
 ## Construir
 

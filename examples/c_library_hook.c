@@ -29,6 +29,7 @@
  */
 
 #include "util/host_allocator_c.h"
+#include "util/vesta_memset.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -59,7 +60,7 @@ static int lib_do_work(int n) {
     for (i = 0; i < n; ++i) {
         rows[i] = (char *)g_hooks.malloc_fn(128);
         if (rows[i] == NULL) return -1;
-        memset(rows[i], 0, 128);
+        vesta_memset(rows[i], 0, 128);
     }
     for (i = 0; i < n; ++i)
         g_hooks.free_fn(rows[i]);

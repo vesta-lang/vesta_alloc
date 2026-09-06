@@ -141,7 +141,7 @@ void os_free(void *addr, size_t bytes) noexcept;
  * Segura mientras los tramos no se solapen.
  *
  * @code
- *   std::memcpy(code, bytes, n);                       // escribir
+ *   vesta_memcpy(code, bytes, n);                      // escribir
  *   util::os_protect(code, n, util::OsProt::Read |
  *                             util::OsProt::Exec);     // y ya solo ejecutar
  * @endcode
@@ -168,7 +168,7 @@ bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept;
  *       util::os_release(base, size_t(1) << 30);
  *       return false;
  *   }
- *   std::memset(base, 0, 64 * 1024);               // ya se puede escribir
+ *   vesta_memset(base, 0, 64 * 1024);              // ya se puede escribir
  * @endcode
  */
 void *os_reserve(size_t bytes) noexcept;

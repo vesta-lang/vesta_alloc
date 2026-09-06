@@ -303,6 +303,45 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
 }
 
 /**
+ * @brief Sirve @p n bytes alineados a @p align, con ESTE asignador.
+ *
+ * @c host_alloc solo garantiza la alineacion natural de `operator new` -- 16
+ * bytes --, asi que un tipo con `alignas(32)` o mas no lo puede usar.  Sin esto
+ * la unica salida era el asignador del SISTEMA, y entonces el proceso acaba con
+ * dos asignadores a la vez: basta con que un objeto se reserve por un camino y
+ * se suelte por el otro para corromper el monton, y el sintoma no es un error
+ * sino una violacion de segmento en otro sitio y mucho despues.
+ *
+ * COMO: se pide de mas, se sube el puntero hasta la alineacion pedida y el
+ * original se guarda en el hueco de justo antes, que es lo unico que hace falta
+ * para poder soltarlo.  El coste es @p align - 1 + 8 bytes por bloque.
+ *
+ * @param n     Bytes utiles.
+ * @param align Alineacion pedida.  Potencia de dos, y al menos 16 -- que es lo
+ *              que el compilador garantiza al llamar a la sobrecarga alineada
+ *              de `operator new`, la unica que llega aqui --.
+ * @return El bloque alineado, o nullptr si no hay memoria.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo**, la misma que @c host_alloc: no anade estado.
+ */
+[[gnu::always_inline]] inline void *host_alloc_aligned(size_t n,
+                                                       size_t align) noexcept {
+    /* Sin comprobar que `align` llegue a 8: quien llama es la sobrecarga
+     * alineada de `operator new`, y el lenguaje solo la usa cuando la
+     * alineacion pasa de la natural, o sea 16.  Una rama que nunca se toma en
+     * el camino de reserva no se pone "por si acaso". */
+    const size_t extra = align - 1u + sizeof(void *);
+    if (__builtin_expect(n > (size_t)-1 - extra, 0)) return nullptr;
+    void *raw = host_alloc(n + extra);
+    if (__builtin_expect(raw == nullptr, 0)) return nullptr;
+    const uintptr_t base = (uintptr_t)raw + sizeof(void *);
+    const uintptr_t aligned = (base + (align - 1u)) & ~(uintptr_t)(align - 1u);
+    ((void **)aligned)[-1] = raw; // el original, para poder soltarlo
+    return (void *)aligned;
+}
+
+/**
  * @brief Devuelve un bloque de @c host_alloc.
  *
  * Vale aunque lo reservara OTRO hilo: es el caso que hunde a los asignadores
@@ -334,6 +373,21 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
         return;
     }
     detail::host_free_remote(p, h);
+}
+
+/**
+ * @brief Devuelve un bloque de @c host_alloc_aligned.
+ *
+ * NO vale para bloques de @c host_alloc, ni al reves: el puntero que se
+ * devolvio no es el que se reservo, y el original vive en el hueco de justo
+ * antes.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo**, la misma que @c host_free.
+ */
+[[gnu::always_inline]] inline void host_free_aligned(void *p) noexcept {
+    if (p == nullptr) return;
+    host_free(((void **)p)[-1]);
 }
 
 /**

@@ -78,6 +78,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_copy(uint8_t *d, const uint8_t *s,
      * sea nada o algo peor.  GCC ya emitia el direccionamiento bueno.  Se anota
      * para que nadie lo vuelva a intentar creyendo que queda ahi. */
 #if VESTA_MEM_AVX2_STEP >= 256
+    VESTA_MEM_NO_UNROLL
     while (n >= 256) {
         VESTA_MEM_KEEP_LOOP(d);
         const vesta_v32 a0 = VESTA_MEM_LOAD32(s);
@@ -101,6 +102,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_copy(uint8_t *d, const uint8_t *s,
         n -= 256;
     }
 #endif
+    VESTA_MEM_NO_UNROLL
     while (n >= 128) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memcpy
         const vesta_v32 a = VESTA_MEM_LOAD32(s);
@@ -115,6 +117,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_copy(uint8_t *d, const uint8_t *s,
         s += 128;
         n -= 128;
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 32) {
         VESTA_MEM_KEEP_LOOP(d);
         VESTA_MEM_STORE32(d, VESTA_MEM_LOAD32(s));

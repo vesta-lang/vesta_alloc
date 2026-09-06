@@ -85,11 +85,14 @@ void bench_large() {
 
 /// 3. Several threads, each minding its own business.
 void bench_threads(unsigned threads) {
-    const int per_thread = 200000;
+    /* `constexpr` y sin capturar: es una constante, asi que la lambda la usa
+     * sin llevarsela dentro.  Capturarla no daba error pero era una copia por
+     * hilo de algo que ya se conoce al compilar. */
+    constexpr int per_thread = 200000;
     std::vector<std::thread> pool;
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned t = 0; t < threads; ++t)
-        pool.emplace_back([per_thread] {
+        pool.emplace_back([] {
             for (int i = 0; i < per_thread; ++i)
                 util::host_free(
                     util::host_alloc(kSmall[i % kSmallCount]));

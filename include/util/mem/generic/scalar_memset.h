@@ -35,6 +35,7 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_scalar_fill(uint8_t *d, uint8_t v,
                                                    size_t n)
     VESTA_MEM_NOEXCEPT {
     const uint64_t pat = vesta_mem_broadcast8(v);
+    VESTA_MEM_NO_UNROLL
     while (n >= sizeof(size_t)) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memset
         __builtin_memcpy(d, &pat, sizeof(size_t)); // constante: se expande

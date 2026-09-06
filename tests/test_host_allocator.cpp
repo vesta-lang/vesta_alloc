@@ -18,6 +18,8 @@
  * asi que la prueba es tambien de integracion.
  */
 #include "util/host_allocator.h"
+#include "util/vesta_memcpy.h"
+#include "util/vesta_memset.h"
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +32,16 @@
 namespace {
 
 int g_failures = 0;
+
+/// Devuelve la misma direccion, pero el compilador deja de saber de donde sale.
+/// Se usa para leer la cabecera que el asignador pone DELANTE de un bloque: sin
+/// esto, el compilador sigue creyendo que esa direccion pertenece al objeto que
+/// hay detras y avisa de un acceso fuera de sus limites -- con razon, porque
+/// mirando solo el tipo eso es lo que parece.
+const char *opaque(const char *p) noexcept {
+    asm volatile("" : "+r"(p));
+    return p;
+}
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
@@ -60,8 +72,9 @@ int main() {
                 // Se llena con un patron dependiente del puntero: si dos
                 // reservas se solaparan, una pisaria a la otra y se veria al
                 // releer.
-                std::memset(
-                    p, static_cast<int>(reinterpret_cast<uintptr_t>(p) & 0xFF),
+                vesta_memset(
+                    p, static_cast<uint8_t>(reinterpret_cast<uintptr_t>(p) &
+                                            0xFF),
                     s);
                 live.push_back(p);
             }
@@ -148,6 +161,82 @@ int main() {
         std::printf("  sistema: %.1f ns/op   propio: %.1f ns/op   (%.2fx)\n",
                     sys, own, sys / own);
         check(own < sys, "el propio gana al del sistema");
+    }
+
+    // --- reserva SOBRE-ALINEADA -------------------------------------------
+    //
+    // Un tipo con `alignas` mayor que la natural no pasa por `operator new` a
+    // secas: el compilador emite la sobrecarga con `std::align_val_t`.  Si esa
+    // no esta sustituida, el tipo se reserva con el asignador del SISTEMA y se
+    // suelta por el camino sustituido -- dos asignadores a la vez y el monton
+    // corrompido --.  No falla al momento: revienta en otro sitio y despues.
+    //
+    // Ya paso: `ProcessVM` de la VM tiene alineacion 64 por su banco vectorial,
+    // asi que TODOS los procesos se estaban reservando fuera de este asignador
+    // sin que nada lo delatara.
+    {
+        struct alignas(64) Linea {
+            unsigned char b[64];
+        };
+        struct alignas(256) Pagina {
+            unsigned char b[1024];
+        };
+        bool alineado = true, intacto = true, del_asignador = true;
+        std::vector<Linea *> l;
+        std::vector<Pagina *> g;
+        for (int i = 0; i < 256; ++i) {
+            Linea *p = new Linea;
+            Pagina *q = new Pagina;
+            if ((reinterpret_cast<uintptr_t>(p) & 63u) != 0) alineado = false;
+            if ((reinterpret_cast<uintptr_t>(q) & 255u) != 0) alineado = false;
+            /* Que salga de ESTE asignador, no del sistema: es lo que estaba
+             * roto, y la alineacion sola no lo distingue -- el del sistema
+             * tambien alinea --.
+             *
+             * La direccion de la cabecera pasa por `opaque` ANTES de leerla.
+             * No es un apano para callar un aviso: el compilador, viendo la
+             * resta sobre un `Linea*`, deduce que se lee un elemento -1 de ese
+             * objeto y avisa -- y tiene razon en lo que ve, porque lo que hay
+             * ahi delante no es de `Linea`, es del asignador --.  La barrera es
+             * la forma de decirle justo eso: esta direccion ya no es parte de
+             * aquel objeto.
+             *
+             * Y se copia con lo NUESTRO, no con la libreria del sistema: esta
+             * libreria trae su propia copia y usar otra aqui dentro seria no
+             * fiarse de ella justo donde toca. */
+            void *const *src = reinterpret_cast<void *const *>(
+                opaque(reinterpret_cast<const char *>(p) - sizeof(void *)));
+            void *header = nullptr;
+            util::vesta_memcopy(&header, src);
+            if (util::host_alloc_active() && !util::in_region(header))
+                del_asignador = false;
+            vesta_memset(p->b, uint8_t(i & 0xFF), sizeof(p->b));
+            vesta_memset(q->b, uint8_t(i & 0xFF), sizeof(q->b));
+            l.push_back(p);
+            g.push_back(q);
+        }
+        // Releer despues de reservar de todo: si dos bloques se solaparan, uno
+        // habria pisado al otro.
+        for (int i = 0; i < 256; ++i) {
+            for (unsigned char c : l[(size_t)i]->b)
+                if (c != (unsigned char)(i & 0xFF)) intacto = false;
+            for (unsigned char c : g[(size_t)i]->b)
+                if (c != (unsigned char)(i & 0xFF)) intacto = false;
+        }
+        for (int i = 0; i < 256; ++i) {
+            delete l[(size_t)i];
+            delete g[(size_t)i];
+        }
+        check(alineado, "`new` de un tipo sobre-alineado respeta la alineacion");
+        check(intacto, "los bloques sobre-alineados no se solapan");
+        check(del_asignador,
+              "un tipo sobre-alineado sale de ESTE asignador, no del sistema");
+
+        // Y en array, que usa OTRA sobrecarga (`new[]` con alineacion).
+        Linea *arr = new Linea[16];
+        const bool arr_ok = (reinterpret_cast<uintptr_t>(arr) & 63u) == 0;
+        delete[] arr;
+        check(arr_ok, "`new[]` de un tipo sobre-alineado tambien la respeta");
     }
 
     const util::HostAllocStats s = util::host_alloc_stats();

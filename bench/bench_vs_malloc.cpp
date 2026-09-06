@@ -46,6 +46,7 @@
 #include "util/host_allocator.h"
 #include "util/host_allocator_c.h"
 #include "util/os_memory.h"
+#include "util/vesta_memset.h"
 
 #include <chrono>
 #include <cstdio>
@@ -97,7 +98,7 @@ struct Owned {
     static void *alloc(size_t n) noexcept { return g_owned.alloc(n); }
     static void *zeroed(size_t n) noexcept {
         void *p = g_owned.alloc(n);
-        if (p != nullptr) std::memset(p, 0, n);
+        if (p != nullptr) vesta_memset(p, 0, n);
         return p;
     }
     static void *grow(void *p, size_t n) noexcept {

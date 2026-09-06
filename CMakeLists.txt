@@ -247,6 +247,21 @@ endif()
 # incluye puede no usar ctest -- VestaVM no lo usa, cada prueba es un binario
 # que sale con 0 o con 1 --, y registrar ahi pruebas ajenas ensuciaria su
 # tanda.  Los binarios existen igual y se pueden lanzar desde el IDE.
+# Lo que necesita el andamiaje de `support/`, que es lo unico del arbol que lee
+# variables de entorno y escribe ficheros.
+#
+# El CRT de Microsoft marca `getenv` y `fopen` como obsoletas y propone sus
+# propias `_s`.  No lo son: son ISO C, y las `_s` no existen fuera de Windows,
+# asi que aceptar la sugerencia partiria en dos un codigo que hoy compila igual
+# en los dos sistemas.  Lo que se apaga es el aviso de un proveedor sobre el
+# estandar, no un aviso sobre este codigo -- y por eso se apaga SOLO aqui, en
+# los tests y los bancos, y nunca en la libreria.
+if(WIN32)
+    set(VESTA_ALLOC_SUPPORT_DEFS _CRT_SECURE_NO_WARNINGS)
+else()
+    set(VESTA_ALLOC_SUPPORT_DEFS)
+endif()
+
 if(VESTA_ALLOC_BUILD_TESTS)
     if(VESTA_ALLOC_STANDALONE)
         enable_testing()
@@ -257,6 +272,10 @@ if(VESTA_ALLOC_BUILD_TESTS)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)
+        target_include_directories(vesta_alloc_${_t} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/support)
+        target_compile_definitions(vesta_alloc_${_t} PRIVATE
+                ${VESTA_ALLOC_SUPPORT_DEFS})
         set_target_properties(vesta_alloc_${_t} PROPERTIES
                 FOLDER "vesta_alloc/tests")
         if(VESTA_ALLOC_STANDALONE)
@@ -320,6 +339,10 @@ if(VESTA_ALLOC_BUILD_BENCH)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)
+        # `support/` es andamiaje de lo que prueba y mide la libreria -- color y
+        # veredictos --, no parte de su interfaz, por eso no esta en `include/`.
+        target_include_directories(vesta_alloc_${_b} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/support)
         set_target_properties(vesta_alloc_${_b} PROPERTIES
                 FOLDER "vesta_alloc/bench")
     endforeach()

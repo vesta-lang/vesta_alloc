@@ -83,14 +83,18 @@ vesta_mem_sse2_fill_le128(uint8_t *d, vesta_v16 pat,
     *(vesta_v16 *)(d + n - 16) = pat;
 }
 
-VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_fill(uint8_t *d, uint8_t v,
-                                                 size_t n) VESTA_MEM_NOEXCEPT {
+VESTA_MEM_ALWAYS_INLINE void
+vesta_mem_sse2_fill(uint8_t *d, uint8_t v, size_t n,
+                    size_t known_align) VESTA_MEM_NOEXCEPT {
     /* El patron, EN REGISTRO y fuera del bucle.  La forma de construirlo no da
      * igual: ver `vesta_mem_x86_splat16`, que cuenta lo que costaba la otra. */
     const vesta_v16 pat = vesta_mem_x86_splat16(v);
     /* ALINEAR EL DESTINO antes del bucle; ver `VESTA_MEM_STORE16A`.  Rellenar
-     * solo escribe, asi que es donde mas duele que las escrituras se partan. */
-    if (n >= 32) {
+     * solo escribe, asi que es donde mas duele que las escrituras se partan.
+     * Y solo si hace falta: con @p known_align constante >= 16 esto desaparece
+     * al compilar, y el tamano sigue siendo constante para el bucle.  Ver
+     * `vesta_mem_sse2_copy`, que lo cuenta entero. */
+    if (known_align < 16 && n >= 32) {
         const size_t head = vesta_mem_x86_head_to_align(d, 16);
         if (head != 0) {
             *(vesta_v16 *)(d) = pat;
@@ -98,6 +102,7 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_fill(uint8_t *d, uint8_t v,
             n -= head;
         }
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 64) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memset
         VESTA_MEM_STORE16A(d, pat); // el destino ya esta alineado
@@ -107,6 +112,7 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_fill(uint8_t *d, uint8_t v,
         d += 64;
         n -= 64;
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 16) {
         VESTA_MEM_KEEP_LOOP(d);
         *(vesta_v16 *)(d) = pat;

@@ -14,6 +14,42 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Anadido
 
+- **Version con TIPO en C++** (`util::vesta_memcopy`, `util::vesta_memfill`) y
+  **variantes que si llaman** (`vesta_memcpy_noinline`,
+  `vesta_memset_noinline`).
+
+  El tipo trae dos datos que desde C no se pueden saber: `sizeof(T)` hace
+  constante el tamano y `alignof(T)` **quita el prologo que alinea el
+  destino**.  Ese prologo calcula un desplazamiento en ejecucion, y eso
+  convierte un tamano constante en variable, con lo que el bucle deja de
+  desenrollarse: desensamblado, un relleno de 256 bytes pasa de 66
+  instrucciones con 4 ramas a 19 en linea recta.
+
+  Donde se nota es con tamanos que NO son multiplo del ancho de una escritura,
+  ahi el prologo se paga entero.  Con tamano redondo la cascada ya se plegaba
+  sola y empatan, que es el resultado honesto.  Y con un tipo que NO declara
+  alineacion, la version con tipo no se inventa nada: sale igual que la de C.
+
+  Los tiempos NO se copian aqui: viven en `bench/baseline/`, con la maquina y
+  las condiciones de la tanda al lado, y los reproducen `bench_memcpy` y
+  `bench_memset`.  Un numero suelto en un registro de cambios no dice en que
+  maquina ni con que compilador salio, que es lo que mas lo mueve, y envejece
+  sin que nadie se entere.
+
+  Se llaman `memcopy`/`memfill` y no `memcpy`/`memset` a proposito: aquellas
+  cuentan BYTES y estas cuentan OBJETOS.  Con el mismo nombre la deduccion de
+  plantilla elegiria la version con tipo sin que nadie lo escriba y el tercer
+  argumento cambiaria de unidad en silencio -- eso no da un error, da memoria
+  pisada.
+
+  Las `noinline` estan para poder ELEGIR, no para sustituir: el camino en linea
+  sigue siendo el de siempre, y es el que se quiere en el camino caliente del
+  asignador.  Con tamanos grandes, en cambio, la expansion son cientos de
+  instrucciones en cada sitio de llamada.
+
+  Los bancos comparan ahora las TRES (C, C++ y libc) y traen tamanos que no son
+  multiplo, que es donde estaba la diferencia.
+
 - **`vesta_memcpy` y `vesta_memset`** (`util/vesta_memcpy.h`,
   `util/vesta_memset.h`, y las implementaciones en `util/mem/`).  Copiar y
   rellenar sin llamar a la biblioteca C: tipos vectoriales con despacho por
@@ -140,6 +176,43 @@ invita a creer que ampara.
 ## [Unreleased]
 
 ### Added
+
+- **Typed version in C++** (`util::vesta_memcopy`, `util::vesta_memfill`) and
+  **variants that do call** (`vesta_memcpy_noinline`, `vesta_memset_noinline`).
+
+  The type carries two facts C cannot know: `sizeof(T)` makes the length
+  constant and `alignof(T)` **removes the prologue that aligns the
+  destination**.  That prologue computes an offset at run time, which turns a
+  constant length into a variable one and stops the loop from being unrolled:
+  disassembled, a 256-byte fill goes from 66 instructions with 4 branches to 19,
+  straight line.
+
+  It shows up at sizes that are NOT a multiple of the store width, where the
+  prologue is paid in full.  At round sizes the cascade already folded on its
+  own and they tie, which is the honest result.  And with a type that declares
+  no alignment the typed version invents nothing: it comes out level with the C
+  one.
+
+  The timings are NOT copied here: they live in `bench/baseline/`, with the
+  machine and the run conditions beside them, and `bench_memcpy` /
+  `bench_memset` reproduce them.  A loose number in a changelog does not say
+  which machine or which compiler produced it -- the two things that move it
+  most -- and it goes stale without anybody noticing.
+
+  They are called `memcopy`/`memfill` and not `memcpy`/`memset` on purpose: the
+  former count BYTES and these count OBJECTS.  With the same name, template
+  deduction would pick the typed one without anybody writing it and the third
+  argument would silently change unit -- that does not give an error, it gives
+  overwritten memory.
+
+  The `noinline` ones exist so you can CHOOSE, not to replace anything: the
+  inline path is still the default and it is what the allocator's hot path
+  wants.  At large sizes, though, the expansion is hundreds of instructions at
+  every call site.
+
+  The benchmarks now compare all THREE (C, C++ and libc) on every row and over
+  the same addresses, and include sizes that are not multiples, which is where
+  the difference was.
 
 - **`vesta_memcpy` and `vesta_memset`** (`util/vesta_memcpy.h`,
   `util/vesta_memset.h`, implementations under `util/mem/`).  Copy and fill

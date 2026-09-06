@@ -15,6 +15,7 @@
  * se comeria la maquina en vez de ir mas rapido.
  */
 #include "util/scratch_arena.h"
+#include "util/vesta_memset.h"
 
 #include <atomic>
 #include <chrono>
@@ -52,7 +53,7 @@ int main() {
                 break;
             }
             if (reinterpret_cast<uintptr_t>(p) % al != 0) aligned = false;
-            std::memset(p, i & 0xFF, n);
+            vesta_memset(p, uint8_t(i & 0xFF), n);
             got.push_back(p);
         }
         check(aligned, "respeta la alineacion pedida");

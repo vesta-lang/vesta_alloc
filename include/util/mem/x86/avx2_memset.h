@@ -58,6 +58,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_fill(uint8_t *d, uint8_t v,
 #if VESTA_MEM_AVX2_STEP >= 256
     /* Ocho escrituras por vuelta.  Ver la nota de `avx2_memcpy.h`: lo que
      * sobraba era contabilidad del bucle, no trabajo. */
+    VESTA_MEM_NO_UNROLL
     while (n >= 256) {
         VESTA_MEM_KEEP_LOOP(d);
         VESTA_MEM_STORE32A(d, pat); // el destino ya esta alineado
@@ -72,6 +73,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_fill(uint8_t *d, uint8_t v,
         n -= 256;
     }
 #endif
+    VESTA_MEM_NO_UNROLL
     while (n >= 128) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memset
         VESTA_MEM_STORE32A(d, pat);
@@ -81,6 +83,7 @@ VESTA_MEM_AVX2_FN void vesta_mem_avx2_fill(uint8_t *d, uint8_t v,
         d += 128;
         n -= 128;
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 32) {
         VESTA_MEM_KEEP_LOOP(d);
         VESTA_MEM_STORE32(d, pat);

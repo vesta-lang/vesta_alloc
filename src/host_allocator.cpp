@@ -176,10 +176,14 @@ StatsDump g_stats_dump;
 void build_class_table() noexcept {
     for (size_t step = 0; step <= kMaxSmall / kAlign; ++step) {
         const size_t want = step * kAlign;
-        uint8_t k = 0;
+        /* El contador tiene el MISMO tipo que la cota con la que se compara.
+         * Con un `uint8_t`, `k + 1` se promociona a `int` con signo y la
+         * comparacion contra `kClasses`, que no lo tiene, es un aviso -- y en
+         * cuanto las clases pasaran de 127 dejaria de ser solo un aviso. */
+        uint32_t k = 0;
         while (k + 1 < kClasses && kSizes[k] < want)
             ++k;
-        g_class_of[step] = k;
+        g_class_of[step] = uint8_t(k);
     }
 }
 
@@ -1083,4 +1087,62 @@ void operator delete(void *p, const std::nothrow_t &) noexcept {
 }
 void operator delete[](void *p, const std::nothrow_t &) noexcept {
     util::host_free(p);
+}
+
+// =========================================================================
+//  operator new / delete SOBRE-ALINEADOS (C++17)
+// =========================================================================
+//
+// Un tipo con `alignas` mayor que la alineacion natural de `operator new` no
+// usa los operadores de arriba: el compilador emite las sobrecargas con
+// `std::align_val_t`.  Si no se sustituyen, TODO tipo sobre-alineado se escapa
+// del asignador -- que es justo lo que este fichero existe para impedir --.
+//
+// Y no es solo que se escape.  Reemplazar unos si y otros no deja al proceso
+// con DOS asignadores a la vez, y basta con que un objeto se reserve por un
+// camino y se suelte por el otro para corromper el monton.  El sintoma no es
+// un error: es una violacion de segmento en otro sitio y mucho despues.
+//
+// Se sirven desde el MISMO asignador -- @c util::host_alloc_aligned --, no
+// delegando en el del sistema, que es lo que hace que la promesa de este
+// fichero siga siendo cierta para todo tipo.
+
+void *operator new(size_t n, std::align_val_t a) {
+    void *p = util::host_alloc_aligned(n, (size_t)a);
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+void *operator new[](size_t n, std::align_val_t a) {
+    void *p = util::host_alloc_aligned(n, (size_t)a);
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+void *operator new(size_t n, std::align_val_t a,
+                   const std::nothrow_t &) noexcept {
+    return util::host_alloc_aligned(n, (size_t)a);
+}
+void *operator new[](size_t n, std::align_val_t a,
+                     const std::nothrow_t &) noexcept {
+    return util::host_alloc_aligned(n, (size_t)a);
+}
+
+void operator delete(void *p, std::align_val_t) noexcept {
+    util::host_free_aligned(p);
+}
+void operator delete[](void *p, std::align_val_t) noexcept {
+    util::host_free_aligned(p);
+}
+void operator delete(void *p, size_t, std::align_val_t) noexcept {
+    util::host_free_aligned(p);
+}
+void operator delete[](void *p, size_t, std::align_val_t) noexcept {
+    util::host_free_aligned(p);
+}
+void operator delete(void *p, std::align_val_t,
+                     const std::nothrow_t &) noexcept {
+    util::host_free_aligned(p);
+}
+void operator delete[](void *p, std::align_val_t,
+                       const std::nothrow_t &) noexcept {
+    util::host_free_aligned(p);
 }

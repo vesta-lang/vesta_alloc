@@ -42,6 +42,7 @@
 VESTA_MEM_ALWAYS_INLINE void
 vesta_mem_scalar_copy(uint8_t *d, const uint8_t *s,
                       size_t n) VESTA_MEM_NOEXCEPT {
+    VESTA_MEM_NO_UNROLL
     while (n >= sizeof(size_t)) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memcpy
         __builtin_memcpy(d, s, sizeof(size_t)); // constante: se expande inline
@@ -101,6 +102,7 @@ vesta_mem_scalar_copy_forward(uint8_t *d, const uint8_t *s,
 VESTA_MEM_ALWAYS_INLINE void
 vesta_mem_scalar_copy_backward(uint8_t *d, const uint8_t *s,
                                size_t n) VESTA_MEM_NOEXCEPT {
+    VESTA_MEM_NO_UNROLL
     while (n >= sizeof(size_t)) {
         n -= sizeof(size_t);
         __builtin_memcpy(d + n, s + n, sizeof(size_t)); // constante: en linea

@@ -88,6 +88,41 @@ call can happen:
 | :--- | :--- |
 | `vesta_memcpy` / `vesta_memset` | Dispatch on CPU.  On a machine with AVX2 they pay one call, which pays off from 32 bytes up. |
 | `vesta_memcpy_inline` / `vesta_memset_inline` | **Never call anybody.**  They stay on the base path -- a function with `target("avx2")` cannot be inlined into one without it -- and with a constant size the compiler expands it. |
+| `vesta_memcpy_noinline` / `vesta_memset_noinline` | One call and that's it.  At large sizes the inline expansion is hundreds of instructions AT EVERY CALL SITE; here the call site is tiny.  They exist so you can choose, not to replace anything. |
+
+### And in C++, the typed version
+
+```cpp
+util::vesta_memcopy(&dst, &src);          // ONE object
+util::vesta_memcopy(v_dst, v_src, count); // `count` OBJECTS
+util::vesta_memfill(&header, 0);
+```
+
+`memcpy`/`memset` count **bytes**; `memcopy`/`memfill` count **objects**.  The
+names differ on purpose: with the same name, template deduction would pick the
+typed one without anybody writing it, and the third argument would silently
+change unit.
+
+What the type buys: `sizeof(T)` makes the length constant and `alignof(T)`
+**removes the prologue that aligns the destination**.  That prologue computes an
+offset at run time, which turns a constant length into a variable one and stops
+the loop from being unrolled.  Disassembled, a 256-byte fill goes from 66
+instructions with 4 branches to **19, straight line**.
+
+It shows up with sizes that are NOT a multiple of the store width, which is
+where the prologue is paid in full.  At round sizes the cascade already folds on
+its own and the two tie, which is the honest result rather than a disappointing
+one.  And when the type declares no alignment, the typed version invents
+nothing: it comes out level with the C one, which is exactly what should happen.
+
+**The timings are not printed here on purpose.**  A table of nanoseconds in a
+README is out of date the day after it is written, and it cannot say which
+machine, which core, or which compiler produced it -- all three of which change
+these numbers more than the code does.  The measurements live in
+[`bench/baseline/`](bench/baseline/), one file per toolchain, with the CPU and
+the run conditions alongside them, and `bench_memcpy` / `bench_memset` reproduce
+them.  That folder also records what is still **wrong**: seven rows where the
+typed layer loses to the C one, which by construction it should not.
 
 **These are C headers, not C++ ones.**  For a C dependency to avoid paying a
 call, its compiler has to see the body; a C++ layer behind a C wrapper would

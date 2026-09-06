@@ -29,6 +29,7 @@
 #include "util/host_allocator.h"
 #include "util/host_allocator_c.h"
 #include "util/host_allocator_layout.h"
+#include "util/vesta_memset.h"
 
 #include <cstdio>
 #include <cstring>
@@ -145,7 +146,7 @@ int main() {
         check(p != nullptr && vesta_host_usable_size(p) >= 5000,
               "C: el tamano utilizable es al menos el pedido");
 
-        std::memset(p, 0xAB, 5000);
+        vesta_memset(p, 0xAB, 5000);
         void *mas = vesta_host_realloc(p, 200000);
         bool conserva = mas != nullptr;
         if (conserva) {

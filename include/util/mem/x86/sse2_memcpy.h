@@ -46,14 +46,26 @@
  *   vesta_mem_sse2_copy(dst, src, n);   // sin preguntar por la CPU
  * @endcode
  */
-VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_copy(uint8_t *d, const uint8_t *s,
-                                                 size_t n) VESTA_MEM_NOEXCEPT {
+VESTA_MEM_ALWAYS_INLINE void
+vesta_mem_sse2_copy(uint8_t *d, const uint8_t *s, size_t n,
+                    size_t known_align) VESTA_MEM_NOEXCEPT {
     /* ALINEAR EL DESTINO antes del bucle.  Se escribe un bloque sin alinear y
      * se avanza hasta el siguiente limite de 16; los bytes que el bucle vuelve
      * a escribir llevan el MISMO dato, asi que pisarlos es inofensivo.  El
      * porque de todo esto -- y lo que costaba no hacerlo -- esta en
-     * `VESTA_MEM_STORE16A`, en `x86_vec.h`. */
-    if (n >= 32) {
+     * `VESTA_MEM_STORE16A`, en `x86_vec.h`.
+     *
+     * PERO SOLO SI HACE FALTA.  @p known_align dice lo que YA se sabe de la
+     * alineacion del destino; con una constante >= 16 todo este bloque
+     * desaparece al compilar.  Y eso importa mas de lo que parece: el prologo
+     * hace `n -= head` con un @c head calculado en ejecucion, y eso convierte
+     * un tamano CONSTANTE en variable, con lo que el bucle deja de poder
+     * desenrollarse.
+     *
+     * Se dice EXPLICITAMENTE en vez de confiar en que el compilador lo deduzca
+     * del tipo del puntero: a veces lo hace y a veces no, y de eso no puede
+     * depender el rendimiento de una primitiva. */
+    if (known_align < 16 && n >= 32) {
         const size_t head = vesta_mem_x86_head_to_align(d, 16);
         if (head != 0) {
             *(vesta_v16 *)(d) = *(const vesta_v16 *)(s);
@@ -62,6 +74,7 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_copy(uint8_t *d, const uint8_t *s,
             n -= head;
         }
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 64) {
         VESTA_MEM_KEEP_LOOP(d); // que no lo cambie POR una llamada a memcpy
         const vesta_v16 a = *(const vesta_v16 *)(s);
@@ -76,6 +89,7 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_sse2_copy(uint8_t *d, const uint8_t *s,
         s += 64;
         n -= 64;
     }
+    VESTA_MEM_NO_UNROLL
     while (n >= 16) {
         VESTA_MEM_KEEP_LOOP(d);
         *(vesta_v16 *)(d) = *(const vesta_v16 *)(s);
@@ -181,6 +195,7 @@ vesta_mem_sse2_copy_le128(uint8_t *d, const uint8_t *s,
 VESTA_MEM_ALWAYS_INLINE void
 vesta_mem_sse2_copy_forward(uint8_t *d, const uint8_t *s,
                             size_t n) VESTA_MEM_NOEXCEPT {
+    VESTA_MEM_NO_UNROLL
     while (n >= 16) {
         VESTA_MEM_KEEP_LOOP(d);
         *(vesta_v16 *)(d) = *(const vesta_v16 *)(s);
@@ -218,6 +233,7 @@ vesta_mem_sse2_copy_forward(uint8_t *d, const uint8_t *s,
 VESTA_MEM_ALWAYS_INLINE void
 vesta_mem_sse2_copy_backward(uint8_t *d, const uint8_t *s,
                              size_t n) VESTA_MEM_NOEXCEPT {
+    VESTA_MEM_NO_UNROLL
     while (n >= 16) {
         n -= 16;
         *(vesta_v16 *)(d + n) = *(const vesta_v16 *)(s + n);

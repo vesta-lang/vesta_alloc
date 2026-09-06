@@ -174,6 +174,17 @@
 #define VESTA_MEM_INLINE static inline
 
 /**
+ * @def VESTA_MEM_NOINLINE
+ * @brief Una funcion de verdad, que NO se mete en linea.
+ *
+ * Sin @c inline a proposito: @c noinline junto a @c inline es una
+ * contradiccion y el compilador avisa de ella.  Y con @c unused porque al
+ * vivir en una cabecera va a haber unidades que no la llamen, y ahi un
+ * @c static sin usar tambien avisa -- dos avisos que taparian los de verdad.
+ */
+#define VESTA_MEM_NOINLINE __attribute__((noinline, unused)) static
+
+/**
  * @def VESTA_MEM_AVX2_FN
  * @brief Como se declara una rutina de AVX2, que depende de si la micro-ISA
  *        vino fijada al compilar.
@@ -232,6 +243,33 @@
 #define VESTA_MEM_KEEP_LOOP(p) __asm__ volatile("" : "+r"(p))
 #else
 #define VESTA_MEM_KEEP_LOOP(p) ((void)0)
+#endif
+
+/**
+ * @def VESTA_MEM_NO_UNROLL
+ * @brief Prohibe al compilador desenrollar el bucle que viene detras.
+ *
+ * EL DESENROLLADO YA ESTA HECHO, y a mano: cada vuelta mueve 64, 128 o 256
+ * bytes, y ese numero salio de medir.  Que el compilador desenrolle ENCIMA es
+ * pasarse por encima de una decision que ya se tomo con datos.
+ *
+ * Y no es teorico.  DESENSAMBLADO: cuando el tamano llega como constante -- que
+ * es lo normal desde la interfaz con tipo -- Clang se lleva la cuenta de
+ * vueltas al compilador y despliega el bucle entero.  Un relleno de 4 KiB pasa
+ * de 137 instrucciones a 407.  Cambia unas pocas ramas por triplicar el
+ * codigo, y a ese tamano eso no es una mejora: es presion de cache de
+ * instrucciones en cada sitio donde se llame.
+ *
+ * Con esto, lo que se emite es lo que hay escrito, y el unico efecto de saber
+ * el tamano y la alineacion es lo que se pretendia: que sobren comprobaciones,
+ * no que aparezca codigo.
+ */
+#if defined(VESTA_MEM_COMPILER_CLANG)
+#define VESTA_MEM_NO_UNROLL _Pragma("clang loop unroll(disable)")
+#elif defined(VESTA_MEM_COMPILER_GCC)
+#define VESTA_MEM_NO_UNROLL _Pragma("GCC unroll 1")
+#else
+#define VESTA_MEM_NO_UNROLL
 #endif
 
 #endif // VESTA_UTIL_MEM_CONFIG_H

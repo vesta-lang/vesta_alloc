@@ -81,8 +81,8 @@
  * @endcode
  */
 VESTA_MEM_ALWAYS_INLINE void
-vesta_mem_copy_dispatch(void *dst, const void *src, size_t n,
-                        int wide) VESTA_MEM_NOEXCEPT {
+vesta_mem_copy_dispatch(void *dst, const void *src, size_t n, int wide,
+                        size_t known_align) VESTA_MEM_NOEXCEPT {
 #if VESTA_ALLOC_FREESTANDING
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
@@ -106,13 +106,15 @@ vesta_mem_copy_dispatch(void *dst, const void *src, size_t n,
         return;
     }
 #endif
-    vesta_mem_sse2_copy(d, s, n);
+    vesta_mem_sse2_copy(d, s, n, known_align);
 #else
     vesta_mem_scalar_copy(d, s, n);
 #endif
     (void)wide;
+    (void)known_align;
 #else
     (void)wide;
+    (void)known_align;
     memcpy(dst, src, n); // respaldo: compilador sin las extensiones
 #endif
 }
@@ -135,7 +137,37 @@ vesta_mem_copy_dispatch(void *dst, const void *src, size_t n,
  */
 VESTA_MEM_ALWAYS_INLINE void vesta_memcpy(void *dst, const void *src,
                                           size_t n) VESTA_MEM_NOEXCEPT {
-    vesta_mem_copy_dispatch(dst, src, n, 1);
+    /* Desde C no se sabe nada de la alineacion, asi que se resuelve en
+     * ejecucion.  Desde C++ hay una version con tipo que si la sabe. */
+    vesta_mem_copy_dispatch(dst, src, n, 1, 1);
+}
+
+/**
+ * @brief La misma copia, pero en una funcion de VERDAD: una llamada y ya.
+ *
+ * El camino de @c vesta_memcpy se mete en linea SIEMPRE, y eso es lo que se
+ * quiere en el camino caliente de un asignador -- ahi la copia es de unos pocos
+ * bytes y la llamada costaria mas que el trabajo --.  Pero con tamanos grandes
+ * la expansion son cientos de instrucciones EN CADA SITIO donde se llame, y
+ * entonces sale mas a cuenta pagar una llamada y no hinchar la cache de
+ * instrucciones.
+ *
+ * Existe para poder elegir, no para sustituir: el camino en linea sigue ahi.
+ *
+ * @param dst Destino.
+ * @param src Origen.  No puede solapar con @p dst.
+ * @param n   Cuantos bytes.
+ *
+ * @par Hilos
+ * Segura, mientras los bufers sean de quien llama.
+ *
+ * @code
+ *   vesta_memcpy_noinline(destino, origen, muchos_bytes);
+ * @endcode
+ */
+VESTA_MEM_NOINLINE void vesta_memcpy_noinline(void *dst, const void *src,
+                                              size_t n) VESTA_MEM_NOEXCEPT {
+    vesta_mem_copy_dispatch(dst, src, n, 1, 1);
 }
 
 /**
@@ -174,9 +206,9 @@ VESTA_MEM_ALWAYS_INLINE void vesta_memcpy_inline(void *dst, const void *src,
 #if defined(VESTA_MEM_TARGET_AVX2)
     /* Con la micro-ISA fijada al compilar, el camino ancho tambien se mete en
      * linea, asi que no hay nada a lo que renunciar. */
-    vesta_mem_copy_dispatch(dst, src, n, 1);
+    vesta_mem_copy_dispatch(dst, src, n, 1, 1);
 #else
-    vesta_mem_copy_dispatch(dst, src, n, 0);
+    vesta_mem_copy_dispatch(dst, src, n, 0, 1);
 #endif
 #else
     memcpy(dst, src, n);
@@ -237,12 +269,72 @@ VESTA_MEM_INLINE void vesta_memmove(void *dst, const void *src,
 }
 
 #ifdef __cplusplus
+#include <type_traits>
+
 namespace util {
+
+/**
+ * @brief Copia @p count objetos de tipo @p T.  La version con TIPO.
+ *
+ * SE LLAMA DISTINTO A PROPOSITO, y no es cosmetica: @c memcpy cuenta BYTES y
+ * @c memcopy cuenta OBJETOS.  Con el mismo nombre, un `vesta_memcpy(p, q, n)`
+ * con @c p y @c q del mismo tipo elegiria esta -- por deduccion, sin que nadie
+ * escriba nada -- y @c n pasaria a significar objetos: se copiarian
+ * @c n*sizeof(T) bytes donde se querian @c n.  Eso no da un error, da memoria
+ * pisada.  Dos nombres, dos unidades.
+ *
+ * QUE APORTA SOBRE LA DE C, que no es poco: el tipo trae dos datos que desde C
+ * no se pueden saber, y los dos se resuelven al compilar.
+ *
+ *   - @c sizeof(T).  Con @p count constante el tamano entero lo es, y la
+ *     cascada del despachador se pliega hasta dejar la linea recta que
+ *     corresponda.  Hasta 128 bytes eso ya salia solo -- medido: 19
+ *     instrucciones y CERO ramas para una copia de 128 --, pero de ahi para
+ *     arriba no, y el motivo es el segundo dato.
+ *   - @c alignof(T).  El camino general tiene que ALINEAR el destino antes del
+ *     bucle, y para eso calcula un desplazamiento EN EJECUCION.  Eso convierte
+ *     un tamano constante en variable y el bucle deja de desenrollarse: una
+ *     copia de 256 bytes salia en 97 instrucciones con 5 ramas.  Sabiendo que
+ *     el tipo ya esta alineado, ese prologo no se emite y vuelve a ser recta.
+ *
+ * Y una tercera cosa que no es velocidad sino correccion: copiar bytes de un
+ * tipo que no es trivialmente copiable es comportamiento indefinido, y aqui se
+ * rechaza al compilar en vez de dar un objeto roto.
+ *
+ * @tparam T   Tipo de los objetos.  Tiene que ser trivialmente copiable.
+ * @param dst   Destino.
+ * @param src   Origen.  No puede solapar con @p dst.
+ * @param count Cuantos objetos.  Uno si no se dice.
+ *
+ * @par Hilos
+ * Segura, mientras los bufers sean de quien llama.
+ *
+ * @code
+ *   util::vesta_memcopy(&destino, &origen);        // UN objeto
+ *   util::vesta_memcopy(v_dst, v_src, cuantos);    // `cuantos` OBJETOS
+ *   util::vesta_memcopy<Cabecera>(d, s);           // el tipo, explicito
+ * @endcode
+ */
+template <class T>
+[[gnu::always_inline]] inline void vesta_memcopy(T *dst, const T *src,
+                                              size_t count = 1) noexcept {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "vesta_memcopy solo vale para tipos trivialmente copiables: "
+                  "copiar los bytes de cualquier otro es comportamiento "
+                  "indefinido");
+    ::vesta_mem_copy_dispatch(dst, src, sizeof(T) * count, 1, alignof(T));
+}
 
 /// @copydoc ::vesta_memcpy
 [[gnu::always_inline]] inline void vesta_memcpy(void *dst, const void *src,
                                                 size_t n) noexcept {
     ::vesta_memcpy(dst, src, n);
+}
+
+/// @copydoc ::vesta_memcpy_noinline
+inline void vesta_memcpy_noinline(void *dst, const void *src,
+                                  size_t n) noexcept {
+    ::vesta_memcpy_noinline(dst, src, n);
 }
 
 /// @copydoc ::vesta_memcpy_inline

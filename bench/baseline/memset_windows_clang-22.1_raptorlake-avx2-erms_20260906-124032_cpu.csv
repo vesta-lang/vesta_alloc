@@ -1,0 +1,2 @@
+run_id,bench,platform,uarch,isa,cpu_signature,cpu_brand,threads,l1d_bytes,l2_bytes,l3_bytes,cache_line,cpu_flags,toolchain,taken_at
+"20260906-124032","memset","windows","raptorlake","raptorlake-avx2-erms","f6m183s1","13th Gen Intel(R) Core(TM) i7-13700KF",24,49152,2097152,31457280,64,"sse2 ssse3 sse4.2 avx avx2 erms fsrm clwb hybrid","clang-22.1","2026-09-06T12:40:32"

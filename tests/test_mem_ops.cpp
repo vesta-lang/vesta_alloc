@@ -140,9 +140,11 @@ void dispatch_paths() {
     std::vector<uint8_t> src(kN), dst(kN), ref(kN, 0x11);
     fill_pattern(src.data(), kN, 3);
 
-    vesta_mem_sse2_copy(dst.data(), src.data(), kN);
+    /* Con 1 se le dice que NO se sabe nada de la alineacion, que es el caso
+     * que hay que probar: es el camino con prologo. */
+    vesta_mem_sse2_copy(dst.data(), src.data(), kN, 1);
     check(dst == src, "sse2_copy: contenido");
-    vesta_mem_sse2_fill(dst.data(), 0x11, kN);
+    vesta_mem_sse2_fill(dst.data(), 0x11, kN, 1);
     check(dst == ref, "sse2_fill: contenido");
 
 #if defined(VESTA_MEM_ARCH_X86_64)
@@ -199,6 +201,85 @@ void inline_variants() {
           "inline con tamano constante: copia");
 }
 
+/// Un tipo con alineacion declarada, que es lo que la capa con tipo aprovecha.
+struct alignas(32) Aligned32 {
+    uint8_t b[256];
+};
+/// Y uno sin nada declarado, que tiene que seguir funcionando igual.
+struct Plain {
+    uint8_t b[100];
+};
+
+/**
+ * @brief Que la capa con TIPO de C++ de lo mismo que la de bytes.
+ *
+ * Es codigo DISTINTO -- se salta el prologo de alineacion porque el tipo se lo
+ * garantiza --, asi que probar solo la de bytes lo dejaria sin mirar.  Y la
+ * garantia hay que comprobarla en las dos direcciones: con un tipo alineado,
+ * que es donde se salta el prologo, y con uno plano, donde NO puede saltarselo.
+ */
+void typed_layer() {
+    /* Un objeto suelto, alineado. */
+    {
+        Aligned32 src, dst;
+        fill_pattern(src.b, sizeof src.b, 11);
+        util::vesta_memfill(&dst, 0);
+        check(dst.b[0] == 0 && dst.b[255] == 0, "vesta_memfill: un objeto");
+        util::vesta_memcopy(&dst, &src);
+        check(std::memcmp(dst.b, src.b, sizeof src.b) == 0,
+              "vesta_memcopy: un objeto alineado");
+    }
+    /* Un array, con la cuenta en EJECUCION: ahi el tamano no es constante pero
+     * la alineacion si, que es la mitad de lo que aporta el tipo. */
+    for (size_t n = 0; n <= 5; ++n) {
+        std::vector<Aligned32> src(n + 1), dst(n + 1);
+        for (size_t i = 0; i < n; ++i)
+            fill_pattern(src[i].b, sizeof src[i].b, unsigned(i) + 3);
+        util::vesta_memcopy(dst.data(), src.data(), n);
+        check(n == 0 || std::memcmp(dst.data(), src.data(),
+                                    n * sizeof(Aligned32)) == 0,
+              "vesta_memcopy: array alineado");
+    }
+    /* Y un tipo SIN alineacion declarada y de tamano que no es potencia de dos,
+     * que es donde no se puede saltar nada. */
+    {
+        Plain src, dst;
+        fill_pattern(src.b, sizeof src.b, 17);
+        util::vesta_memfill(&dst, 0xEE);
+        check(dst.b[0] == 0xEE && dst.b[99] == 0xEE,
+              "vesta_memfill: tipo plano");
+        util::vesta_memcopy(&dst, &src);
+        check(std::memcmp(dst.b, src.b, sizeof src.b) == 0,
+              "vesta_memcopy: tipo plano");
+    }
+}
+
+/**
+ * @brief Las variantes que SI llaman.
+ *
+ * Tienen su propio cuerpo -- no son un alias -- asi que si nadie las ejecuta,
+ * nadie las prueba.
+ */
+void noinline_variants() {
+    for (size_t n = 0; n <= 300; n += 7) {
+        Guarded dst(n);
+        std::vector<uint8_t> src(n + kPad);
+        fill_pattern(src.data(), src.size(), 23);
+
+        util::vesta_memcpy_noinline(dst.data(), src.data(), n);
+        check(std::memcmp(dst.data(), src.data(), n) == 0,
+              "vesta_memcpy_noinline: contenido");
+        check(dst.intact(n), "vesta_memcpy_noinline: se escribio fuera");
+
+        Guarded f(n);
+        std::vector<uint8_t> ref(n, 0x7A);
+        util::vesta_memset_noinline(f.data(), 0x7A, n);
+        check(std::memcmp(f.data(), ref.data(), n) == 0,
+              "vesta_memset_noinline: contenido");
+        check(f.intact(n), "vesta_memset_noinline: se escribio fuera");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -217,6 +298,8 @@ int main() {
 
     dispatch_paths();
     inline_variants();
+    noinline_variants();
+    typed_layer();
 
     /* Casos de longitud cero: tienen que ser un no-op limpio, no un acceso a
      * una direccion que quiza no sea valida. */

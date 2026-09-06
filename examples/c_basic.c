@@ -21,6 +21,7 @@
  */
 
 #include "util/host_allocator_c.h"
+#include "util/vesta_memset.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,7 +35,7 @@ int main(void) {
         printf("out of memory\n");
         return 1;
     }
-    memset(buf, 'x', 100);
+    vesta_memset(buf, 'x', 100);
     printf("asked for 100 bytes, actually got %zu\n",
            vesta_host_usable_size(buf));
     printf("  (rounding up to a size class is not waste if you use it)\n");
