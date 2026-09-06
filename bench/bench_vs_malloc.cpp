@@ -46,6 +46,8 @@
 #include "util/host_allocator.h"
 #include "util/host_allocator_c.h"
 #include "util/os_memory.h"
+#include "util/host_allocator_layout.h"
+#include "util/vesta_memcpy.h"
 #include "util/vesta_memset.h"
 
 #include <chrono>
@@ -292,6 +294,90 @@ void header(const char *title) {
 const size_t kSizes[] = {16, 64, 256, 1024, 4096, 65536, 1u << 20};
 const int kSizeCount = int(sizeof(kSizes) / sizeof(kSizes[0]));
 
+// ---------------------------------------------------------------------------
+//  Lo que el reloj no ve: lo que cuesta un bloque en MEMORIA
+// ---------------------------------------------------------------------------
+//
+// Las tablas de arriba miden tiempo, y hay cambios que no lo tocan y sin
+// embargo empeoran el asignador: mover una clase de tamano, cambiar la cabecera
+// del trozo o el relleno de las reservas alineadas cambia cuanta memoria se
+// queda quieta sin que ninguna cifra de nanosegundos se mueva.
+//
+// Estas dos tablas son ARITMETICA, no medida: salen iguales en cualquier
+// maquina y en cualquier corrida.  Eso las hace mejores detectoras de
+// regresion que un tiempo -- una diferencia aqui es un cambio, nunca ruido --.
+
+/// La clase que serviria @p n bytes, buscada recorriendo la lista.  La tabla
+/// rapida se llena al arrancar el asignador; aqui hace falta la aritmetica pura.
+size_t class_for(size_t n) {
+    for (uint32_t i = 0; i < util::kClasses; ++i)
+        if (util::kSizes[i] >= n) return util::kSizes[i];
+    return 0; // por encima de las clases: lo sirve un tramo
+}
+
+/// Cuanto se queda sin usar al final de un trozo, por clase.  Un trozo no se
+/// devuelve hasta vaciarse entero, asi que lo que sobra al final esta retenido
+/// mientras viva UN solo bloque de esa clase.
+void memory_per_class() {
+    std::printf("\nwhat a chunk wastes, per size class\n");
+    std::printf("  %8s %7s %8s %10s %8s\n", "class", "chunk", "blocks",
+                "left over", "of chunk");
+    std::printf("  -------- ------- -------- ---------- --------\n");
+    for (uint32_t i = 0; i < util::kClasses; ++i) {
+        const size_t s = util::kSizes[i];
+        /* Cada clase se sirve del trozo que le toca, y hay que preguntarlo aqui
+         * en vez de dar por hecho el pequeno: las clases grandes viven en su
+         * propia region con trozos de otro tamano, que es justamente el cambio
+         * que esta tabla tiene que poder detectar. */
+        const size_t chunk =
+            s >= util::kBigClassMin ? util::kBigChunkBytes : util::kChunkBytes;
+        const size_t usable = chunk - sizeof(util::ChunkHeader);
+        const size_t blocks = usable / s;
+        const size_t left = usable - blocks * s;
+        const double pct = 100.0 * double(left) / double(chunk);
+        // Solo lo que se nota: por debajo del 1% la lista entera seria ruido.
+        if (pct >= 1.0)
+            std::printf("  %8zu %6zuK %8zu %10zu %7.1f%%\n", s, chunk >> 10,
+                        blocks, left, pct);
+    }
+}
+
+/// Lo que cuesta de mas un tipo SOBRE-ALINEADO frente a uno normal del mismo
+/// tamano.  Es el precio del relleno, y se compara contra la clase ideal para
+/// que un cambio en la formula salte aqui aunque no mueva ningun tiempo.
+void memory_over_aligned() {
+    struct Caso {
+        size_t n, align;
+    };
+    static const Caso kCasos[] = {{32, 32},     {64, 64},   {128, 64},
+                                  {1000, 64},   {4096, 64}, {1024, 256},
+                                  {4096, 4096}};
+
+    std::printf("\nwhat over-alignment costs (padding, not time)\n");
+    std::printf("  %8s %7s %9s %9s %8s\n", "size", "align", "ideal", "actual",
+                "x ideal");
+    std::printf("  -------- ------- --------- --------- --------\n");
+    for (const Caso &c : kCasos) {
+        void *p = util::host_alloc_aligned(c.n, c.align);
+        if (p == nullptr) continue;
+        /* La clase real se lee de la CABECERA del trozo del bloque original,
+         * no se recalcula: repetir aqui la formula del relleno mediria la
+         * formula y no el codigo. */
+        void *raw = nullptr;
+        vesta_memcpy(&raw, reinterpret_cast<const char *>(p) - sizeof(void *),
+                     sizeof raw);
+        const util::ChunkHeader *h = util::chunk_of(raw);
+        const size_t actual = (h->magic == util::kChunkMagic)
+                                  ? util::kSizes[h->cls]
+                                  : 0; // lo sirvio un tramo
+        const size_t ideal = class_for(c.n);
+        std::printf("  %8zu %7zu %9zu %9zu %7.2fx\n", c.n, c.align, ideal,
+                    actual, (ideal && actual) ? double(actual) / double(ideal)
+                                              : 0.0);
+        util::host_free_aligned(p);
+    }
+}
+
 /// Fewer iterations as the blocks get bigger, or the large cases dominate the
 /// wall time without adding information.
 int rounds_for(size_t size) {
@@ -353,6 +439,9 @@ int main() {
         const int n = rounds_for(s) / 8 + 1;
         row("grow to", s, abba(GrowCase{s, n}));
     }
+
+    memory_per_class();
+    memory_over_aligned();
 
     const util::OsProcessMemory pm = util::os_process_memory();
     std::printf("\nprocess peak %.1f MiB resident\n",

@@ -201,10 +201,16 @@ target_compile_features(vesta_alloc PUBLIC cxx_std_17)
 set_target_properties(vesta_alloc PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
-    # `kernel32` trae `VirtualAlloc`, `TlsAlloc` y `K32GetProcessMemoryInfo`.
-    # No hace falta `psapi`: la cabecera pide la version 2 de esa API, que vive
-    # en kernel32 -- ver `src/os_memory.cpp`.
-    target_link_libraries(vesta_alloc PUBLIC kernel32)
+    # `kernel32` trae `TlsAlloc` y `K32GetProcessMemoryInfo`.  No hace falta
+    # `psapi`: la cabecera pide la version 2 de esa API, que vive en kernel32
+    # -- ver `src/os_memory.cpp`.
+    #
+    # `ntdll` trae `NtAllocateVirtualMemory` y companyia, que es a quien se le
+    # pide la memoria: `VirtualAlloc` solo valida argumentos y llama a esa.  Se
+    # ENLAZAN en vez de resolverlas al arrancar, de forma que el sitio de
+    # llamada quede en un salto por la tabla de importacion y no en una lectura
+    # mas una comprobacion de nulo.  El motivo largo esta en `os_memory.cpp`.
+    target_link_libraries(vesta_alloc PUBLIC kernel32 ntdll)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(vesta_alloc PUBLIC Threads::Threads)
@@ -268,7 +274,7 @@ if(VESTA_ALLOC_BUILD_TESTS)
     endif()
     foreach(_t IN ITEMS test_host_allocator test_host_spans test_alloc_tag
                         test_single_owner test_thread_slot test_scratch_arena
-                        test_mem_ops)
+                        test_mem_ops test_host_layout)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)
@@ -335,7 +341,7 @@ endif()
 # -----------------------------------------------------------------------------
 if(VESTA_ALLOC_BUILD_BENCH)
     foreach(_b IN ITEMS bench_allocator bench_vs_malloc bench_reserve_cost
-                        bench_memcpy bench_memset)
+                        bench_memcpy bench_memset bench_contention)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)
