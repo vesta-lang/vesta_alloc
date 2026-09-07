@@ -16,18 +16,58 @@
 
 #include "util/host_allocator_c.h"
 
+#include "util/alloc_sites.h"
+#include "util/call_site.h"
 #include "util/host_allocator.h"
 
 #include <cstdlib>
 
+namespace {
+
+/**
+ * @brief Apunta de donde vino esta reserva, si se ha pedido medir.
+ *
+ * POR QUE HACE FALTA AQUI.  Porque el apuntado del sitio vivia SOLO en el
+ * camino de `operator new`, que es una construccion de C++.  Un programa en C
+ * -- o una libreria en C enchufada por el gancho -- reservaba a traves nuestro
+ * y salia en los contadores, pero no en NINGUN sitio: el arbol de "de donde
+ * nacen las reservas" salia vacio para la mitad del codigo que usa esta
+ * libreria.  Contar y saber de donde son dos cosas, y faltaba la segunda.
+ *
+ * @p ret es la direccion de retorno del envoltorio, o sea la instruccion
+ * siguiente a la llamada EN EL CODIGO EN C.  Vale exactamente lo mismo que el
+ * `[rsp]` que lee el parche de `operator new`, y por eso los envoltorios de
+ * abajo no se pueden meter en linea: si el compilador los fundiera con quien
+ * llama -- y con enlazado al vuelo puede --, la direccion seria la del
+ * llamante DEL llamante y el sitio saldria una funcion mas arriba, que es un
+ * dato equivocado con toda la pinta de ser correcto.
+ *
+ * Y solo cuando se ha pedido medir: una medida que nadie pidio no se paga.
+ */
+inline void note_site(const void *ret, size_t n) noexcept {
+    /* Las DOS condiciones, y la segunda importa mas de lo que parece.  Medir
+     * (`VESTA_HOST_ALLOC_STATS`) y apuntar sitios (`VESTA_HOST_ALLOC_SITES`)
+     * son peticiones distintas: el parche sobre `operator new` solo se instala
+     * con la segunda.  Sin esta comprobacion, pidiendo solo estadisticas la
+     * tabla de sitios se llenaria con lo que reserva el C y con NADA de lo que
+     * reserva el C++ -- una lista completa en apariencia que dejaria fuera la
+     * mitad del programa. */
+    if (!util::detail::g_measure || !util::call_site_patch_installed()) return;
+    const util::detail::ThreadCache *c = util::detail::current_cache();
+    util::record_alloc_site(ret, n, c != nullptr ? c->tag : 0);
+}
+
+} // namespace
 
 extern "C" {
 
-void *vesta_host_alloc(size_t n) {
-    return util::host_alloc(n);
+[[gnu::noinline]] void *vesta_host_alloc(size_t n) {
+    void *p = util::host_alloc(n);
+    note_site(__builtin_return_address(0), n);
+    return p;
 }
 
-void *vesta_host_calloc(size_t count, size_t size) {
+[[gnu::noinline]] void *vesta_host_calloc(size_t count, size_t size) {
     /* El desbordamiento del producto es un fallo clasico de `calloc`, y de los
      * caros: si se desborda se reserva de menos y se escribe de mas.  Se
      * comprueba antes de multiplicar. */
@@ -36,15 +76,23 @@ void *vesta_host_calloc(size_t count, size_t size) {
      * acaba de venir del sistema ya esta a cero y limpiarla otra vez es
      * escribir de balde.  Con bloques de 1 MiB eran veintitres veces mas lento
      * que `calloc`; ver la cabecera. */
-    return util::host_alloc_zeroed(count * size);
+    void *p = util::host_alloc_zeroed(count * size);
+    note_site(__builtin_return_address(0), count * size);
+    return p;
 }
 
-void *vesta_host_realloc(void *p, size_t n) {
+[[gnu::noinline]] void *vesta_host_realloc(void *p, size_t n) {
     /* Toda la logica -- incluido estirar un tramo en su sitio en vez de copiar
      * -- vive en la capa de C++.  Aqui no se repite ni una decision: dos
      * implementaciones del mismo `realloc` acabarian divergiendo, y la que se
      * quedara corta seria la que menos se mira. */
-    return util::host_realloc(p, n);
+    void *q = util::host_realloc(p, n);
+    /* Un `realloc` TAMBIEN se apunta, y no es un capricho: en C es la forma
+     * normal de crecer -- es el `std::vector` de aqui --, asi que dejarlo
+     * fuera esconderia justo el patron que mas interesa ver.  Se apunta con el
+     * tamano NUEVO, que es lo que se acaba de pedir. */
+    note_site(__builtin_return_address(0), n);
+    return q;
 }
 
 void vesta_host_free(void *p) {

@@ -33,7 +33,9 @@
  * preguntando `GetProcessMemoryInfo`. */
 #include <windows.h>
 #else
+#include <cstdio> // os_module_base lee /proc/self/maps
 #include <fcntl.h>
+#include <sched.h> // os_yield where there is no direct syscall
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -355,6 +357,21 @@ OsSystemMemory os_system_memory() noexcept {
     return m;
 }
 
+/* La cabecera DOS del propio modulo, que el enlazador coloca al principio de
+ * la imagen: su direccion ES la base.  Se prefiere a `GetModuleHandle` porque
+ * no es una llamada -- es un simbolo -- y porque no puede fallar. */
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+const void *os_module_base() noexcept { return &__ImageBase; }
+
+/* `SwitchToThread` is preferred over `Sleep(0)`: it yields to any READY thread
+ * on this processor even at a lower priority, which is exactly the case that
+ * matters -- the lock holder that cannot get a core.  `Sleep(0)` only yields to
+ * threads of EQUAL or higher priority, so it can return immediately without
+ * having let anybody run. */
+void os_yield() noexcept { SwitchToThread(); }
+
+
 #else // ---------------------------------------------------------------- POSIX
 
 // ---------------------------------------------------------------------------
@@ -391,6 +408,7 @@ namespace {
 constexpr long kSysMmap = 9;
 constexpr long kSysMprotect = 10;
 constexpr long kSysMunmap = 11;
+constexpr long kSysSchedYield = 24;
 constexpr long kSysMadvise = 28;
 
 /**
@@ -516,8 +534,18 @@ void os_free(void *addr, size_t bytes) noexcept {
 
 bool os_protect(void *addr, size_t bytes, OsProt prot) noexcept {
     if (addr == nullptr || bytes == 0) return false;
-    return sys_mprotect(addr, round_up(bytes, os_page_size()),
-                        kPosixProt[prot_index(prot)]);
+    /* `page_range`, not just rounding the size up: `mprotect` REQUIRES a
+     * page-aligned address and `VirtualProtect` does not -- it aligns on its
+     * own.  This rounded the size but not the address, so the very same call
+     * worked on Windows and failed on Linux with EINVAL.
+     *
+     * The `operator new` patch (`call_site.cpp`) uncovered it: it protects five
+     * bytes in the middle of a function, and on Linux none of the eight patches
+     * were installed.  This is what `os_commit` and `os_decommit` already do,
+     * and for the same reason -- this layer meaning THE SAME THING on both
+     * systems is exactly what is asked of it. */
+    page_range(addr, bytes);
+    return sys_mprotect(addr, bytes, kPosixProt[prot_index(prot)]);
 }
 
 bool os_decommit(void *addr, size_t bytes) noexcept {
@@ -625,6 +653,43 @@ OsSystemMemory os_system_memory() noexcept {
                                                     : (uint64_t(3) << 30);
     return m;
 }
+
+/**
+ * @brief La base del ejecutable, leida de `/proc/self/maps`.
+ *
+ * POR QUE ASI Y NO CON `dladdr`.  Porque `dladdr` obliga a enlazar con `dl`, y
+ * esta libreria se distribuye aparte y no arrastra dependencias que no
+ * necesita.  Esto corre UNA vez, al volcar, que es cuando el proceso ya ha
+ * terminado su trabajo -- ahi una lectura de fichero no le quita nada a nadie.
+ *
+ * La primera linea del mapa es la primera region mapeada de la imagen, y su
+ * direccion de inicio es la base.
+ */
+const void *os_module_base() noexcept {
+    static const void *cached = [] () -> const void * {
+        FILE *f = std::fopen("/proc/self/maps", "r");
+        if (f == nullptr) return nullptr;
+        char line[512];
+        const void *base = nullptr;
+        if (std::fgets(line, sizeof(line), f) != nullptr) {
+            unsigned long long start = 0;
+            if (std::sscanf(line, "%llx", &start) == 1)
+                base = reinterpret_cast<const void *>(uintptr_t(start));
+        }
+        std::fclose(f);
+        return base;
+    }();
+    return cached;
+}
+
+void os_yield() noexcept {
+#if defined(VESTA_ALLOC_RAW_SYSCALL)
+    raw_syscall(kSysSchedYield); // without going through the C library
+#else
+    sched_yield();
+#endif
+}
+
 
 #endif
 

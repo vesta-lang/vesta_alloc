@@ -108,6 +108,34 @@ namespace util {
  * Se llevan POR HILO y se suman al pedirlos, para que contarlos no obligue a
  * sincronizar en el camino rapido.
  */
+/*
+ * SIN INICIALIZADORES DE MIEMBRO AQUI, Y ESTO NO ES UN DESCUIDO.
+ *
+ * Poner `= 0` o `= {}` en los campos hace que la estructura deje de tener
+ * construccion TRIVIAL, y eso se propaga: `ThreadCache` la contiene, asi que
+ * `g_caches` deja de ser un array que el cargador pone a cero y pasa a tener un
+ * INICIALIZADOR DINAMICO que corre entre los constructores globales.
+ *
+ * Y ahi esta la trampa, porque el asignador se usa ANTES.  El estandar no
+ * ordena los constructores de unidades distintas: cualquier global de otro
+ * fichero que reserve arranca el asignador, que se monta y empieza a servir.
+ * Cuando por fin le toca el turno a ESTE fichero, su inicializador hace un
+ * `rep stos` sobre `g_caches` y **borra lo que el asignador ya tenia**: las
+ * listas libres con sus bloques, el identificador, la marca de usado, los
+ * tramos guardados y las cuentas.
+ *
+ * Medido en el compilador: 13.702 reservas atendidas y contadas, y de golpe
+ * todo a cero.  Los bloques que colgaban de esas listas se pierden -- nadie los
+ * vuelve a ver -- y el hilo sigue apuntando a un cache recien borrado.  No
+ * fallaba nada: el programa seguia, reservando de nuevo lo perdido, y las
+ * cifras que publicaba el asignador contaban desde ese punto como si el
+ * arranque no hubiera existido.
+ *
+ * Con la estructura trivial, `g_caches` vive en `.bss`, lo pone a cero el
+ * cargador antes de que corra una sola instruccion, y no hay ningun momento en
+ * el que alguien pueda borrarlo.  Quien necesite una copia a cero en la pila
+ * que la pida: `HostAllocStats t{};`.
+ */
 struct HostAllocStats {
     /**
      * @brief Reservas pequenas, repartidas POR ETIQUETA.
@@ -118,14 +146,14 @@ struct HostAllocStats {
      * la suma de esto -- y por eso llevar el reparto no cuesta ni una
      * instruccion extra en el camino caliente.
      */
-    uint64_t by_tag[AllocTag::kSlots] = {};
-    uint64_t small_allocs = 0;   ///< suma de @c by_tag; la rellena el que pide
-    uint64_t small_frees = 0;    ///< liberaciones del propio hilo
-    uint64_t remote_frees = 0;   ///< liberaciones hechas por OTRO hilo
-    uint64_t large_allocs = 0;   ///< reservas grandes, servidas por tramos
-    uint64_t large_frees = 0;    ///< tramos devueltos
-    uint64_t chunks = 0;         ///< trozos pedidos a la region
-    uint64_t bytes_reserved = 0; ///< bytes comprometidos de la region
+    uint64_t by_tag[AllocTag::kSlots];
+    uint64_t small_allocs;       ///< suma de @c by_tag; la rellena el que pide
+    uint64_t small_frees;        ///< liberaciones del propio hilo
+    uint64_t remote_frees;       ///< liberaciones hechas por OTRO hilo
+    uint64_t large_allocs;       ///< reservas grandes, servidas por tramos
+    uint64_t large_frees;        ///< tramos devueltos
+    uint64_t chunks;             ///< trozos pedidos a la region
+    uint64_t bytes_reserved;     ///< bytes comprometidos de la region
     /**
      * @brief Veces que se pidio identificador de dueno y no quedaba.
      *
@@ -138,12 +166,12 @@ struct HostAllocStats {
      * No se lleva por hilo: quien la incrementa es precisamente el que no
      * consiguio uno.
      */
-    uint64_t no_owner_id = 0;
+    uint64_t no_owner_id;
     /// Reparto de los tamanos PEDIDOS.  Los tramos exactos estan en
     /// `kBucketLimit`, en el `.cpp`; llegan hasta arriba porque hay que poder
     /// ver la COLA para decidir como servir las reservas grandes.  Solo se
     /// llena con VESTA_HOST_ALLOC_STATS=1.
-    uint64_t size_hist[12] = {};
+    uint64_t size_hist[12];
 };
 
 namespace detail {
@@ -193,6 +221,31 @@ struct alignas(64) ThreadCache {
     ChunkHeader *span_cache[kSpanCacheSlots];
     HostAllocStats stats;
 };
+
+/**
+ * EL GUARDIAN DE LO ANTERIOR, y no es una formalidad: esto ya se rompio.
+ *
+ * Mientras estas dos sean de construccion TRIVIAL, el array de caches vive en
+ * `.bss` y lo pone a cero el cargador, antes de que corra una sola instruccion
+ * del programa.  En cuanto alguien le pone un `= 0` a un campo, dejan de serlo
+ * y el array pasa a tener un inicializador DINAMICO que corre entre los
+ * constructores globales -- y el asignador ya esta sirviendo para entonces,
+ * porque los globales de otras unidades reservan y el estandar no ordena entre
+ * unidades --.  Resultado medido: 13.702 reservas atendidas y luego un
+ * `rep stos` que se lleva las listas libres, los identificadores y las cuentas.
+ *
+ * No fallaba nada.  Se perdian los bloques que colgaban de esas listas y las
+ * cifras contaban desde ahi como si el arranque no hubiera existido.  Por eso
+ * la comprobacion es de COMPILACION: un test tendria que depender del orden de
+ * inicializacion entre unidades, que es justo lo que no esta definido.
+ */
+static_assert(__is_trivially_constructible(HostAllocStats),
+              "HostAllocStats must be constructible without running code: "
+              "otherwise the cache array is initialised AFTER the allocator is "
+              "already in use, and wipes what it had");
+static_assert(__is_trivially_constructible(ThreadCache),
+              "ThreadCache must be constructible without running code: see the "
+              "note above, this has been broken once already");
 
 /// La ranura por hilo donde vive el puntero al cache.  Ver `util/thread_slot.h`.
 extern ThreadSlot g_cache_slot;
@@ -325,6 +378,36 @@ void host_free_not_small(void *p, ChunkHeader *h) noexcept;
  */
 void host_free_big(void *p) noexcept;
 
+/// Thread slot of the lock-free per-thread policy.  Separate from
+/// @c g_cache_slot because a thread may use both allocators at once.
+extern ThreadSlot g_per_thread_slot;
+
+/// Registers this thread with the lock-free policy and hands it its own cache.
+/// Cold: runs ONCE per thread.  Returns nullptr only when that policy's id pool
+/// is exhausted -- there is no shared fallback here, by design.
+ThreadCache *per_thread_cache_slow() noexcept;
+
+/// This thread's cache under the lock-free policy, or nullptr the first time.
+/// @par Threads
+/// Safe: a thread slot is private to the thread that reads it.
+[[gnu::always_inline]] inline ThreadCache *per_thread_cache() noexcept {
+    return static_cast<ThreadCache *>(g_per_thread_slot.get());
+}
+
+/**
+ * @brief Para el proceso: ha llegado a soltarse un bloque que no es nuestro.
+ *
+ * NO DEVUELVE.  Es la otra mitad de no tener respaldo al reservar: si nadie se
+ * cae al sistema pidiendo, no puede haber bloques del sistema que soltar, y uno
+ * que aparezca es la prueba de que alguien reservo por una puerta que no
+ * miramos.  Pasarselo a `free` funcionaria -- y esa es justamente la trampa:
+ * el programa seguiria, mas lento, y las cifras del asignador dejarian de
+ * describir lo que pasa sin que nada fallara.
+ *
+ * Fuera de linea y fria: el camino caliente de soltar no la ve.
+ */
+[[noreturn]] void no_foreign_free(void *p) noexcept;
+
 } // namespace detail
 
 /**
@@ -434,8 +517,13 @@ void host_free_big(void *p) noexcept;
             detail::host_free_big(p);
             return;
         }
-        std::free(p);
-        return;
+        /* NO ES NUESTRO, y eso no puede pasar: si nadie cae al sistema al
+         * reservar, no hay bloques del sistema que soltar.  Que llegue uno
+         * significa que alguien reservo por otra puerta, y devolverselo a
+         * `free` lo taparia -- el programa seguiria y las cuentas dejarian de
+         * cuadrar sin que nada lo dijera.  Ver `no_fallback`. */
+        // std::free(p);
+        detail::no_foreign_free(p);
     }
     ChunkHeader *h = chunk_of(p);
     if (h->magic != kChunkMagic) {
@@ -494,9 +582,25 @@ void host_free_big(void *p) noexcept;
  */
 class AllocScope {
   public:
+    /**
+     * @brief Pone la etiqueta y guarda la que habia.
+     *
+     * EL CASO DE SIEMPRE VA EN LINEA.  Un hilo tiene cache desde su primera
+     * reserva, asi que lo normal es una lectura de la ranura y dos escrituras,
+     * sin ninguna llamada.  `ensure_cache` esta fuera de linea y solo se paga
+     * la primera vez de cada hilo.
+     *
+     * Importa mas de lo que parece porque esto ya no se abre solo una vez por
+     * fase: el pool de hilos construye uno por TAREA para que la etiqueta viaje
+     * con el trabajo repartido (D11 del plan de reservas).
+     */
     explicit AllocScope(AllocTag t) noexcept
-        : c_(detail::ensure_cache()), prev_(c_ != nullptr ? c_->tag : 0) {
-        if (c_ != nullptr) c_->tag = t.raw();
+        : c_(detail::current_cache()), prev_(0) {
+        if (__builtin_expect(c_ == nullptr, 0)) c_ = detail::ensure_cache();
+        if (__builtin_expect(c_ != nullptr, 1)) {
+            prev_ = c_->tag;
+            c_->tag = t.raw();
+        }
     }
     ~AllocScope() noexcept {
         if (c_ != nullptr) c_->tag = prev_;
@@ -541,6 +645,49 @@ class AllocScope {
  * @endcode
  */
 HostAllocStats host_alloc_stats();
+
+/**
+ * @brief Cuanto ESPACIO DE DIRECCIONES tiene reservado la region, en bytes.
+ *
+ * No es memoria: reservar solo aparta direcciones y no cuesta nada hasta que se
+ * COMPROMETE.  Lo comprometido es otra cifra y ya estaba a la vista
+ * (@c HostAllocStats::bytes_reserved); esta faltaba, y sin las dos no se puede
+ * responder a "cuanto ocupa esto", que es la pregunta que se hace todo el que
+ * se lleva la libreria.
+ *
+ * Cero si la region aun no se ha montado -- se monta en la primera reserva
+ * grande --, lo que tambien es una respuesta.
+ *
+ * @par Hilos
+ * Segura desde cualquier hilo.  Es una lectura atomica relajada.
+ *
+ * @code
+ *   std::printf("reservado %.1f MiB, comprometido %.1f MiB\n",
+ *               util::host_region_reserved() / (1024.0 * 1024.0),
+ *               util::host_alloc_stats().bytes_reserved / (1024.0 * 1024.0));
+ * @endcode
+ */
+size_t host_region_reserved() noexcept;
+
+/**
+ * @brief Cuantas veces ha entrado `operator new`.  Cero si no se esta midiendo.
+ *
+ * POR QUE NO BASTA CON `HostAllocStats`.  Esa cuenta RESERVAS servidas; esta
+ * cuenta ENTRADAS por la puerta del lenguaje.  Deberian coincidir, y cuando no
+ * coinciden es cuando hace falta saberlo: con una sola de las dos, un descuadre
+ * entre la tabla de sitios y el reparto por proposito no se puede atribuir a
+ * ninguna de las dos partes, y se acaba deduciendo por eliminacion.
+ *
+ * Se lleva por hilo y sin atomicos -- una linea de cache por dueno --, asi que
+ * no introduce contencion donde no la habia.  La unica cifra aproximada es la
+ * de los hilos que se quedaron sin cache propio, que pueden pisarse entre
+ * ellos; normalmente es cero.
+ *
+ * @par Hilos
+ * Segura.  Suma lecturas simples; puede ver una cuenta a medio actualizar de un
+ * hilo que este reservando en ese instante.
+ */
+uint64_t host_new_calls() noexcept;
 
 /**
  * @brief Un asignador de UN SOLO DUENO, sin nada que sincronizar.
@@ -619,17 +766,46 @@ class SingleOwnerAllocator {
         return p;
     }
 
-    /// Devuelve un bloque.  Vale aunque lo reservara otro.
+    /**
+     * @brief Returns a block.  Works even if somebody else allocated it.
+     *
+     * IT LOOKS AT BOTH REGIONS, and that is not a detail.  Size classes from
+     * `kBigClassMin` upwards live in the BIG region, so `in_region` says no and
+     * this used to fall through to the general path -- which re-derives the
+     * owner from the THREAD SLOT, not from this allocator.  Because a
+     * single-owner id is decoupled from any thread, the two never matched:
+     * every 4 KiB free ended up on the remote stack, paying a
+     * `compare_exchange`.
+     *
+     * Measured before touching anything, 20,000 blocks per size: at 64 and
+     * 1024 bytes all 20,000 frees were local; at 4096 and 8192, all 20,000
+     * were REMOTE.  That is what made the single-owner column 2-3x worse than
+     * the shared one from exactly that size upwards.
+     *
+     * The small path pays nothing: the second question is only asked once the
+     * first has already said no, which is precisely where this used to give up.
+     *
+     * @code
+     *   util::SingleOwnerAllocator a;
+     *   void *small = a.alloc(64);    // small region
+     *   void *big   = a.alloc(4096);  // big region
+     *   a.free(big);                  // local push, no atomic
+     *   a.free(small);
+     * @endcode
+     */
     [[gnu::always_inline]] void free(void *p) noexcept {
         if (p == nullptr) return;
-        if (cache_ == nullptr || !in_region(p)) {
-            host_free(p);
-            return;
-        }
-        ChunkHeader *h = chunk_of(p);
-        if (h->magic == kChunkMagic && h->owner == cache_->id) {
-            detail::push_block(cache_, p, h->cls);
-            return;
+        if (cache_ != nullptr) {
+            ChunkHeader *h = nullptr;
+            if (in_region(p))
+                h = chunk_of(p);
+            else if (in_big_region(p))
+                h = big_chunk_of(p);
+            if (h != nullptr && h->magic == kChunkMagic &&
+                h->owner == cache_->id) {
+                detail::push_block(cache_, p, h->cls);
+                return;
+            }
         }
         host_free(p); // de otro dueno, o un tramo: por el camino de siempre
     }
@@ -649,6 +825,119 @@ class SingleOwnerAllocator {
   private:
     detail::ThreadCache *cache_;
 };
+
+/**
+ * @brief Many threads, and NOT ONE LOCK on the small path.
+ *
+ * WHAT IT IS FOR.  The process-wide allocator bounds MEMORY: it can name at
+ * most `kMaxThreads` owners, and a thread that does not get one is served from
+ * the shared lists behind a spin lock.  That bound is the right default for
+ * something that serves the whole process, but it has a price, and the price
+ * was measured: past the point where the threads on the shared path outnumber
+ * the cores, the lock stops being a wait and becomes a convoy.  With 20,000
+ * allocations per thread on a 24-core machine, CPU time per operation went
+ * 46.5 -> 167.4 -> 537.1 ns at 21, 25 and 65 threads on the shared path, doing
+ * exactly the same work.
+ *
+ * This type bounds LATENCY instead.  Every thread gets a cache of its own, so
+ * allocating and freeing take no lock ever, and there is no shared fallback to
+ * fall into.  What it costs is memory: one cache per live thread, out of a pool
+ * of `kPerThreadCaches`.
+ *
+ * NEITHER IS BETTER.  They bound different things, and that is exactly why both
+ * exist rather than one replacing the other.  Pick this one when the thread
+ * count is known and latency matters; keep the shared one when threads are
+ * unbounded and memory must not grow with them.
+ *
+ * WHAT IS STILL SHARED.  Only allocations up to `kMaxSmall` are lock-free.
+ * Anything larger is a span, and spans go through the general path, which does
+ * take the span lock -- rarely, since spans are the uncommon case.
+ *
+ * @par Threads
+ * **Safe from any thread.**  Every thread that calls this gets its own cache on
+ * its first allocation and gives it back when it dies.  A block may be freed
+ * from a different thread than the one that allocated it: that goes down the
+ * general path, exactly like everywhere else in this allocator.
+ *
+ * @code
+ *   // One instance per call site, or none at all: it holds no state.
+ *   util::PerThreadAllocator a;
+ *   void *p = a.alloc(256);
+ *   a.free(p);
+ *
+ *   // Equivalent, and this is the form that shows it is a choice of TYPE:
+ *   void *q = util::PerThreadAllocator::alloc(256);
+ *   util::PerThreadAllocator::free(q);
+ * @endcode
+ */
+class PerThreadAllocator {
+  public:
+    /**
+     * @brief Serves @p n bytes without taking any lock.
+     *
+     * Falls back to the general path in two cases, and both are the uncommon
+     * one: a span (larger than `kMaxSmall`), and a pool with no id left.
+     */
+    [[gnu::always_inline]] static void *alloc(size_t n) noexcept {
+        detail::ThreadCache *c = detail::per_thread_cache();
+        if (__builtin_expect(c == nullptr, 0)) {
+            c = detail::per_thread_cache_slow();
+            if (c == nullptr) return host_alloc(n); // pool exhausted
+        }
+        if (n - 1 >= kMaxSmall) return host_alloc(n); // spans: general path
+        if (detail::g_measure) detail::record_size(c, n);
+        const uint32_t k = class_of(n);
+        void *p = detail::pop_block(c, k);
+        if (p == nullptr) return detail::host_alloc_refill(c, k, n);
+        return p;
+    }
+
+    /**
+     * @brief Returns a block.  Works even if another thread allocated it.
+     *
+     * Looks at BOTH regions before giving up, for the same reason
+     * @c SingleOwnerAllocator::free does: size classes from `kBigClassMin`
+     * upwards live in the big region, so asking only `in_region` would send
+     * every one of those frees down the general path -- and there the owner is
+     * re-derived from the OTHER thread slot, which never matches, turning each
+     * one into an atomic push.
+     */
+    [[gnu::always_inline]] static void free(void *p) noexcept {
+        if (p == nullptr) return;
+        detail::ThreadCache *c = detail::per_thread_cache();
+        if (c != nullptr) {
+            ChunkHeader *h = nullptr;
+            if (in_region(p))
+                h = chunk_of(p);
+            else if (in_big_region(p))
+                h = big_chunk_of(p);
+            if (h != nullptr && h->magic == kChunkMagic &&
+                h->owner == c->id) {
+                detail::push_block(c, p, h->cls);
+                return;
+            }
+        }
+        host_free(p); // another owner, or a span: the usual path
+    }
+};
+
+/**
+ * @brief How many times @c PerThreadAllocator ran out of caches.
+ *
+ * IT HAS TO BE ASKABLE.  This policy has no shared fallback on purpose, so
+ * exhausting the pool means threads silently going down the general path --
+ * that is, back behind the lock this type exists to avoid.  Non-zero here means
+ * `kPerThreadCaches` is too small for the program, and the only symptom
+ * otherwise would be "it got slower for no visible reason".
+ *
+ * @return Times a thread asked for a per-thread cache and none was left.
+ *
+ * @code
+ *   if (util::host_per_thread_exhausted() != 0)
+ *       report("more live threads than per-thread caches");
+ * @endcode
+ */
+uint64_t host_per_thread_exhausted() noexcept;
 
 /**
  * @brief Sirve @p n bytes PUESTOS A CERO.

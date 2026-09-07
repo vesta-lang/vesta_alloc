@@ -368,6 +368,58 @@ struct OsSystemMemory {
  */
 OsSystemMemory os_system_memory() noexcept;
 
+/**
+ * @brief Donde esta cargado el ejecutable.
+ *
+ * PARA QUE.  Para volcar una direccion de codigo como BASE + DESPLAZAMIENTO en
+ * vez de absoluta.  Con la disposicion aleatoria del espacio de direcciones, la
+ * direccion absoluta de una corrida no se puede leer con el binario de otra:
+ * `addr2line` daria otra funcion, o ninguna, y el volcado pareceria correcto.
+ *
+ * Se pregunta UNA vez y se guarda: no cambia mientras el proceso vive.
+ *
+ * @return La base, o nullptr si el sistema no la da -- y entonces quien vuelque
+ *         tiene que decir que las direcciones no son resolubles, no callarse.
+ *
+ * @code
+ *   const uintptr_t off = uintptr_t(pc) - uintptr_t(util::os_module_base());
+ *   // addr2line -f -C -e binario 0x<off>
+ * @endcode
+ */
+const void *os_module_base() noexcept;
+
+/**
+ * @brief Gives the core up to another thread that is ready to run.
+ *
+ * THIS IS NOT `cpu_relax`, and the difference is the one between waiting and
+ * getting in the way.  `cpu_relax` tells the PROCESSOR that this is a wait, but
+ * the thread still owns the core; this hands it to somebody else.
+ *
+ * WHY IT IS NEEDED.  A spin that never yields is only correct while there are
+ * fewer spinners than cores.  Past that point the lock holder can lose its
+ * processor, and then every other spinner burns its WHOLE quantum waiting on a
+ * thread that is not running -- a convoy.  A waiter cannot fix that by spinning
+ * faster: the only thing that helps is handing the core back so the holder can
+ * reach the release.
+ *
+ * Measured in this allocator on the shared lock: the knee appeared exactly when
+ * spinners went past 24 on a 24-core machine, and from there CPU time per
+ * operation grew 19x without doing any more work.
+ *
+ * Call it ONLY after spinning for a while: yielding to nobody costs a system
+ * call, so in the normal case -- little contention -- this is never reached.
+ *
+ * @code
+ *   for (unsigned i = 0; i < kSpins; ++i) {
+ *       if (try_take()) return;   // spin first, it is usually enough
+ *       cpu_relax();
+ *   }
+ *   util::os_yield();             // only once spinning has clearly failed
+ * @endcode
+ */
+void os_yield() noexcept;
+
+
 } // namespace util
 
 #endif // VESTA_UTIL_OS_MEMORY_H

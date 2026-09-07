@@ -15,11 +15,17 @@
  * construir, esa reentrada se queda esperando su guarda para siempre y el
  * proceso cuelga antes de llegar a `main`.  Costo encontrarlo.
  *
- * Por eso las dos variables de entorno que mira este fichero se leen con
- * `getenv` a pelo.  Y de paso es lo que permite que esta libreria no dependa de
- * nada del compilador. */
+ * Y tampoco con `getenv`, que tiene un problema distinto: no lee el entorno,
+ * lee una COPIA que el runtime de C monta al arrancar, y esto puede correr
+ * antes de que exista.  Las variables de este fichero se leen del bloque que
+ * dio el sistema, por `util/os_env.h`.  De paso es lo que permite que esta
+ * libreria no dependa de nada del compilador. */
 #include "util/host_allocator.h"
 
+#include "util/alloc_sites.h"
+#include "util/call_site.h"
+
+#include "util/os_env.h"
 #include "util/os_memory.h"
 #include "util/thread_slot.h"
 #include "util/vesta_memcpy.h"
@@ -55,11 +61,16 @@ uint8_t g_class_of[(kMaxSmall / kAlign) + 1];
 /// que cambia por hilo es el CONTENIDO de la ranura.
 ThreadSlot g_cache_slot;
 
+/// The same thing for the lock-free per-thread policy.  A separate slot because
+/// a thread can use both allocators, and each has to find its own cache.
+ThreadSlot g_per_thread_slot;
+
 bool g_measure = false;
 
 } // namespace detail
 
 using detail::g_cache_slot;
+using detail::g_per_thread_slot;
 using detail::g_class_of;
 using detail::g_measure;
 using detail::g_region_base;
@@ -93,7 +104,11 @@ constexpr uint32_t kSizeBuckets =
 //  Estado
 // =========================================================================
 
-ThreadCache g_caches[kMaxThreads];
+/* Both policies index this: ids below `kMaxThreads` belong to the shared
+ * allocator, the rest to `PerThreadAllocator`.  One table means `h->owner`
+ * stays a plain index -- no indirection on the remote-free path -- and a block
+ * can be freed through either door without a special case. */
+ThreadCache g_caches[kTotalCaches];
 
 /**
  * @brief El ultimo cache es COMPARTIDO, no de un hilo.
@@ -111,14 +126,84 @@ ThreadCache g_caches[kMaxThreads];
  * cruzadas y las estadisticas funcionan sin ningun caso especial.
  */
 constexpr uint32_t kSharedCacheId = kMaxThreads - 1;
-std::atomic_flag g_shared_lock = ATOMIC_FLAG_INIT;
+/**
+ * @brief A breather for the processor inside a spin.
+ *
+ * It neither sleeps nor gives up the core: it tells the execution unit that
+ * this is a wait, so it stops filling the window with speculative loads that
+ * have to be squashed on the way out, and it hands the sibling thread over to
+ * the neighbour.
+ *
+ * It lives up here because BOTH locks use it -- the span one and the shared
+ * cache one -- and the latter is declared first.
+ */
+[[gnu::always_inline]] inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+/**
+ * @brief The shared cache lock, with a cache line all to itself.
+ *
+ * On its own it shared a line with whatever the linker put next to it, so
+ * anybody spinning on it also invalidated unrelated data.
+ */
+struct alignas(64) SharedLockWord {
+    std::atomic<uint32_t> v;
+    char pad[64 - sizeof(std::atomic<uint32_t>)];
+};
+SharedLockWord g_shared_lock{{0}, {}};
+
+/**
+ * @brief Takes and releases the shared cache lock.
+ *
+ * LOOK BEFORE YOU TRY, same as @c SpanLock: spinning on a bare exchange is one
+ * read-modify-write per turn, and that steals the line in exclusive state from
+ * the holder -- precisely the one that needs it in order to release.
+ *
+ * AND ALSO YIELD, which is what this lock needs and the span one does not.  The
+ * difference is how many contend: spans are touched once in a while, whereas
+ * every thread that ran out of an owner id comes through here, on every single
+ * allocation.  Once those outnumber the cores, spinning without yielding stops
+ * being a wait and becomes a convoy: the holder loses its processor and
+ * everybody else burns a whole quantum waiting on a thread that is not running.
+ *
+ * MEASURED, not assumed.  With 20,000 allocations per thread on a 24-core
+ * machine, the knee landed exactly when the shared path went past 24 threads:
+ *
+ *     threads   on shared   CPU ns per operation
+ *          84          21                   46.5
+ *          88          25                  167.4   <- the knee
+ *         128          65                  537.1
+ *
+ * The useful work is the SAME in all three rows; what grows 19x is processor
+ * time burned spinning.  That is why the spin count before yielding is small:
+ * if the holder is running it releases quickly and the yield is never reached;
+ * if it is not, spinning harder will not wake it up.
+ *
+ * @note This is the bounded-MEMORY policy.  A caller that would rather bound
+ *       LATENCY takes no lock at all -- see the per-thread allocator, which
+ *       gives every thread its own cache instead of sharing one.
+ */
+constexpr uint32_t kSharedSpins = 64;
 
 struct SharedLock {
     SharedLock() noexcept {
-        while (g_shared_lock.test_and_set(std::memory_order_acquire)) {
+        for (;;) {
+            for (uint32_t i = 0; i < kSharedSpins; ++i) {
+                if (g_shared_lock.v.exchange(1, std::memory_order_acquire) == 0)
+                    return;
+                // Mirar sin tocar mientras siga cogido.
+                while (g_shared_lock.v.load(std::memory_order_relaxed) != 0)
+                    cpu_relax();
+            }
+            os_yield();
         }
     }
-    ~SharedLock() { g_shared_lock.clear(std::memory_order_release); }
+    ~SharedLock() { g_shared_lock.v.store(0, std::memory_order_release); }
 };
 
 /**
@@ -149,7 +234,49 @@ struct SharedLock {
 struct alignas(64) RemoteLists {
     std::atomic<void *> head[kClasses];
 };
-RemoteLists g_remote[kMaxThreads];
+RemoteLists g_remote[kTotalCaches];
+
+/**
+ * @brief Cuantas veces ha entrado `operator new` POR HILO, solo al medir.
+ *
+ * POR QUE EXISTE.  Porque sin el, "cuantas veces se pidio reservar" y "cuantas
+ * reservas conto el asignador" no se pueden separar: si no cuadran, no hay
+ * forma de saber cual de las dos miente.  Es la tercera pata de la medida, y
+ * este es su sitio -- `new_measured` solo existe cuando se ha pedido medir --.
+ *
+ * UNA LINEA POR DUENO Y SIN ATOMICOS, que es lo unico que hay que respetar al
+ * tocarlo.  Un contador global con `fetch_add` seria una linea de cache que se
+ * pelean todos los hilos EN CADA RESERVA, o sea que mediria mas despacio de lo
+ * que hay -- el instrumento cambiando lo que mide --.  Aqui cada hilo escribe
+ * en la suya, sin sincronizar nada, igual que sus listas.
+ */
+struct alignas(64) NewCalls {
+    uint64_t n;
+    char pad[64 - sizeof(uint64_t)];
+};
+NewCalls g_new_calls[kMaxThreads + 1]; ///< la ultima, para los hilos sin cache
+
+} // namespace
+
+namespace detail {
+
+/**
+ * @brief Apunta una entrada de `operator new`.  Solo se llama al medir.
+ *
+ * La ranura sale del dueno, asi que la escritura es de un solo hilo y no hace
+ * falta sincronizar.  La EXCEPCION es la ultima -- los hilos que se quedaron
+ * sin cache propio --, que si pueden pisarse: ahi la cifra es aproximada y se
+ * dice al ensenarla, en vez de fingir exactitud sobre un caso que ademas es
+ * raro.
+ */
+void note_new_call(const ThreadCache *c) noexcept {
+    g_new_calls[c != nullptr ? c->id : kMaxThreads].n++;
+}
+
+
+} // namespace detail
+
+namespace {
 
 std::atomic<size_t> g_chunk_next{0};
 
@@ -218,29 +345,51 @@ void build_class_table() noexcept {
 bool allocator_active() noexcept {
     const int s = g_active_state.load(std::memory_order_acquire);
     if (s != 0) return s == 1;
-    /* Se deja APAGADO antes de preguntar al entorno: si `getenv` pidiera
+    /* Se deja APAGADO antes de preguntar al entorno: si preguntar pidiera
      * memoria por dentro, esa peticion entraria aqui otra vez y se quedaria
      * dando vueltas.  Asi lo peor que pasa es que la primera reserva vaya al
      * sistema. */
     g_active_state.store(2, std::memory_order_release);
-    /* A PELO, y no por el registro de mandos (`util/env_flags.h`), aunque los
-     * dos esten declarados alli.
+    /* Al SISTEMA (`util/os_env.h`), ni por el registro de mandos del
+     * compilador (`util/env_flags.h`) ni por `getenv`.  Son dos fallos
+     * distintos y los dos ya mordieron:
      *
-     * El registro guarda el valor de los 167 mandos en cadenas, asi que
-     * consultarlo la primera vez PIDE MEMORIA -- y pedir memoria entra aqui.
-     * Con el estatico del registro a medio construir, esa reentrada se queda
-     * esperando su guarda para siempre: el proceso cuelga antes de llegar a
-     * `main`.  Costo encontrarlo.
+     *  - El registro guarda el valor de sus mandos en cadenas, asi que
+     *    consultarlo la primera vez PIDE MEMORIA -- y pedir memoria entra
+     *    aqui.  Con su estatico a medio construir, esa reentrada se queda
+     *    esperando su guarda para siempre y el proceso cuelga antes de llegar
+     *    a `main`.
+     *  - `getenv` no lee el entorno: lee una COPIA que el runtime de C monta
+     *    al arrancar.  Y esto corre en la PRIMERA reserva, que puede caer
+     *    durante la inicializacion de estaticos -- cualquier global cuyo
+     *    constructor pida memoria llega antes que `main` --, donde esa copia
+     *    puede no existir todavia.  Entonces `getenv` devuelve nulo y TODOS
+     *    los mandos salen apagados, sin fallar y sin decirlo.
      *
-     * Es el mismo motivo que ya decia el comentario de arriba sobre `getenv`,
-     * llevado un paso mas: quien resuelve las reservas no puede apoyarse en
-     * nada que reserve. */
-    const char *no_slab = std::getenv("VESTA_NO_HOST_SLAB");
-    const bool off = no_slab != nullptr && no_slab[0] != '\0' &&
-                     !(no_slab[0] == '0' && no_slab[1] == '\0');
-    const char *stats = std::getenv("VESTA_HOST_ALLOC_STATS");
-    g_measure = stats != nullptr && stats[0] != '\0' &&
-                !(stats[0] == '0' && stats[1] == '\0');
+     * Es el mismo principio en los dos casos: quien resuelve las reservas no
+     * puede apoyarse en nada que reserve, ni en nada que haya que montar
+     * antes. */
+    const bool off = os_env_flag("VESTA_NO_HOST_SLAB");
+    /* Dos formas de pedir lo mismo.  `..._STATS` pide el reparto de tamanos y
+     * `..._SITES` pide de donde vienen las reservas, y las dos necesitan que se
+     * apunte -- si no, no hay nada que ensenar.  Se miran las dos aqui porque
+     * esto corre ANTES de la primera reserva, y encenderlo despues dejaria
+     * fuera todo lo de arranque sin decirlo.
+     *
+     * Cada variable se lee UNA vez y se guarda: `..._SITES` decide dos cosas
+     * -- si se apunta y si se parchea `operator new` -- y preguntarla dos veces
+     * abre la puerta a que las dos decisiones no coincidan. */
+    const bool sites = os_env_flag("VESTA_HOST_ALLOC_SITES");
+    g_measure = os_env_flag("VESTA_HOST_ALLOC_STATS") || sites;
+    /* And if SITES are going to be recorded, make the `operator new` family say
+     * where they came from.  Here and not earlier: this is the only moment when
+     * we know it is needed, there is still a single thread, and nothing has
+     * been allocated yet -- the three conditions writing over code asks for.
+     *
+     * It looks at SITES and not at `g_measure`: the SIZE histogram does not
+     * need to know where an allocation came from, so asking for `..._STATS`
+     * alone has no reason to pay for the jump. */
+    if (sites) util::install_call_site_patch();
     if (!off) {
         build_class_table();
         g_active_state.store(1, std::memory_order_release);
@@ -488,6 +637,70 @@ std::atomic<uint64_t> g_no_cache_id{0};
     give_cache_id(c->id);
 }
 
+// =========================================================================
+//  The lock-free per-thread policy: one cache per thread, no shared fallback
+// =========================================================================
+
+/**
+ * @brief Which per-thread ids are TAKEN.  One bit each, set means taken.
+ *
+ * The meaning is inverted with respect to @c g_free_ids on purpose.  "Set means
+ * taken" makes the all-zero state mean "everything free", and all-zero is what
+ * `.bss` gives for nothing: no initialiser runs, so this cannot repeat the
+ * static-initialisation-order trap that already wiped the cache table once --
+ * an array that initialises itself AFTER the allocator is already serving.
+ */
+std::atomic<uint64_t> g_per_thread_taken[kPerThreadCaches / 64];
+
+/// How many times a thread asked for a per-thread cache and none was left.
+std::atomic<uint64_t> g_no_per_thread_id{0};
+
+/**
+ * @brief Takes a per-thread id, or @c kNoCacheId when the pool is exhausted.
+ *
+ * Cold by construction: a thread comes through here ONCE, on its first
+ * allocation, and from then on the id lives in the thread slot.  That is what
+ * lets this scan words instead of being a single-word test like
+ * @c take_cache_id -- and it is also why running out is not a fallback here.
+ */
+[[gnu::cold]] uint32_t take_per_thread_id() noexcept {
+    for (uint32_t w = 0; w < kPerThreadCaches / 64; ++w) {
+        uint64_t taken = g_per_thread_taken[w].load(std::memory_order_relaxed);
+        while (taken != ~uint64_t(0)) {
+            // The lowest bit that is still zero is the first free id.
+            const uint32_t bit = lowest_set(~taken);
+            if (g_per_thread_taken[w].compare_exchange_weak(
+                    taken, taken | (uint64_t(1) << bit),
+                    std::memory_order_acq_rel, std::memory_order_relaxed))
+                return kMaxThreads + w * 64 + bit;
+            // `taken` now holds what was really there; retry with another bit.
+        }
+    }
+    /* IT IS COUNTED, because otherwise this bound is crossed in silence.  This
+     * policy has no shared fallback by design, so running out is a real limit
+     * and has to be visible -- the same rule as `g_gave_up`. */
+    g_no_per_thread_id.fetch_add(1, std::memory_order_relaxed);
+    return kNoCacheId;
+}
+
+/// Gives a per-thread id back.  One atomic write: this runs at thread teardown.
+[[gnu::cold]] void give_per_thread_id(uint32_t id) noexcept {
+    if (id < kMaxThreads || id >= kTotalCaches) return;
+    const uint32_t i = id - kMaxThreads;
+    g_per_thread_taken[i / 64].fetch_and(~(uint64_t(1) << (i % 64)),
+                                         std::memory_order_release);
+}
+
+/// Returns the id when the thread dies, exactly like @c on_thread_exit does for
+/// the shared policy.  What the cache still holds is inherited by whoever takes
+/// the id next: they are valid blocks of chunks that are still ours.
+[[gnu::cold]] void on_per_thread_exit(void *value) noexcept {
+    ThreadCache *c = static_cast<ThreadCache *>(value);
+    if (c == nullptr) return;
+    g_per_thread_slot.set(nullptr);
+    give_per_thread_id(c->id);
+}
+
 ThreadCache *cache() noexcept {
     if (!g_cache_slot.ensure()) return nullptr;
     ThreadCache *c = static_cast<ThreadCache *>(g_cache_slot.get());
@@ -532,13 +745,39 @@ ThreadCache *cache() noexcept {
 // fragmentacion se come la ganancia -- ni pedir cada una al sistema, que seria
 // una llamada por reserva.
 //
-// POR QUE UN CERROJO AQUI Y NO EN EL RESTO.  Porque no cuesta: en una
-// compilacion entera hay 564 reservas grandes frente a 62 millones de pequenas,
-// o sea una de cada cien mil.  Una pila atomica exigiria resolver el problema
-// del ABA -- varios hilos sacando a la vez -- y eso son mas instrucciones y mas
-// formas de equivocarse por un ahorro que no se puede ni medir.  El camino
-// rapido de verdad, el de las pequenas, no toca esto ni de lejos.
-std::atomic_flag g_span_lock = ATOMIC_FLAG_INIT;
+// POR QUE UN CERROJO AQUI Y NO EN EL RESTO.  Porque para ESTE consumidor no
+// cuesta: en una compilacion entera hay 564 reservas grandes frente a 62
+// millones de pequenas, o sea una de cada cien mil.  Una pila atomica exigiria
+// resolver el problema del ABA -- varios hilos sacando a la vez -- y eso son
+// mas instrucciones y mas formas de equivocarse.  El camino rapido de verdad,
+// el de las pequenas, no toca esto ni de lejos.
+//
+// PERO ESE REPARTO NO VIAJA CON EL ASIGNADOR.  Un consumidor de bufers grandes
+// desde muchos hilos cae de lleno aqui, y ahi el cerrojo deja de ser gratis.
+// Por eso lo que se le exige a este cerrojo no es ser rapido, es no tener
+// ACANTILADOS: nada de llamadas al sistema dentro de la seccion critica, y
+// nada de girar de una forma que empeore sola al crecer el numero de nucleos.
+// Medido con el banco de tramos: sacar la llamada al sistema vale 5,7x con 48
+// hilos, y no le cuesta nada a quien no pasa por ahi.
+
+/**
+ * @brief El cerrojo de los tramos, con su linea de cache para el solo.
+ *
+ * POR QUE UNA LINEA ENTERA.  Sin esto queda pegado al final de `g_span_free`
+ * -- comprobado en el objeto: el array termina en 0xC68 y el cerrojo empezaba
+ * justo ahi --, con lo que las ultimas listas de libres viven en la MISMA
+ * linea que la palabra que todos los que esperan estan mirando.  Cada
+ * escritura en esas listas les invalida la copia y les obliga a volver a
+ * pedirla, que es exactamente lo que este cerrojo intenta evitar.  Cuesta 60
+ * bytes de `.bss` y su ausencia solo se paga en las clases de tramo que este
+ * proyecto no usa: justo el tipo de mina que no puede llevar dentro algo
+ * pensado para reusarse.
+ */
+struct alignas(64) SpanLockWord {
+    std::atomic<uint32_t> v{0};
+    char pad[64 - sizeof(std::atomic<uint32_t>)];
+};
+SpanLockWord g_span_lock;
 
 /**
  * @brief Cuanta memoria de tramos LIBRES se conserva sin devolver al sistema.
@@ -607,12 +846,34 @@ struct SpanNode {
  */
 SpanNode *g_span_free[kMaxSpanChunks + 1];
 
+/**
+ * @brief Toma y suelta el cerrojo de tramos.  Se gira, no se duerme.
+ *
+ * POR QUE MIRAR ANTES DE INTENTAR.  Un giro sobre un intercambio a secas es una
+ * lectura-modificacion-escritura por vuelta, y eso se lleva la linea en
+ * EXCLUSIVA cada vez: los que esperan se la quitan unos a otros y, lo que es
+ * peor, se la quitan al que la tiene cogida, que la necesita justamente para
+ * soltarla.  Mirando primero con una lectura normal, los que esperan se quedan
+ * con la linea COMPARTIDA y no molestan a nadie; solo intentan el cambio
+ * cuando la ven libre.
+ *
+ * HONESTIDAD SOBRE ESTA FORMA: con las llamadas al sistema ya fuera de la
+ * seccion critica, el banco de tramos NO distingue esto del giro anterior.
+ * Esta asi porque sin contencion cuesta exactamente lo mismo -- un intercambio
+ * -- y lo que evita es una degradacion que crece con el numero de nucleos de
+ * quien lo ejecute, que es un dato que no tenemos.  Es criterio, no medida.
+ */
 struct SpanLock {
     SpanLock() noexcept {
-        while (g_span_lock.test_and_set(std::memory_order_acquire)) {
+        for (;;) {
+            if (g_span_lock.v.exchange(1, std::memory_order_acquire) == 0)
+                return;
+            // Mirar sin tocar mientras siga cogido.
+            while (g_span_lock.v.load(std::memory_order_relaxed) != 0)
+                cpu_relax();
         }
     }
-    ~SpanLock() { g_span_lock.clear(std::memory_order_release); }
+    ~SpanLock() { g_span_lock.v.store(0, std::memory_order_release); }
 };
 
 // -------------------------------------------------------------------------
@@ -634,6 +895,54 @@ inline bool is_free_span(const ChunkHeader *h) noexcept {
     return h->magic == kSpanMagic && h->extra == kSpanFree;
 }
 
+/**
+ * @brief Un bit por trozo: "aqui EMPIEZA un tramo LIBRE".
+ *
+ * POR QUE EXISTE.  Para poder preguntar por el vecino de la derecha SIN LEER SU
+ * MEMORIA.  Antes se usaba `g_chunk_next` como "hasta aqui se puede leer", y
+ * eso es falso: ese contador sube al REPARTIR el trozo, o sea antes de
+ * comprometerlo y antes de escribir su cabecera.  En esa ventana, un hilo que
+ * soltaba un tramo miraba a su derecha, creia que habia vecino y leia memoria
+ * sin comprometer.  Dos formas de acabar: un acceso invalido, o -- peor -- que
+ * la basura pase por un tramo libre y se absorba.  TSan lo nombro: lectura en
+ * `is_free_span` contra la escritura de `h->magic` en `alloc_span`.
+ *
+ * Con el mapa la pregunta cambia de "esta esa memoria repartida?" a "hay un
+ * tramo libre que empieza justo ahi?", y eso es un dato que solo cambia con el
+ * cerrojo cogido.
+ *
+ * Y trae una segunda propiedad de la que depende lo de abajo: **la cabecera de
+ * un tramo EN USO no la lee nadie mas que su dueno.**  Quien fusiona solo mira
+ * los marcados libres.  De ahi sale que se pueda comprometer memoria de un
+ * tramo propio con el cerrojo ya soltado.
+ *
+ * SIN ATOMICOS a proposito: se pone y se quita en `list_insert`/`list_remove` y
+ * se consulta en `right_neighbour`, y las tres cosas ocurren con el cerrojo
+ * cogido.  Atomicos aqui serian pagar otra vez por una exclusion que ya existe.
+ */
+constexpr size_t kMaxChunksTotal = size_t(256) << 14; ///< 256 GiB / 64 KiB
+uint64_t g_free_span_map[kMaxChunksTotal / 64];       ///< 512 KiB de `.bss`
+
+/// Que numero de trozo de la region es @p addr.  Fuera de la region sale un
+/// numero enorme, que los tres de abajo descartan por rango.
+inline size_t chunk_index_of(uintptr_t addr) noexcept {
+    return (addr - g_region_base.load(std::memory_order_relaxed)) / kChunkBytes;
+}
+inline void mark_free_span(const ChunkHeader *h) noexcept {
+    const size_t i = chunk_index_of(reinterpret_cast<uintptr_t>(h));
+    if (i < kMaxChunksTotal) g_free_span_map[i >> 6] |= uint64_t(1) << (i & 63);
+}
+inline void clear_free_span(const ChunkHeader *h) noexcept {
+    const size_t i = chunk_index_of(reinterpret_cast<uintptr_t>(h));
+    if (i < kMaxChunksTotal)
+        g_free_span_map[i >> 6] &= ~(uint64_t(1) << (i & 63));
+}
+inline bool is_marked_free(uintptr_t addr) noexcept {
+    const size_t i = chunk_index_of(addr);
+    if (i >= kMaxChunksTotal) return false;
+    return ((g_free_span_map[i >> 6] >> (i & 63)) & 1u) != 0;
+}
+
 void list_insert(ChunkHeader *h) noexcept {
     const uint32_t k = h->cls;
     SpanNode *n = node_of(h);
@@ -642,6 +951,7 @@ void list_insert(ChunkHeader *h) noexcept {
     if (n->next != nullptr) n->next->prev = n;
     g_span_free[k] = n;
     h->extra = kSpanFree;
+    mark_free_span(h);
 }
 
 void list_remove(ChunkHeader *h) noexcept {
@@ -652,17 +962,15 @@ void list_remove(ChunkHeader *h) noexcept {
         g_span_free[h->cls] = n->next;
     if (n->next != nullptr) n->next->prev = n->prev;
     h->extra = 0;
+    clear_free_span(h);
 }
 
-/// El vecino de la derecha, si esta DENTRO de lo ya repartido.  nullptr si el
-/// tramo termina donde acaba lo repartido, o si se sale de la region.
+/// El vecino de la derecha si esta LIBRE, que es lo unico que se puede mirar
+/// sin correr riesgos.  nullptr si no lo hay; ver `g_free_span_map`.
 ChunkHeader *right_neighbour(ChunkHeader *h) noexcept {
-    const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
-    const uintptr_t addr = reinterpret_cast<uintptr_t>(h);
-    const uintptr_t next = addr + size_t(h->cls) * kChunkBytes;
-    const uintptr_t handed =
-        base + g_chunk_next.load(std::memory_order_relaxed) * kChunkBytes;
-    if (next >= handed) return nullptr;
+    const uintptr_t next =
+        reinterpret_cast<uintptr_t>(h) + size_t(h->cls) * kChunkBytes;
+    if (!is_marked_free(next)) return nullptr;
     return reinterpret_cast<ChunkHeader *>(next);
 }
 
@@ -711,6 +1019,29 @@ ChunkHeader *take_from_free_lists(uint32_t want) noexcept {
     return nullptr;
 }
 
+/**
+ * @brief Un trozo de region ya APARTADO al que todavia le falta la memoria.
+ *
+ * POR QUE NO SE COMPROMETE EN EL SITIO.  Comprometer paginas es una llamada al
+ * sistema, y hacerla con el cerrojo cogido deja al resto de los hilos girando
+ * durante toda ella -- que es de donde salia casi todo el coste de este camino
+ * cuando se midio.  Se puede sacar fuera por dos razones, y las dos hacen
+ * falta:
+ *
+ *  1. el rango ya es NUESTRO, porque lo aparto el compare-exchange sobre
+ *     `g_chunk_next`, asi que nadie mas lo va a repartir;
+ *  2. el tramo no esta en ninguna lista de libres, y con `g_free_span_map`
+ *     quien fusiona solo mira los marcados libres: su cabecera no la lee nadie
+ *     mas que su dueno.
+ *
+ * Sin la segunda no valdria, porque entonces otro hilo podria estar mirando la
+ * cabecera mientras se le anaden trozos.
+ */
+struct PendingCommit {
+    uintptr_t addr = 0; ///< desde donde hay que comprometer
+    size_t bytes = 0;   ///< cuanto; cero si no hay nada pendiente
+};
+
 /// Trozos ya entregados por la region y nunca devueltos, para no repartir dos
 /// veces el mismo.  Es el mismo contador que usa `grow`.
 /**
@@ -730,7 +1061,8 @@ ChunkHeader *take_from_free_lists(uint32_t want) noexcept {
  * reconocerlo.  Ese reconocimiento de dos comparaciones es de donde sale que
  * liberar sea barato, asi que no es negociable.
  */
-bool try_extend_span(ChunkHeader *h, uint32_t want) noexcept {
+bool try_extend_span(ChunkHeader *h, uint32_t want,
+                     PendingCommit *pend) noexcept {
     // 1. Tragarse vecinos libres mientras no baste.
     while (h->cls < want) {
         ChunkHeader *r = right_neighbour(h);
@@ -758,23 +1090,50 @@ bool try_extend_span(ChunkHeader *h, uint32_t want) noexcept {
     if (addr + size_t(want) * kChunkBytes >
         g_region_end.load(std::memory_order_relaxed))
         return false;
-    const uintptr_t fresh_addr = addr + size_t(h->cls) * kChunkBytes;
-    if (!os_commit(reinterpret_cast<void *>(fresh_addr),
-                   size_t(want - h->cls) * kChunkBytes))
-        return false;
-    h->cls = want;
+    /* La llamada al sistema NO se hace aqui: se deja apuntada y la hace el
+     * llamante con el cerrojo ya soltado, que es tambien quien pone `h->cls`
+     * cuando la memoria ya esta.  Ver `PendingCommit`. */
+    pend->addr = addr + size_t(h->cls) * kChunkBytes;
+    pend->bytes = size_t(want - h->cls) * kChunkBytes;
     return true;
 }
 
+/**
+ * @brief Aparta @p count trozos del reparto.  0 si no caben.
+ *
+ * COMPARA-Y-CAMBIA Y NO SUMA-Y-DEVUELVE, y la diferencia no es de estilo.
+ * Sumando primero y mirando despues, una peticion que NO cabe deja el cursor
+ * adelantado igualmente -- y nadie lo devuelve --.  Con una sola peticion
+ * absurda (un `new` de 32 TiB, que es lo que hace una prueba de `bad_alloc`) el
+ * cursor se iba mas alla del final y **la region quedaba muerta para el resto
+ * del proceso**: a partir de ahi ninguna reserva la conseguia.
+ *
+ * Y era MUDO, que es lo que lo hacia grave: como el asignador se caia a
+ * `std::malloc` cuando no podia servir, el programa seguia funcionando, mas
+ * lento y sin usar ya su propio asignador, sin que nada lo dijera.  Se destapo
+ * al quitar ese respaldo.
+ *
+ * Asi el cursor solo avanza cuando lo apartado cabe de verdad.
+ */
 uintptr_t take_chunks(size_t count) noexcept {
     if (!ensure_region()) return 0;
-    const size_t idx = g_chunk_next.fetch_add(count, std::memory_order_acq_rel);
     const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
-    const uintptr_t addr = base + idx * kChunkBytes;
-    if (addr + count * kChunkBytes >
-        g_region_end.load(std::memory_order_relaxed))
-        return 0; // region llena
-    return addr;
+    const uintptr_t end = g_region_end.load(std::memory_order_relaxed);
+    size_t idx = g_chunk_next.load(std::memory_order_relaxed);
+    for (;;) {
+        const uintptr_t addr = base + idx * kChunkBytes;
+        /* El desbordamiento se mira aparte: con un `count` disparatado,
+         * `addr + count * kChunkBytes` da la vuelta y la comparacion diria que
+         * si cabe.  Es justo el caso que trae hasta aqui una peticion absurda. */
+        if (count > (size_t(-1) / kChunkBytes)) return 0;
+        const uintptr_t want = uintptr_t(count) * kChunkBytes;
+        if (addr < base || want > end - addr) return 0; // no cabe
+        if (g_chunk_next.compare_exchange_weak(idx, idx + count,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_relaxed))
+            return addr;
+        // Otro se adelanto: `idx` ya trae su valor y se vuelve a intentar.
+    }
 }
 
 /**
@@ -874,38 +1233,57 @@ void free_span(ChunkHeader *h) noexcept {
         return;
     }
 
-    SpanLock lk;
-    /* Se absorbe a los vecinos libres de la derecha ANTES de entrar en ninguna
-     * lista.  Asi los trozos vuelven a estar juntos y sirven para lo que venga
-     * despues, en vez de quedarse atrapados en la lista de su tamano exacto.
-     *
-     * UN TRAMO QUE SE GUARDA, SE GUARDA CON SU MEMORIA.  Aqui hubo dos intentos
-     * de devolver paginas al soltarlo y los dos se midieron y se retiraron: por
-     * tamano, convierte cada par reservar/soltar en tres llamadas al sistema
-     * (1.438 ns por operacion frente a 9,6 de `malloc`); por presupuesto, peor
-     * todavia y mas dificil de ver -- una fase que suelta 512 tramos de 1 MiB
-     * deja sesenta y cuatro pinchados, nadie vuelve a pedir ese tamano, y a
-     * partir de ahi CUALQUIER liberacion ve el presupuesto lleno.
-     *
-     * Lo retenido esta acotado por el pico de tramos libres a la vez, que es
-     * memoria que el programa ya llego a tener.  Devolverla, si hace falta,
-     * es cosa de una llamada explicita entre fases. */
-    h->extra = 0;
-    coalesce_right(h);
+    /* Lo que haya que devolverle al sistema se APUNTA aqui y se hace despues,
+     * ya sin el cerrojo.  Un tramo al que se le quita la marca y que no entra
+     * en ninguna lista no lo puede encontrar nadie -- ni por las listas ni por
+     * `g_free_span_map` --, asi que soltar sus paginas no necesita exclusion.
+     * Hacerlo dentro paraba a TODOS los demas durante una llamada al sistema
+     * entera, y con tramos de decenas de MiB eso no es un detalle: medido, es
+     * la diferencia entre 267 ms y 1.534 con 48 hilos. */
+    uintptr_t drop_addr = 0;
+    size_t drop_bytes = 0;
+    {
+        SpanLock lk;
+        /* Se absorbe a los vecinos libres de la derecha ANTES de entrar en
+         * ninguna lista.  Asi los trozos vuelven a estar juntos y sirven para
+         * lo que venga despues, en vez de quedarse atrapados en la lista de su
+         * tamano exacto.
+         *
+         * UN TRAMO QUE SE GUARDA, SE GUARDA CON SU MEMORIA.  Aqui hubo dos
+         * intentos de devolver paginas al soltarlo y los dos se midieron y se
+         * retiraron: por tamano, convierte cada par reservar/soltar en tres
+         * llamadas al sistema (1.438 ns por operacion frente a 9,6 de
+         * `malloc`); por presupuesto, peor todavia y mas dificil de ver -- una
+         * fase que suelta 512 tramos de 1 MiB deja sesenta y cuatro pinchados,
+         * nadie vuelve a pedir ese tamano, y a partir de ahi CUALQUIER
+         * liberacion ve el presupuesto lleno.
+         *
+         * Lo retenido esta acotado por el pico de tramos libres a la vez, que
+         * es memoria que el programa ya llego a tener.  Devolverla, si hace
+         * falta, es cosa de una llamada explicita entre fases. */
+        h->extra = 0;
+        coalesce_right(h);
 
-    if (h->cls > kMaxSpanChunks) {
-        /* Demasiado grande para guardarlo.  Sus paginas SI vuelven al sistema
-         * -- quedarse con el rango y ademas con la memoria seria regalar las
-         * dos cosas --, y se cuenta, para que no sea mudo si deja de ser raro. */
-        const size_t bytes = size_t(h->cls) * kChunkBytes;
-        const size_t page = os_page_size();
-        if (bytes > page)
-            os_decommit(reinterpret_cast<char *>(h) + page, bytes - page);
-        h->magic = 0;
-        g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
+        if (h->cls > kMaxSpanChunks) {
+            /* Demasiado grande para guardarlo.  Sus paginas SI vuelven al
+             * sistema -- quedarse con el rango y ademas con la memoria seria
+             * regalar las dos cosas --, y se cuenta, para que no sea mudo si
+             * deja de ser raro. */
+            const size_t bytes = size_t(h->cls) * kChunkBytes;
+            const size_t page = os_page_size();
+            if (bytes > page) {
+                drop_addr = reinterpret_cast<uintptr_t>(h) + page;
+                drop_bytes = bytes - page;
+            }
+            h->magic = 0; // deja de ser una cabecera: ya no es de nadie
+            g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            list_insert(h);
+        }
     }
-    list_insert(h);
+
+    if (drop_bytes != 0)
+        os_decommit(reinterpret_cast<void *>(drop_addr), drop_bytes);
 }
 
 /// Recoge de un golpe lo que otros hilos soltaron de esta clase.
@@ -989,12 +1367,12 @@ void *grow(ThreadCache *c, uint32_t k) noexcept {
         void *p = grow_big(c, k);
         if (p != nullptr) return p;
     }
-    if (!ensure_region()) return nullptr;
-    const size_t idx = g_chunk_next.fetch_add(1, std::memory_order_acq_rel);
-    const uintptr_t base = g_region_base.load(std::memory_order_relaxed);
-    const uintptr_t addr = base + idx * kChunkBytes;
-    if (addr + kChunkBytes > g_region_end.load(std::memory_order_relaxed))
-        return nullptr; // region agotada: se sigue con el sistema
+    /* POR `take_chunks` Y NO CON UN `fetch_add` AQUI.  Era la misma cuenta
+     * escrita dos veces, y la copia de aqui tenia el mismo fallo que la otra:
+     * sumaba primero y miraba despues, asi que cada intento fallido dejaba el
+     * cursor un trozo mas adelante sin devolverlo.  Un hecho, un productor. */
+    const uintptr_t addr = take_chunks(1);
+    if (addr == 0) return nullptr; // region agotada
     if (!os_commit(reinterpret_cast<void *>(addr), kChunkBytes)) return nullptr;
     ChunkHeader *h = reinterpret_cast<ChunkHeader *>(addr);
     h->magic = kChunkMagic;
@@ -1030,6 +1408,10 @@ void *grow(ThreadCache *c, uint32_t k) noexcept {
 
 namespace detail {
 
+/// Declarada aqui porque los caminos lentos de abajo la usan antes de que este
+/// definida.  No devuelve: ver su definicion.
+[[gnu::cold, noreturn]] void no_fallback(const char *why, size_t n) noexcept;
+
 void record_size(ThreadCache *c, size_t n) noexcept {
     // Reparto de tamanos pedidos.  Sirve para UNA pregunta concreta: si lo que
     // se pide cae fuera de las clases, subir el tope da mas de lo que cuesta;
@@ -1045,14 +1427,39 @@ ThreadCache *ensure_cache() noexcept {
     return cache();
 }
 
+/* Its helpers -- the free-id map and the exit callback -- live up in the
+ * anonymous namespace next to `cache()`, which is the same thing this does for
+ * the shared policy.  Only this one is exported, because it is the only one the
+ * inline fast path in the header has to reach. */
+ThreadCache *per_thread_cache_slow() noexcept {
+    if (!g_per_thread_slot.ensure()) return nullptr;
+    const uint32_t id = take_per_thread_id();
+    if (__builtin_expect(id == kNoCacheId, 0)) return nullptr;
+    ThreadCache *c = &g_caches[id];
+    c->id = id;
+    c->used = true;
+    c->tag = 0; // the previous owner's purpose is not ours; see `cache()`
+    /* Ask to be told BEFORE storing the value: it is `set` that arms the
+     * notification, so the other way round this thread would die without
+     * returning its id. */
+    g_per_thread_slot.notify_on_exit(&on_per_thread_exit);
+    g_per_thread_slot.set(c);
+    return c;
+}
+
 void *host_alloc_refill(ThreadCache *c, uint32_t k, size_t n) noexcept {
     void *chain = take_remote(c, k);
     if (chain == nullptr) chain = grow(c, k);
     if (chain == nullptr) {
-        // Region agotada.  Se sigue con el sistema, pero SE CUENTA: esto es
-        // rendirse, no una decision de diseno, y hasta ahora era mudo.
+        /* NO HAY SITIO.  Antes se caia al sistema; eso es rendirse en silencio
+         * y ya no se hace.  Pero tampoco se para el proceso: quedarse sin
+         * memoria es una condicion que el lenguaje tiene CONTRATADA, y el
+         * contrato lo cumple quien llamo -- `operator new` lanza `bad_alloc`,
+         * su forma `nothrow` devuelve nulo y la capa en C devuelve NULL --.
+         * Abortar aqui le quitaria al programa la posibilidad de manejarlo. */
         g_gave_up.fetch_add(1, std::memory_order_relaxed);
-        return std::malloc(n);
+        // return std::malloc(n);
+        return nullptr;
     }
     /* Lo recogido es una cadena entera: se cuelga de la lista y se entrega el
      * primero por la via de siempre, para que el reparto por etiqueta se lleve
@@ -1082,8 +1489,11 @@ void *alloc_shared(size_t n) noexcept {
     if (n > kMaxSmall) {
         void *p = alloc_span(c, n);
         if (p != nullptr) return p;
+        // Sin sitio: nulo, y que el llamante cumpla el contrato.  Ver la nota
+        // en `host_alloc_refill`.
         g_gave_up.fetch_add(1, std::memory_order_relaxed);
-        return std::malloc(n);
+        // return std::malloc(n);
+        return nullptr;
     }
     const uint32_t k = class_of(n);
     void *p = pop_block(c, k);
@@ -1091,12 +1501,70 @@ void *alloc_shared(size_t n) noexcept {
     return host_alloc_refill(c, k, n);
 }
 
+/**
+ * @brief No hay respaldo: si el asignador no puede servir, se para el proceso.
+ *
+ * POR QUE UN PANICO Y NO `std::malloc`.  Porque caer al sistema no es una
+ * decision, es una rendicion, y ademas es MUDA: el programa sigue, va mas
+ * lento, y las cuentas del asignador dejan de cuadrar con la realidad sin que
+ * nada lo diga.  Es exactamente el modo de fallo que este proyecto persigue en
+ * todas partes -- un valor por defecto que "funciona" convierte un error en un
+ * resultado equivocado --.
+ *
+ * Y ademas se descubrio midiendo: en el arranque, `operator new` entraba 16.421
+ * veces y el asignador solo contaba 2.720, con un unico trozo pedido y todos
+ * los contadores de rendicion a cero.  O sea que trece mil reservas salian por
+ * una puerta que no dejaba rastro.  Con esto, esa puerta grita y dice cual es.
+ *
+ * QUEDARSE SIN MEMORIA ES OTRA COSA, y no pasa por aqui.  Ahi no se para el
+ * proceso: se devuelve nulo y el contrato lo cumple quien llamo -- `operator
+ * new` lanza `bad_alloc`, su forma `nothrow` devuelve nulo, y la capa en C
+ * devuelve NULL --.  Abortar seria quitarle al programa la posibilidad de
+ * manejar una condicion que el lenguaje tiene prevista.
+ *
+ * POR QUE LAS LINEAS DEL RESPALDO SIGUEN AHI, COMENTADAS.  Porque valen para
+ * depurar: volver a ponerlas convierte un fallo duro en el respaldo silencioso
+ * de antes, y eso es justo lo que hace falta para separar "el asignador no
+ * puede" de "el que llama pide mal".  No son codigo muerto olvidado; estan a un
+ * caracter de distancia a proposito.
+ */
+[[gnu::noinline, gnu::cold, noreturn]] void no_fallback(const char *why,
+                                                        size_t n) noexcept {
+    std::fprintf(stderr,
+                 "[allocator] PANIC: cannot serve %llu bytes and there is NO "
+                 "fallback: %s\n"
+                 "            Falling back to the system allocator here would "
+                 "be silent: the program would keep going, slower, and every "
+                 "figure this allocator reports would stop matching reality.\n",
+                 (unsigned long long)n, why);
+    std::fflush(stderr);
+    std::abort();
+}
+
+[[gnu::noinline, gnu::cold]] void no_foreign_free(void *p) noexcept {
+    std::fprintf(stderr,
+                 "[allocator] PANIC: free() of %p, which this allocator never "
+                 "handed out.\n"
+                 "            Nothing falls back to the system when "
+                 "allocating, so there can be no system blocks to release: a "
+                 "pointer arriving here means somebody allocated through a "
+                 "door we are not watching.  Passing it to free() would work "
+                 "and would hide exactly that.\n",
+                 p);
+    std::fflush(stderr);
+    std::abort();
+}
+
 /* Cubre a la vez el alta del hilo, el asignador apagado, la reserva vacia, la
  * reserva grande y el desbordamiento de hilos.  Son casos distintos pero todos
  * raros, y juntarlos deja el camino rapido con una sola comparacion para los
  * cinco. */
 void *host_alloc_slow(size_t n) noexcept {
-    if (!allocator_active()) return std::malloc(n);
+    if (!allocator_active())
+        // return std::malloc(n);
+        no_fallback("the allocator is not active yet (this runs during static "
+                    "initialisation, before it has decided)",
+                    n);
     if (n == 0) n = 1;
     ThreadCache *c = cache();
     if (c != nullptr && g_measure) record_size(c, n);
@@ -1105,10 +1573,11 @@ void *host_alloc_slow(size_t n) noexcept {
          * al asignador del sistema; ver `doc/PLAN_RESERVAS.md`. */
         void *p = alloc_span(c, n);
         if (p != nullptr) return p;
-        /* La region no dio.  Se cede al sistema, pero SE CUENTA: esto es
-         * rendirse, no una decision de diseno. */
+        /* La region no dio.  Antes se cedia al sistema; ahora nulo, y el
+         * llamante cumple el contrato.  Ver la nota en `host_alloc_refill`. */
         g_gave_up.fetch_add(1, std::memory_order_relaxed);
-        return std::malloc(n);
+        // return std::malloc(n);
+        return nullptr;
     }
     if (c == nullptr) return alloc_shared(n);
     const uint32_t k = class_of(n);
@@ -1176,9 +1645,31 @@ void host_free_remote(void *p, ChunkHeader *h) noexcept {
 //  Interfaz
 // =========================================================================
 
+size_t host_region_reserved() noexcept {
+    return g_region_reserved.load(std::memory_order_relaxed);
+}
+
+uint64_t host_per_thread_exhausted() noexcept {
+    return g_no_per_thread_id.load(std::memory_order_relaxed);
+}
+
+uint64_t host_new_calls() noexcept {
+    uint64_t t = 0;
+    for (uint32_t i = 0; i <= kMaxThreads; ++i)
+        t += g_new_calls[i].n;
+    return t;
+}
+
 HostAllocStats host_alloc_stats() {
-    HostAllocStats t;
-    for (uint32_t i = 0; i < kMaxThreads; ++i) {
+    /* Con llaves: la estructura ya no lleva inicializadores de miembro -- ver la
+     * nota en la cabecera --, asi que una copia en la pila hay que pedirla a
+     * cero explicitamente.  Sin ellas se sumaria sobre basura. */
+    HostAllocStats t{};
+    /* The WHOLE table, both policies.  Stopping at `kMaxThreads` would leave
+     * out every cache handed out by `PerThreadAllocator`, and the figures would
+     * lie by omission -- which is worse than missing, because they would still
+     * look right. */
+    for (uint32_t i = 0; i < kTotalCaches; ++i) {
         if (!g_caches[i].used) continue;
         const HostAllocStats &s = g_caches[i].stats;
         for (uint32_t g = 0; g < AllocTag::kSlots; ++g) {
@@ -1268,10 +1759,12 @@ void *host_realloc(void *p, size_t n) noexcept {
             host_free(p);
             return q;
         }
-        /* No es nuestro: vino del sistema y tiene que volver al sistema.
-         * Mezclar los dos asignadores seria pasarle a `free` un puntero que no
-         * reconoce. */
-        return std::realloc(p, n);
+        /* No es nuestro.  Antes se le pasaba a `std::realloc`; ahora no, por lo
+         * mismo que en `no_foreign_free`: si nadie cae al sistema al reservar,
+         * un bloque ajeno aqui no es un caso a cubrir, es la prueba de que
+         * alguien reservo por otra puerta. */
+        // return std::realloc(p, n);
+        detail::no_foreign_free(p);
     }
 
     const size_t old = host_usable_size(p);
@@ -1285,8 +1778,22 @@ void *host_realloc(void *p, size_t n) noexcept {
         if (want > h->cls) {
             // CON EL CERROJO: estirar toca las listas de libres al absorber al
             // vecino, y sin el dos hilos creciendo a la vez las corromperian.
-            SpanLock lk;
-            if (try_extend_span(h, want)) return p;
+            // Lo que NO va dentro es comprometer las paginas; ver
+            // `PendingCommit`.
+            PendingCommit pend;
+            bool ok;
+            {
+                SpanLock lk;
+                ok = try_extend_span(h, want, &pend);
+            }
+            if (ok && pend.bytes != 0) {
+                // Ya sin cerrojo: aqui es donde se llama al sistema.
+                if (os_commit(reinterpret_cast<void *>(pend.addr), pend.bytes))
+                    h->cls = want;
+                else
+                    ok = false; // se queda el rango, pero no la memoria
+            }
+            if (ok) return p;
         }
     }
 
@@ -1370,8 +1877,9 @@ StatsDump::~StatsDump() {
                      (1024.0 * 1024.0 * 1024.0));
     if (gave_up != 0)
         std::fprintf(stderr,
-                     "  | GAVE UP TO THE SYSTEM: %llu  <- the allocator ran "
-                     "short, these were NOT served here",
+                     "  | COULD NOT SERVE: %llu  <- the region ran short and "
+                     "these were REFUSED (operator new threw, or the nothrow "
+                     "form returned null).  Nothing went to the system",
                      (unsigned long long)gave_up);
     std::fprintf(stderr, "\n");
     /* Y la otra cota que degradaba callando: quedarse sin identificador manda
@@ -1397,6 +1905,10 @@ StatsDump::~StatsDump() {
                          100.0 * double(s.by_tag[g]) /
                              double(s.small_allocs));
         }
+        /* Y DE DONDE sale lo que no lo dijo.  El porcentaje de arriba dice
+         * cuanto falta; esta lista dice por donde empezar, que es otra
+         * pregunta.  Ver `util/alloc_sites.h`. */
+        dump_alloc_sites(30);
     }
     static const char *kNames[kSizeBuckets] = {
         "<=64",   "<=256", "<=1K",  "<=2K", "<=4K",  "<=8K",
@@ -1427,6 +1939,82 @@ StatsDump::~StatsDump() {
 // cambio valga: en el perfil las reservas no estaban concentradas en ningun
 // sitio, asi que solo se ganaba tocandolas todas a la vez.
 
+/**
+ * @brief Apunta de donde vino esta reserva Y CON QUE PROPOSITO.
+ *
+ * AQUI Y NO DENTRO DE `host_alloc`: desde alli el llamante es SIEMPRE
+ * `operator new` y el dato no vale para nada.  Tiene que ser en la frontera.
+ *
+ * SE APUNTA TODO, CON SU ETIQUETA, y esto es lo que hace que el informe sirva
+ * para lo que este asignador existe.  Antes se filtraba a lo que llegara SIN
+ * declarar -- para que el coste menguara segun se fuera migrando --, y el
+ * efecto era que la columna de proposito solo podia decir "no se": por
+ * construccion no habia nada mas que ensenar.  Guardando el par
+ * (sitio, proposito) se ve que declara cada funcion, se puede CONTRASTAR con la
+ * forma y la vida medidas de ese mismo sitio, y lo que no declara nada sigue
+ * saliendo como "no se", que es la lista de lo que falta.
+ *
+ * Y solo cuando se ha pedido medir.  La CAPTURA de la direccion es gratis --
+ * medido: 1,529 ns sin ella y 1,544 con ella, que es ruido --, pero apuntarla
+ * en una tabla es una medida, y una medida que nadie pidio no se paga.  La
+ * bandera es la misma que ya mira el camino rapido para el reparto de tamanos,
+ * asi que la comparacion no es nueva.
+ */
+[[gnu::noinline, gnu::cold]] void *new_measured(size_t n,
+                                                const void *ret) noexcept {
+    void *p = util::host_alloc(n);
+    const util::detail::ThreadCache *c = util::detail::current_cache();
+    util::detail::note_new_call(c);
+    util::record_alloc_site(ret, n, c != nullptr ? c->tag : 0);
+
+    return p;
+}
+
+/**
+ * @brief Reserva, y si se ha pedido medir apunta ademas de donde vino.
+ *
+ * TODO LO MEDIDO VIVE EN LA RAMA FRIA, y esto no es estilo: la primera version
+ * llamaba a `host_alloc` y apuntaba DESPUES, y eso obliga a que el tamano y la
+ * direccion de retorno sobrevivan a la llamada.  En el desensamblado se veia:
+ * `operator new` pasaba de 100 a 119 instrucciones y ganaba DOS `push`/`pop` de
+ * mas en el prologo -- que se pagan siempre, tambien con la medida apagada --.
+ * Medido, +3,3% en el camino de `operator new`.
+ *
+ * Sacando la rama entera fuera, el camino de siempre queda como estaba: nada
+ * tiene que sobrevivir a nada porque despues de reservar ya no se usa el
+ * tamano.  Lo unico que queda es la comparacion, que es una lectura de un byte
+ * que ya esta en cache y una rama que nunca se toma.
+ */
+[[gnu::always_inline]] inline void *new_or_measure(size_t n,
+                                                   const void *ret) noexcept {
+    if (__builtin_expect(util::detail::g_measure, 0))
+        return new_measured(n, ret);
+    return util::host_alloc(n);
+}
+
+/* THE FOUR `operator new`, AND WHY THEY SAY NOTHING ABOUT MEASURING.
+ *
+ * What is here is the usual path and nothing else: allocate and, if there is
+ * none, fail.  Not one extra instruction -- not even the one that used to read
+ * the return address.
+ *
+ * When measuring is requested, `call_site.cpp` PATCHES the entry of these four
+ * with a jump to an assembly thunk that takes the return address out of `[rsp]`
+ * and carries on into `vesta_alloc_new_from`.  Which is why the measurement is
+ * nowhere to be seen here: it costs nothing when off because it literally IS
+ * NOT THERE.
+ *
+ * Why patch instead of asking here: asking costs a load and a branch on every
+ * allocation, and this is the path the whole file exists to look after -- a
+ * difference of that order already cost a measured 3.3%.
+ *
+ * Why a thunk and not `__builtin_return_address(0)`, which is what this used to
+ * be: it is reliable for zero, but it is a value the compiler hands you, and
+ * for N > 0 GCC itself says it "may have unpredictable effects, including
+ * crashing the calling program".  With a prologue of our own, the calling
+ * convention is enough.
+ *
+ * The OVER-ALIGNED variants further down are patched too. */
 void *operator new(size_t n) {
     void *p = util::host_alloc(n);
     if (p == nullptr) throw std::bad_alloc();
@@ -1442,6 +2030,53 @@ void *operator new(size_t n, const std::nothrow_t &) noexcept {
 }
 void *operator new[](size_t n, const std::nothrow_t &) noexcept {
     return util::host_alloc(n);
+}
+
+/* And the other side of the patch: the same, but recording where it came from.
+ *
+ * `new` and `new[]` share a body -- they do the same thing -- so the four
+ * patched symbols come in through two functions. */
+extern "C" void *vesta_alloc_new_from(size_t n, const void *ret) {
+    void *p = new_or_measure(n, ret);
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+
+extern "C" void *vesta_alloc_new_nothrow_from(size_t n, const std::nothrow_t &,
+                                              const void *ret) noexcept {
+    return new_or_measure(n, ret);
+}
+
+/* AND THE OVER-ALIGNED ONES, which until now recorded NOTHING.
+ *
+ * They did not show up in the report as "undeclared": they did not show up at
+ * all.  A missing site leaves no gap behind, so everything aligned to a cache
+ * line -- which in this project is not a little -- was invisible.  A list of
+ * who allocates that is missing allocations is not an incomplete list, it is a
+ * wrong one.
+ *
+ * The SIZE histogram did see them, because `host_alloc_aligned` ends up in
+ * `host_alloc`; what was missing was the site. */
+[[gnu::noinline, gnu::cold]] static void *
+new_aligned_measured(size_t n, size_t a, const void *ret) noexcept {
+    void *p = util::host_alloc_aligned(n, a);
+    const util::detail::ThreadCache *c = util::detail::current_cache();
+    util::detail::note_new_call(c);
+    util::record_alloc_site(ret, n, c != nullptr ? c->tag : 0);
+    return p;
+}
+
+extern "C" void *vesta_alloc_new_aligned_from(size_t n, size_t a,
+                                              const void *ret) {
+    void *p = new_aligned_measured(n, a, ret);
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+
+extern "C" void *
+vesta_alloc_new_aligned_nothrow_from(size_t n, size_t a, const std::nothrow_t &,
+                                     const void *ret) noexcept {
+    return new_aligned_measured(n, a, ret);
 }
 
 void operator delete(void *p) noexcept {

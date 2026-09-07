@@ -14,6 +14,62 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Anadido
 
+- **`util::PerThreadAllocator`: muchos hilos y NI UN cerrojo hasta 16 KiB.**
+  Segunda forma de desbordar, elegida por TIPO al compilar como manda D13.  El
+  asignador del proceso acota MEMORIA: puede nombrar `kMaxThreads` duenos y a
+  partir de ahi los hilos comparten un cache detras de un cerrojo de giro.
+  Este acota LATENCIA: cada hilo tiene el suyo, no hay respaldo compartido al
+  que caer, y lo que se paga es memoria -- un cache por hilo vivo, de un fondo
+  de `kPerThreadCaches` --.
+
+  Ninguno es mejor: acotan cosas distintas, y por eso existen los dos en vez de
+  sustituir uno al otro.
+
+  POR QUE HACIA FALTA.  Porque el cerrojo compartido no se degrada, se
+  DERRUMBA, y el codo esta donde nadie lo mira: cuando los hilos que van por el
+  camino compartido pasan de los nucleos que hay.  A partir de ahi el que lo
+  tiene cogido puede quedarse sin procesador y los demas queman su cuanto
+  entero esperando a alguien que no corre.  Medido con 20.000 reservas por hilo
+  en una maquina de 24 nucleos, con el MISMO trabajo util en las tres filas:
+
+  | hilos | en compartido | ns de CPU por operacion |
+  | ----: | ------------: | ----------------------: |
+  |    84 |            21 |                    46,5 |
+  |    88 |            25 |                   167,4 |
+  |   128 |            65 |                   537,1 |
+
+  Y en `bench_contention` con 128 hilos, lo que se nota no es solo el tiempo
+  (101,4 -> 32,4 ms) sino la COLA: el hilo mas lento pasa de ser 42,3 veces mas
+  lento que el mas rapido a serlo 3,7.
+
+  Sin competencia no cuesta nada: en `bench_vs_malloc`, que es de un solo hilo,
+  la columna nueva va a la par de las otras dos.
+
+- **`util/os_env.h`: el entorno se lee del SISTEMA, no del runtime de C.**
+  `util::os_env` y `util::os_env_flag` van al bloque que el nucleo dio al
+  proceso -- el PEB en Windows, por `NtQueryInformationProcess`; `environ` en
+  POSIX -- en vez de a `getenv`.
+
+  `getenv` no lee el entorno: lee una COPIA que el runtime de C monta mientras
+  arranca.  Y este asignador se inicializa en la PRIMERA reserva, que puede
+  caer durante la inicializacion de estaticos -- cualquier global cuyo
+  constructor pida memoria llega antes que `main` --.  Ahi esa copia puede no
+  existir todavia, y entonces `getenv` devuelve nulo y TODOS los mandos salen
+  apagados sin fallar y sin decirlo.  Leyendo el bloque del sistema no hay un
+  "demasiado pronto", y de paso la libreria deja de necesitar al runtime de C
+  para contestar una pregunta sobre el proceso -- la misma razon por la que
+  `os_memory.cpp` habla con ntdll y no con kernel32.
+
+  Cada variable se lee **una sola vez**, antes de la primera reserva.
+  `..._SITES` decidia dos cosas -- si se apunta y si se parchea `operator new`
+  -- y se preguntaba dos veces; ahora se pregunta una y las dos decisiones no
+  pueden discrepar.
+
+  Se prueba comparandose con `getenv` sobre el entorno ENTERO
+  (`tests/test_os_env.cpp`): llegar antes no vale de nada si la respuesta no es
+  la misma.  Ademas de los casos que una muestra se salta -- valor vacio, un
+  nombre que es prefijo de otro, truncado visible.
+
 - **Version con TIPO en C++** (`util::vesta_memcopy`, `util::vesta_memfill`) y
   **variantes que si llaman** (`vesta_memcpy_noinline`,
   `vesta_memset_noinline`).
@@ -82,6 +138,22 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
   VestaVM, en dos sitios distintos y ninguno de los dos era el suyo -- la copia
   en un `simd_copy.h` suelto, y el relleno DENTRO del `.cpp` del interprete, sin
   cabecera, donde no lo podia usar nadie mas.  Un hecho, un productor.
+
+### Corregido
+
+- **`bench_operator_new` acusaba a corridas que funcionaban.**  Su bucle de
+  calentamiento no pasaba el puntero por un `volatile`, y desde C++14 el
+  compilador puede BORRAR un par `new`/`delete` sin usar -- GCC borraba el
+  bucle entero a `-O2`.  La comprobacion que venia despues leia entonces el
+  estado del asignador sin que se hubiera reservado nada todavia, concluia que
+  la medicion estaba apagada y se negaba a correr... en una corrida que a
+  continuacion apuntaba diez millones de reservas sin un fallo.  En Debug no
+  pasaba, porque ahi el bucle sigue estando.
+
+  Ahora los dos bucles pasan por la misma funcion, que es donde vive el
+  `volatile`: una copia sin el es un bucle que el compilador puede borrar, y lo
+  borra en silencio.  Una autocomprobacion que acusa a lo que funciona es peor
+  que no tenerla -- manda a quien la lea detras de un fallo que no existe.
 
 ## [1.0.0] -- 2026-09-06
 
@@ -177,6 +249,62 @@ invita a creer que ampara.
 
 ### Added
 
+- **`util::PerThreadAllocator`: many threads and NOT ONE lock up to 16 KiB.**
+  A second overflow policy, picked by TYPE at compile time as D13 requires.
+  The process-wide allocator bounds MEMORY: it can name `kMaxThreads` owners,
+  and past that threads share one cache behind a spin lock.  This one bounds
+  LATENCY: every thread gets a cache of its own, there is no shared fallback to
+  land in, and what it costs is memory -- one cache per live thread, out of a
+  pool of `kPerThreadCaches`.
+
+  Neither is better; they bound different things, which is why both exist
+  rather than one replacing the other.
+
+  WHY IT WAS NEEDED.  Because the shared lock does not degrade, it COLLAPSES,
+  and the knee is where nobody looks: when the threads on the shared path
+  outnumber the cores.  Past that the holder can lose its processor and every
+  other spinner burns a whole quantum waiting on a thread that is not running.
+  Measured with 20,000 allocations per thread on a 24-core machine, with the
+  SAME useful work in all three rows:
+
+  | threads | on shared | CPU ns per operation |
+  | ------: | --------: | -------------------: |
+  |      84 |        21 |                 46.5 |
+  |      88 |        25 |                167.4 |
+  |     128 |        65 |                537.1 |
+
+  And in `bench_contention` at 128 threads what shows is not only the time
+  (101.4 -> 32.4 ms) but the TAIL: the slowest thread goes from being 42.3x
+  slower than the fastest to 3.7x.
+
+  It costs nothing where there is no contention: in `bench_vs_malloc`, which is
+  single-threaded, the new column is on par with the other two.
+
+- **`util/os_env.h`: the environment is read from the SYSTEM, not from the C
+  runtime.**  `util::os_env` and `util::os_env_flag` go to the block the kernel
+  handed the process -- the PEB on Windows, through
+  `NtQueryInformationProcess`; `environ` on POSIX -- instead of to `getenv`.
+
+  `getenv` does not read the environment: it reads a COPY the C runtime builds
+  while it starts up.  And this allocator initialises on the FIRST allocation,
+  which can happen during static initialisation -- any global whose constructor
+  asks for memory gets there before `main`.  That copy may not exist yet at
+  that point, and then `getenv` returns null and every switch reads as off,
+  without failing and without saying so.  Reading the system's block means
+  there is no "too early", and it also drops the C runtime as a dependency for
+  answering a question about the process -- the same reason `os_memory.cpp`
+  talks to ntdll rather than kernel32.
+
+  Each variable is read **once**, before the first allocation.  `..._SITES`
+  decided two things -- whether to record and whether to patch `operator new`
+  -- and was asked twice; it is now asked once and the two decisions cannot
+  disagree.
+
+  Tested by comparing against `getenv` over the WHOLE environment
+  (`tests/test_os_env.cpp`): arriving earlier is worth nothing if the answer is
+  not the same one.  Plus the cases a sample would skip -- an empty value, a
+  name that is a prefix of another, visible truncation.
+
 - **Typed version in C++** (`util::vesta_memcopy`, `util::vesta_memfill`) and
   **variants that do call** (`vesta_memcpy_noinline`, `vesta_memset_noinline`).
 
@@ -245,6 +373,21 @@ invita a creer que ampara.
   in two different places and neither was the right one -- the copy in a
   standalone `simd_copy.h`, the fill INSIDE the interpreter's `.cpp` with no
   header, where nobody else could use it.  One fact, one producer.
+
+### Fixed
+
+- **`bench_operator_new` accused runs that were working.**  Its warm-up loop did
+  not park the pointer in a `volatile`, and since C++14 the compiler may DELETE
+  an unused `new`/`delete` pair -- GCC deleted the whole loop at `-O2`.  The
+  check that followed then read the allocator's state with nothing allocated
+  yet, concluded measurement was off and refused to run... on a run that went on
+  to record ten million allocations without a hitch.  Debug never showed it,
+  because there the loop is still present.
+
+  Both loops now go through the same function, which is where the `volatile`
+  lives: a copy without it is a loop the compiler is free to delete, and it
+  deletes it silently.  A self-check that accuses working code is worse than no
+  self-check -- it sends whoever reads it after a bug that is not there.
 
 ## [1.0.0] -- 2026-09-06
 

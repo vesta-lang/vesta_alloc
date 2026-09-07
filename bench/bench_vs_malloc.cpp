@@ -32,9 +32,13 @@
  *   3. churn   a live set with random insert/remove.  The realistic one, and
  *              the one that punishes fragmentation -- the other two never make
  *              an allocator work.
- *   4. calloc  the same, zeroed.  Worth separating: an allocator that gets
- *              fresh pages from the OS can skip the memset, one that recycles
- *              cannot.
+ *   4. calloc  the same, zeroed, and measured TWICE: once with the caller
+ *              reading the whole block and once reading a sixty-fourth.  It has
+ *              to be both, because a large `calloc` does not zero anything --
+ *              it maps pages the kernel already holds zeroed and defers the
+ *              cost to page faults.  Measured with a single byte touched, that
+ *              deferral looks like speed; measured with the block actually
+ *              used, it is 8x slower.  Neither row alone is the answer.
  *   5. realloc growth from small to large, which is where a bad realloc shows
  *              up as a copy it did not need to make.
  *
@@ -81,7 +85,12 @@ struct Rng {
 };
 
 // ---------------------------------------------------------------------------
-//  The two allocators, behind the same shape so the loops are identical.
+//  Every way in, behind the same shape so the loops are identical.
+//
+//  A column is a TYPE, which is also how a caller picks a specialisation in
+//  real code -- resolved at compile time, never a flag.  Each one carries its
+//  own name and says whether it is one of ours, so the driver below can walk
+//  them as a list instead of being hand-unrolled once per column.
 // ---------------------------------------------------------------------------
 
 struct Ours {
@@ -91,6 +100,29 @@ struct Ours {
         return vesta_host_realloc(p, n);
     }
     static void release(void *p) noexcept { util::host_free(p); }
+    static const char *name() noexcept { return "shared"; }
+    static constexpr bool is_ours = true;
+};
+
+/// A cache per thread and no lock.  Here it measures the SAME single-threaded
+/// work as the others on purpose: this is where it must not be paying for the
+/// thing it buys.  What it buys only shows up in `bench_contention`, with more
+/// threads alive than the shared policy can name.
+struct PerThread {
+    static void *alloc(size_t n) noexcept {
+        return util::PerThreadAllocator::alloc(n);
+    }
+    static void *zeroed(size_t n) noexcept {
+        void *p = util::PerThreadAllocator::alloc(n);
+        if (p != nullptr) vesta_memset(p, 0, n);
+        return p;
+    }
+    static void *grow(void *p, size_t n) noexcept {
+        return util::host_realloc(p, n);
+    }
+    static void release(void *p) noexcept { util::PerThreadAllocator::free(p); }
+    static const char *name() noexcept { return "per-thread"; }
+    static constexpr bool is_ours = true;
 };
 
 /// El de un solo dueno: la misma maquinaria sin pasar por la ranura del hilo.
@@ -107,6 +139,8 @@ struct Owned {
         return util::host_realloc(p, n);
     }
     static void release(void *p) noexcept { g_owned.free(p); }
+    static const char *name() noexcept { return "owned"; }
+    static constexpr bool is_ours = true;
 };
 
 struct System {
@@ -116,7 +150,24 @@ struct System {
         return std::realloc(p, n);
     }
     static void release(void *p) noexcept { std::free(p); }
+    static const char *name() noexcept { return "malloc"; }
+    static constexpr bool is_ours = false;
 };
+
+/**
+ * @brief The columns, as a type list.
+ *
+ * Adding a way in is a TYPE here.  It used to be a field in the result struct,
+ * a pair of lines in the A-B-B-A driver and a column in two printf formats,
+ * which is three places to forget and no error when you do -- the column simply
+ * would not appear.
+ *
+ * Order matters: the driver walks this forwards and then backwards, so the
+ * system allocator goes last and lands first on the way back.
+ */
+template <class...> struct Columns {};
+using AllColumns = Columns<Ours, PerThread, Owned, System>;
+constexpr int kCols = 4;
 
 // ---------------------------------------------------------------------------
 //  The patterns.  Each returns nanoseconds per operation.
@@ -172,11 +223,46 @@ template <class A> double churn(size_t size, int live_n, int steps) {
     return r;
 }
 
-template <class A> double zeroed(size_t size, int rounds) {
+/**
+ * @brief Stops the compiler from deleting the work being measured.
+ *
+ * NEEDED, and this benchmark got it wrong without it.  With `std::free` right
+ * after the block, GCC knows it dies and DELETES the memset; with our `free`,
+ * an opaque call, it cannot.  So the two columns were not measuring the same
+ * thing: 4 MiB "filled" in 9 us is 447 GB/s, which no single core can do.
+ */
+[[gnu::always_inline]] inline void keep(void *p) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" : : "r"(p) : "memory");
+#else
+    (void)*static_cast<volatile char *>(p);
+#endif
+}
+
+/**
+ * @brief Zeroed allocation, measured by how much of it the caller USES.
+ *
+ * WHY THIS IS TWO CASES AND NOT ONE.  A large `calloc` does not zero anything:
+ * it maps pages the kernel already holds zeroed and defers the cost to page
+ * faults.  If nobody touches the memory, that cost is never paid.  We zero for
+ * real, up front.  Measuring with a single byte touched therefore does not
+ * compare two ways of doing the same job -- it rewards whoever does less work,
+ * without asking whether the work was needed.
+ *
+ * Measured here, 1 MiB on Windows: zeroing eagerly and then reading the whole
+ * block costs 28,7 us; deferring costs 4,7 us plus 292 us of page faults.
+ * Deferring only wins when the caller touches under ~4% of what it asked for.
+ *
+ * @param used  Fraction of the block the caller reads, 1..N (1 = all of it).
+ */
+template <class A> double zeroed(size_t size, int rounds, size_t used) {
     const auto t0 = Clock::now();
     for (int i = 0; i < rounds; ++i) {
         void *p = A::zeroed(size);
-        if (p != nullptr) *static_cast<volatile char *>(p) = 1;
+        if (p != nullptr) {
+            std::memset(p, 1, size / used);
+            keep(p);
+        }
         A::release(p);
     }
     return ns_since(t0, 2LL * rounds);
@@ -203,11 +289,37 @@ template <class A> double grow(size_t size, int rounds) {
 //  Measuring, A-B-B-A.
 // ---------------------------------------------------------------------------
 
-struct Pair {
-    double ours = 0.0;
-    double owned = 0.0;
-    double sys = 0.0;
+struct Row {
+    double ns[kCols] = {};
+    /* And what each one KEEPS.  Time alone does not settle any of these rows:
+     * an allocator that defers the work also defers the memory, and one that
+     * holds on to a block is faster next time for a reason that has a price.
+     * These are the committed bytes this process gained across the run. */
+    double mem[kCols] = {};
 };
+
+/**
+ * @brief How much memory each column had to COMMIT for its run.
+ *
+ * The two allocators live in the same process, so a process-level number
+ * cannot tell them apart.  Each is therefore read with the instrument that
+ * attributes it:
+ *
+ *   - ours (both columns) by our own counter of bytes committed out of the
+ *     region, which is exact and counts only us;
+ *   - malloc by what the process gained in committed private bytes while only
+ *     its column was running.
+ *
+ * Reading ours with the process counter instead would print zeros and mean
+ * nothing: by the time a case runs, the region already holds what the earlier
+ * cases committed.
+ */
+uint64_t committed_by_us() noexcept {
+    return util::host_alloc_stats().bytes_reserved;
+}
+uint64_t committed_by_process() noexcept {
+    return util::os_process_memory().commit;
+}
 
 /* Los casos son structs de ambito de fichero y no lambdas locales porque hacen
  * falta con un `operator()` de PLANTILLA -- el mismo bucle se instancia para
@@ -238,8 +350,9 @@ struct ChurnCase {
 struct ZeroedCase {
     size_t size;
     int rounds;
+    size_t used; ///< 1 = the caller reads all of it; 64 = a sixty-fourth
     template <class A> double operator()() const {
-        return zeroed<A>(size, rounds);
+        return zeroed<A>(size, rounds, used);
     }
 };
 struct GrowCase {
@@ -250,22 +363,51 @@ struct GrowCase {
     }
 };
 
-/// @param f  Called as `f.template operator()<Alloc>()`, returns ns/op.
-template <class F> Pair abba(F run) {
-    const double a1 = run.template operator()<Ours>();
-    const double c1 = run.template operator()<Owned>();
-    const double b1 = run.template operator()<System>();
-    const double b2 = run.template operator()<System>();
-    const double c2 = run.template operator()<Owned>();
-    const double a2 = run.template operator()<Ours>();
-    Pair p;
-    p.ours = (a1 + a2) / 2.0;
-    p.owned = (c1 + c2) / 2.0;
-    p.sys = (b1 + b2) / 2.0;
-    return p;
+/// One column's run, behind a pointer so the driver can hold them in an array.
+/// The call happens once per RUN -- thousands of operations later -- so the
+/// inner loop is still `A`'s code, fully typed and fully inlined.
+template <class F, class A> double call_one(const F &run) {
+    return run.template operator()<A>();
 }
 
-void row(const char *label, size_t size, Pair p) {
+/// Whether a column is served by this library, which decides WHICH instrument
+/// attributes its memory.
+template <class A> bool column_is_ours() { return A::is_ours; }
+template <class A> const char *column_name() { return A::name(); }
+
+/// @param run  Called as `run.template operator()<Alloc>()`, returns ns/op.
+template <class F, class... A> Row abba(const F &run, Columns<A...>) {
+    using Fn = double (*)(const F &);
+    static const Fn fns[] = {&call_one<F, A>...};
+    static const bool ours[] = {A::is_ours...};
+    constexpr int n = int(sizeof...(A));
+
+    Row r;
+    /* FORWARDS AND THEN BACKWARDS, which is A-B-B-A generalised: each column
+     * lands as often near the start as near the end, so drift in the machine
+     * -- thermal, another process, the scheduler settling -- does not land on
+     * the difference between them. */
+    for (int i = 0; i < n; ++i) {
+        /* The memory each one keeps is read around its FIRST run only: by the
+         * second the heap has already grown and the difference would read as
+         * zero for everybody.  Ours is read with our own committed-bytes
+         * counter, which is exact and counts only us; the system one with what
+         * the process gained, which is the only instrument that sees it. */
+        const uint64_t before =
+            ours[i] ? committed_by_us() : committed_by_process();
+        r.ns[i] = fns[i](run);
+        const uint64_t after =
+            ours[i] ? committed_by_us() : committed_by_process();
+        /* Signed on purpose: a negative reading means that column gave memory
+         * back to the system, which is a real answer and not an error to
+         * hide. */
+        r.mem[i] = double(int64_t(after) - int64_t(before));
+    }
+    for (int i = n; i-- > 0;) r.ns[i] = (r.ns[i] + fns[i](run)) / 2.0;
+    return r;
+}
+
+void row(const char *label, size_t size, const Row &r) {
     char name[48];
     if (size >= (1u << 20))
         std::snprintf(name, sizeof(name), "%s %zuM", label, size >> 20);
@@ -274,21 +416,40 @@ void row(const char *label, size_t size, Pair p) {
     else
         std::snprintf(name, sizeof(name), "%s %zu", label, size);
 
-    /* La proporcion se calcula contra la MEJOR de las dos nuestras, porque la
-     * pregunta es "que se puede conseguir con esta biblioteca", no "cual de sus
-     * dos formas escogimos".  Las dos columnas estan a la vista para poder ver
-     * cuanto cuesta compartir. */
-    const double best = (p.owned > 0.0 && p.owned < p.ours) ? p.owned : p.ours;
-    const double ratio = best > 0.0 ? p.sys / best : 0.0;
-    std::printf("  %-16s %9.2f %9.2f %9.2f  %6.2fx  %s\n", name, p.ours,
-                p.owned, p.sys, ratio, ratio >= 1.0 ? "" : "<- system wins");
+    std::printf("  %-16s", name);
+    for (int i = 0; i < kCols; ++i) std::printf(" %10.2f", r.ns[i]);
+
+    /* The ratio is against the BEST of ours, because the question is "what can
+     * be had from this library", not "which of its forms did we pick".  Every
+     * column stays on show so the cost of sharing is visible. */
+    double best = 0.0;
+    for (int i = 0; i < kCols - 1; ++i)
+        if (r.ns[i] > 0.0 && (best == 0.0 || r.ns[i] < best)) best = r.ns[i];
+    const double sys = r.ns[kCols - 1];
+    const double ratio = best > 0.0 ? sys / best : 0.0;
+    std::printf("  %6.2fx  ", ratio);
+
+    const double mib = 1024.0 * 1024.0;
+    for (int i = 0; i < kCols; ++i) std::printf(" %7.2f", r.mem[i] / mib);
+    std::printf("  %s\n", ratio >= 1.0 ? "" : "<- system wins");
 }
 
 void header(const char *title) {
+    static const char *names[] = {Ours::name(), PerThread::name(),
+                                  Owned::name(), System::name()};
     std::printf("\n%s\n", title);
-    std::printf("  %-16s %9s %9s %9s  %8s\n", "case", "shared", "owned",
-                "malloc", "best/sys");
-    std::printf("  ---------------- --------- --------- ---------  --------\n");
+    std::printf("  %-16s", "case");
+    for (int i = 0; i < kCols; ++i) std::printf(" %10s", names[i]);
+    std::printf("  %8s   %s\n", "best/sys", "MiB committed by the run");
+    std::printf("  %-16s", "");
+    for (int i = 0; i < kCols; ++i) std::printf(" %10s", "ns/op");
+    std::printf("  %8s  ", "");
+    for (int i = 0; i < kCols; ++i) std::printf(" %7s", names[i]);
+    std::printf("\n  ----------------");
+    for (int i = 0; i < kCols; ++i) std::printf(" ----------");
+    std::printf("  --------  ");
+    for (int i = 0; i < kCols; ++i) std::printf(" -------");
+    std::printf("\n");
 }
 
 const size_t kSizes[] = {16, 64, 256, 1024, 4096, 65536, 1u << 20};
@@ -409,43 +570,80 @@ int main() {
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s);
-        row("hot", s, abba(HotCase{s, n}));
+        row("hot", s, abba(HotCase{s, n}, AllColumns{}));
     }
 
     header("allocate a batch, free the batch (burst)");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s) / 512 + 1;
-        row("burst", s, abba(BurstCase{s, n}));
+        row("burst", s, abba(BurstCase{s, n}, AllColumns{}));
     }
 
     header("live set with random replacement (churn)");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s);
-        row("churn", s, abba(ChurnCase{s, n}));
+        row("churn", s, abba(ChurnCase{s, n}, AllColumns{}));
     }
 
-    header("zeroed (calloc)");
+    header("zeroed (calloc), and the caller reads ALL of it");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s);
-        row("calloc", s, abba(ZeroedCase{s, n}));
+        row("calloc", s, abba(ZeroedCase{s, n, 1}, AllColumns{}));
+    }
+
+    std::printf("\nThe other half of the answer, not a second opinion: whoever\n"
+                "defers the zeroing wins below and loses above.  A row where a\n"
+                "1 MiB request is barely read says more about the caller asking\n"
+                "for the wrong size than about the allocator.\n");
+    header("zeroed (calloc), and the caller reads a SIXTY-FOURTH");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        const int n = rounds_for(s);
+        row("calloc", s, abba(ZeroedCase{s, n, 64}, AllColumns{}));
     }
 
     header("grow from 64 bytes by doubling (realloc)");
     for (int i = 2; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s) / 8 + 1;
-        row("grow to", s, abba(GrowCase{s, n}));
+        row("grow to", s, abba(GrowCase{s, n}, AllColumns{}));
     }
 
     memory_per_class();
     memory_over_aligned();
 
+    /* What the whole run cost in MEMORY, which the ns/op columns cannot show.
+     * It belongs next to the times: an allocator that is faster because it
+     * keeps everything it was ever given is not faster, it is trading. */
     const util::OsProcessMemory pm = util::os_process_memory();
-    std::printf("\nprocess peak %.1f MiB resident\n",
-                pm.working_set_peak / (1024.0 * 1024.0));
+    const util::HostAllocStats hs = util::host_alloc_stats();
+    const double mib = 1024.0 * 1024.0;
+    std::printf("\nmemory for the whole run\n");
+    std::printf("  address space reserved by us     %8.1f MiB\n",
+                double(util::host_region_reserved()) / mib);
+    std::printf("  committed by us                  %8.1f MiB   (%llu chunks)\n",
+                double(hs.bytes_reserved) / mib,
+                (unsigned long long)hs.chunks);
+    /* El pico de comprometido no lo da todo el mundo: en Linux vendria de
+     * `/proc/self/status` y la capa de sistema no lo lee.  Se dice, en vez de
+     * imprimir un cero que parece un dato. */
+    if (pm.commit_peak != 0)
+        std::printf("  committed by the whole process   %8.1f MiB   (peak %.1f)\n",
+                    pm.commit / mib, pm.commit_peak / mib);
+    else
+        std::printf("  committed by the whole process   %8.1f MiB   (peak: this "
+                    "system does not report it)\n",
+                    pm.commit / mib);
+    std::printf("  resident now / peak              %8.1f / %.1f MiB\n",
+                pm.working_set / mib, pm.working_set_peak / mib);
+    std::printf("\n  Reserved is address space and costs nothing until it is\n"
+                "  committed; committed is what the system has to back.  We\n"
+                "  reserve once and keep what we commit, which is why our\n"
+                "  per-row figures fall to zero after the first case: the memory\n"
+                "  is already ours.  That is the price of the speed above.\n");
     std::printf("\nA ratio above 1.00 means this allocator is that many times\n"
                 "faster.  Anything marked \"system wins\" is a real result, not\n"
                 "noise to be explained away.\n");

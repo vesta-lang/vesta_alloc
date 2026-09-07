@@ -140,19 +140,66 @@ option(VESTA_ALLOC_BUILD_EXAMPLES "Compilar los ejemplos"
 option(VESTA_ALLOC_BUILD_BENCH "Compilar los bancos de medida"
         ${VESTA_ALLOC_STANDALONE})
 
+# -----------------------------------------------------------------------------
+#  LTO BREAKS THIS, AND WE STOP HERE
+#
+#  `call_site.cpp` records where each allocation comes from by writing a jump
+#  over the ENTRY of `operator new`.  That assumes every allocation goes through
+#  that entry -- always true, because `operator new` is replaceable and lives in
+#  another translation unit -- and link-time optimisation breaks it: it may
+#  inline `operator new` into its callers, and those allocations no longer pass
+#  through the patched entry.
+#
+#  The expensive part is HOW it breaks: it does not fail, it does not warn, those
+#  allocations simply do not appear in the report.  A list of who allocates that
+#  is missing allocations is not incomplete, it is wrong -- and there is no way
+#  to tell by looking at it.
+#
+#  Checked HERE and not with an `#error` because the preprocessor cannot: neither
+#  GCC nor Clang define any macro for `-flto`.  CMake does know, so CMake is the
+#  one that has to say it.
+# -----------------------------------------------------------------------------
+if(CMAKE_INTERPROCEDURAL_OPTIMIZATION
+        OR CMAKE_CXX_FLAGS MATCHES "-flto"
+        OR CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto"
+        OR CMAKE_EXE_LINKER_FLAGS MATCHES "-flto")
+    message(FATAL_ERROR
+            "vesta_alloc: this project does not use LTO, and "
+            "`src/call_site.cpp` counts on that.\n"
+            "The who-allocates report patches the entry of `operator new`; with "
+            "LTO the linker may inline it into its callers and those "
+            "allocations stop being recorded -- without failing and without "
+            "warning, which is the worst thing that can happen to a list.\n"
+            "If LTO is genuinely needed, first work out how an inlined "
+            "allocation gets attributed; until then this stops the build on "
+            "purpose.")
+endif()
+
 set(VESTA_ALLOC_SOURCES
+        src/alloc_sites.cpp
+        # The `operator new` family, plus the patch that makes them say where
+        # they came from.  The return address is taken by a `mov` from `[rsp]`,
+        # not by a compiler builtin.  See the file header; their bodies stay in
+        # host_allocator.cpp.
+        src/call_site.cpp
         src/host_allocator.cpp
         src/host_allocator_c.cpp
+        # The environment, read from the block the SYSTEM gave the process and
+        # not from the C runtime's copy of it -- which does not exist yet when
+        # the allocator initialises during static initialisation.
+        src/os_env.cpp
         src/os_memory.cpp
         src/scratch_arena.cpp
         src/thread_slot.cpp
 )
 
 set(VESTA_ALLOC_HEADERS
+        include/util/alloc_sites.h
         include/util/alloc_tag.h
         include/util/host_allocator.h
         include/util/host_allocator_c.h
         include/util/host_allocator_layout.h
+        include/util/os_env.h
         include/util/os_memory.h
         include/util/scratch_arena.h
         include/util/thread_slot.h
@@ -273,8 +320,10 @@ if(VESTA_ALLOC_BUILD_TESTS)
         enable_testing()
     endif()
     foreach(_t IN ITEMS test_host_allocator test_host_spans test_alloc_tag
-                        test_single_owner test_thread_slot test_scratch_arena
-                        test_mem_ops test_host_layout)
+                        test_alloc_sites test_span_race test_counters_agree
+                        test_variants test_thread_slot test_scratch_arena
+                        test_mem_ops test_host_layout test_call_site
+                        test_os_env)
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_t} PRIVATE vesta_alloc)
@@ -341,7 +390,8 @@ endif()
 # -----------------------------------------------------------------------------
 if(VESTA_ALLOC_BUILD_BENCH)
     foreach(_b IN ITEMS bench_allocator bench_vs_malloc bench_reserve_cost
-                        bench_memcpy bench_memset bench_contention)
+                        bench_memcpy bench_memset bench_contention
+                        bench_operator_new)
         add_executable(vesta_alloc_${_b} bench/${_b}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
         target_link_libraries(vesta_alloc_${_b} PRIVATE vesta_alloc)

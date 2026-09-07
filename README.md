@@ -240,6 +240,22 @@ stack in one exchange when it next runs dry.
 | :--- | :--- |
 | `VESTA_NO_HOST_SLAB=1` | Turn the allocator off; everything goes to the system. This exists so there is something to compare against -- without it there is no way to know whether an allocator improves anything. |
 | `VESTA_HOST_ALLOC_STATS=1` | Print a summary at exit: counts, committed bytes, the breakdown by requested size, and the breakdown by purpose. |
+| `VESTA_HOST_ALLOC_SITES=1` | Also record WHERE each allocation came from, and print the sites at exit. Implies `..._STATS`. This is the one that installs the jump over `operator new`; without it those entry points are untouched and cost nothing. |
+
+Set, non-empty and not `0` means on.
+
+Each is read **once, on the first allocation**, and read from the environment
+block the operating system gave the process -- the PEB on Windows, `environ` on
+POSIX -- not through `getenv`. `getenv` reads a copy the C runtime builds while
+it starts up, and the first allocation can happen before that copy exists: any
+global whose constructor asks for memory gets there before `main`. Reading the
+system's block instead means there is no "too early", and it is also why this
+library needs nothing from the C runtime to answer the question.
+
+Because the answer is taken once and before anything is allocated, setting one
+of these from inside the program later has no effect -- deliberately. Switching
+measurement on halfway through would silently leave every allocation made
+during start-up out of the report.
 
 ## Purpose tags
 

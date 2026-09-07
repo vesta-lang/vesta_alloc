@@ -204,24 +204,66 @@ void push(Mailbox &b, void *p) noexcept {
 }
 
 /**
- * @brief The two allocators, chosen by TYPE.
+ * @brief The allocators under test, chosen by TYPE.
  *
  * A number with nothing beside it says nothing: "1.39 ns per operation" is only
  * meaningful next to what the system charges for the same work.  And the choice
  * has to be a type resolved at compile time, not a pointer or a flag -- with an
- * indirect call in the loop, both columns would be measuring the indirect call
+ * indirect call in the loop, every column would be measuring the indirect call
  * as much as the allocator, and the one that is otherwise five instructions
  * would suffer most.
+ *
+ * That the choice is a type is not a benchmarking trick, it is the shape the
+ * allocator itself uses: the two overflow policies below are picked the same
+ * way, at compile time, never by a switch the program can flip.
  */
 struct Ours {
     static void *alloc(size_t n) noexcept { return util::host_alloc(n); }
     static void free(void *p) noexcept { util::host_free(p); }
-    static const char *name() noexcept { return "ours"; }
+    static const char *name() noexcept { return "shared"; }
+};
+
+/**
+ * @brief The other overflow policy: a cache per thread, and no lock.
+ *
+ * THIS IS THE COLUMN THIS BENCH EXISTS FOR.  The two policies bound different
+ * things -- `Ours` bounds memory (at most `kMaxThreads` caches, the rest served
+ * behind a spin lock), this one bounds latency (a cache for every thread, no
+ * lock, memory grows with live threads) -- so the interesting number is not
+ * either one alone but where they separate.
+ *
+ * They separate exactly when the threads on the shared path outnumber the
+ * cores: below that both are lock-free and measure the same, and above it the
+ * shared one stops waiting and starts convoying.  Run this past
+ * `kMaxThreads` threads or the two columns will agree and say nothing.
+ */
+struct PerThread {
+    static void *alloc(size_t n) noexcept {
+        return util::PerThreadAllocator::alloc(n);
+    }
+    static void free(void *p) noexcept { util::PerThreadAllocator::free(p); }
+    static const char *name() noexcept { return "per-thread"; }
 };
 struct System {
     static void *alloc(size_t n) noexcept { return std::malloc(n); }
     static void free(void *p) noexcept { std::free(p); }
     static const char *name() noexcept { return "malloc"; }
+};
+
+/**
+ * @brief La MISMA implementacion, pero entrando por donde entra el programa.
+ *
+ * POR QUE HACE FALTA UNA TERCERA COLUMNA que sirve lo mismo que la primera.
+ * Porque casi nadie llama a `host_alloc`: cada `std::vector`, cada cadena y
+ * cada nodo de tabla llegan por `operator new`, y ahi hay cosas que el camino
+ * directo no tiene -- la comprobacion de nulo que exige lanzar `bad_alloc`, y
+ * la anotacion de QUIEN reservo.  Medir por `host_alloc` y hablar del coste de
+ * `operator new` es medir otra cosa; ya paso.
+ */
+struct New {
+    static void *alloc(size_t n) noexcept { return ::operator new(n); }
+    static void free(void *p) noexcept { ::operator delete(p); }
+    static const char *name() noexcept { return "new"; }
 };
 
 template <class A> void drain(Mailbox &b) noexcept {
@@ -375,8 +417,39 @@ uint64_t g_ops_per_round = 0;
  * is not printed then, because with nothing to compare against it would be
  * inventing one.
  */
-enum class Only { Both, Ours, System };
-Only g_only = Only::Both;
+/**
+ * @brief The columns, in ONE table instead of a branch per variant.
+ *
+ * The function pointer costs nothing where it sits.  It is called once per
+ * ROUND -- millions of operations later -- while the inner loop is still
+ * `one_round<A>`, fully typed and fully inlined.  Paying one indirect call per
+ * round to stop hand-unrolling the driver for every variant is the trade this
+ * table makes, and it is why adding an allocator here is a LINE rather than
+ * four new branches, three new vectors and a new enum value.
+ *
+ * Order matters: the interleaving below walks this table forwards and then
+ * backwards, so whichever column is listed first is also the last one run.
+ */
+struct Column {
+    const char *name;
+    Sample (*run)(const affinity::Pass &, unsigned, int);
+};
+
+const Column kColumns[] = {
+    {"shared", &one_round<Ours>},
+    {"per-thread", &one_round<PerThread>},
+    {"new", &one_round<New>},
+    {"malloc", &one_round<System>},
+};
+constexpr size_t kNumColumns = sizeof(kColumns) / sizeof(kColumns[0]);
+
+/// Which columns to run.  Empty name means all of them.
+const char *g_only = nullptr;
+
+/// Whether a column is in this run.  Matched by first letter, as before.
+bool wanted(const Column &c) noexcept {
+    return g_only == nullptr || c.name[0] == g_only[0];
+}
 
 /**
  * @brief Prints one allocator's row and returns its median per-core cost.
@@ -460,47 +533,46 @@ void run_pass(const affinity::Pass &p, int steps, int reps, unsigned want) {
      * first would be charging one of them for being first.  What it warms
      * SURVIVES the round even though the threads do not: the free lists go back
      * with the identifier and the next round inherits them. */
-    if (g_only != Only::System) one_round<Ours>(p, threads, steps);
-    if (g_only != Only::Ours) one_round<System>(p, threads, steps);
+    for (const Column &c : kColumns)
+        if (wanted(c)) c.run(p, threads, steps);
 
-    /* INTERLEAVED AND IN BOTH ORDERS: ours, system, system, ours.  Two runs one
-     * after the other cannot tell a difference from the machine drifting --
-     * thermal, another process, the scheduler settling -- and the drift is not
-     * symmetric, so whichever goes first pays for it.  Running A-B-B-A inside
-     * every repetition puts each of them equally often in each position. */
-    std::vector<Sample> ours, sys;
+    /* INTERLEAVED AND IN BOTH ORDERS.  Two runs one after the other cannot tell
+     * a difference from the machine drifting -- thermal, another process, the
+     * scheduler settling -- and the drift is not symmetric, so whichever goes
+     * first pays for it.  Walking the table forwards and then backwards inside
+     * every repetition is the A-B-B-A trick generalised: each column lands as
+     * often near the start as near the end, however many there are. */
+    std::vector<Sample> got[kNumColumns];
     for (int rd = 0; rd < reps; ++rd) {
-        if (g_only == Only::System) {
-            sys.push_back(one_round<System>(p, threads, steps));
-            sys.push_back(one_round<System>(p, threads, steps));
-            continue;
-        }
-        if (g_only == Only::Ours) {
-            ours.push_back(one_round<Ours>(p, threads, steps));
-            ours.push_back(one_round<Ours>(p, threads, steps));
-            continue;
-        }
-        const Sample a1 = one_round<Ours>(p, threads, steps);
-        const Sample b1 = one_round<System>(p, threads, steps);
-        const Sample b2 = one_round<System>(p, threads, steps);
-        const Sample a2 = one_round<Ours>(p, threads, steps);
-        ours.push_back(a1);
-        ours.push_back(a2);
-        sys.push_back(b1);
-        sys.push_back(b2);
+        for (size_t i = 0; i < kNumColumns; ++i)
+            if (wanted(kColumns[i]))
+                got[i].push_back(kColumns[i].run(p, threads, steps));
+        for (size_t i = kNumColumns; i-- > 0;)
+            if (wanted(kColumns[i]))
+                got[i].push_back(kColumns[i].run(p, threads, steps));
     }
 
-    if (ours.empty() && sys.empty()) return;
+    bool any = false;
+    for (size_t i = 0; i < kNumColumns; ++i) any = any || !got[i].empty();
+    if (!any) return;
 
     std::printf("  %s%s%s  %u threads, %llu operations a round\n", report::bold(),
                 p.name, report::reset(), threads,
                 (unsigned long long)g_ops_per_round);
-    const double a = ours.empty() ? 0.0 : report_row("ours", ours);
-    const double b = sys.empty() ? 0.0 : report_row("malloc", sys);
-    if (a > 0.0 && b > 0.0)
-        std::printf("      %s%-8s%s %s%.2fx%s\n", report::dim(), "ratio",
-                    report::reset(), b / a >= 1.0 ? report::green() : report::red(),
-                    b / a, report::reset());
+    /* The ratio is ours-versus-the-system, so the two ends of the table are
+     * remembered while the rows print. */
+    double first = 0.0, last = 0.0;
+    for (size_t i = 0; i < kNumColumns; ++i) {
+        if (got[i].empty()) continue;
+        const double med = report_row(kColumns[i].name, got[i]);
+        if (i == 0) first = med;
+        if (i == kNumColumns - 1) last = med;
+    }
+    if (first > 0.0 && last > 0.0)
+        std::printf("      %s%-10s%s %s%.2fx%s\n", report::dim(), "ratio",
+                    report::reset(),
+                    last / first >= 1.0 ? report::green() : report::red(),
+                    last / first, report::reset());
 }
 
 } // namespace
@@ -510,11 +582,10 @@ int main(int argc, char **argv) {
     const int reps = argc > 2 ? std::atoi(argv[2]) : 5;
     /// Zero -- the default -- means one thread per core of the pass.
     const unsigned want = argc > 3 ? unsigned(std::atoi(argv[3])) : 0u;
-    if (argc > 4) {
-        const char *w = argv[4];
-        if (w[0] == 'o') g_only = Only::Ours;
-        else if (w[0] == 'm') g_only = Only::System;
-    }
+    /* Which column to run on its own, by first letter: s(hared), p(er-thread),
+     * n(ew), m(alloc).  "ours" is still accepted for the shared one, which is
+     * what it used to be called. */
+    if (argc > 4) g_only = argv[4][0] == 'o' ? "shared" : argv[4];
 
     std::printf("== the allocator with many threads at once ==\n\n");
     std::printf("Each thread keeps 512 blocks alive and replaces one at random.\n"
@@ -569,9 +640,10 @@ int main(int argc, char **argv) {
      * ever reached. */
     const uint64_t no_id = a.no_owner_id - before.no_owner_id;
     if (no_id != 0)
-        std::printf("  %sran out of owner ids %llu times: those threads used "
-                    "the SHARED lists, behind the lock.  This is the fallback "
-                    "being measured, not the fast path.%s\n",
+        std::printf("  %sran out of owner ids %llu times: in the SHARED column "
+                    "those threads went behind the lock, which is exactly what "
+                    "the per-thread column does not do.  This is the "
+                    "comparison, not a spoiled measurement.%s\n",
                     report::amber(), (unsigned long long)no_id, report::reset());
     else if (want >= util::kMaxThreads)
         std::printf("  %s%u threads asked for and the owner ids never ran out: "

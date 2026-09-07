@@ -278,6 +278,36 @@ inline constexpr size_t kBigRegionMinBytes = size_t(32) << 20; // 32 MiB
  */
 inline constexpr uint32_t kMaxThreads = 64;
 
+/**
+ * @brief Owner ids reserved for the LOCK-FREE per-thread policy.
+ *
+ * TWO POLICIES, TWO BOUNDS.  The ids above bound MEMORY: no matter how many
+ * threads a program starts, the shared allocator never uses more than
+ * `kMaxThreads` caches, and whoever does not get one is served from the shared
+ * lists behind a lock.  These ids bound LATENCY instead: a thread using
+ * @c PerThreadAllocator always gets a cache of its own, so it never touches a
+ * lock, and the price is paid in memory -- one cache per live thread.
+ *
+ * Neither is better; they bound different things, which is why both exist.
+ *
+ * The ranges are kept apart on purpose.  Sharing one pool would let the
+ * lock-free policy eat the ids the shared one relies on, and the memory bound
+ * that is the whole point of the shared policy would quietly stop holding.
+ *
+ * The tables live in `.bss`, so this costs address space and commit charge,
+ * not resident memory: a page is only touched when a thread actually takes the
+ * cache that lives in it.
+ */
+inline constexpr uint32_t kPerThreadCaches = 960;
+
+/// Entries in the cache and remote tables: both policies index the same arrays.
+inline constexpr uint32_t kTotalCaches = kMaxThreads + kPerThreadCaches;
+
+static_assert(kPerThreadCaches % 64 == 0,
+              "the free-id map is an array of 64-bit words, so the count has "
+              "to fill whole words: a partial word would hand out ids that do "
+              "not exist");
+
 /// Marca de un trozo troceado en clases, el del asignador normal.
 inline constexpr uint32_t kChunkMagic = 0x56455354u; // 'VEST'
 
