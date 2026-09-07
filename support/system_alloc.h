@@ -77,10 +77,20 @@
 
 namespace system_alloc {
 
-/// The genuine `malloc`/`free`, plus what had to be done to reach them.
+/// The genuine `malloc`/`calloc`/`realloc`/`free`, plus what had to be done to
+/// reach them.
 struct Api {
     void *(*alloc)(size_t) = nullptr;
     void (*release)(void *) = nullptr;
+    /* THE OTHER TWO, and they are not decoration.  A benchmark that compares
+     * only `malloc` leaves out the two calls where the allocators differ MOST:
+     * `calloc` because whether the zeros are written or come free from the
+     * kernel is a design decision each side makes differently, and `realloc`
+     * because growing in place or copying is the whole question.  Reaching them
+     * through the same handle as `malloc` is also what keeps a block with the
+     * pair that made it -- see the rule below. */
+    void *(*zeroed)(size_t, size_t) = nullptr;
+    void *(*grow)(void *, size_t) = nullptr;
     /// How it was reached, for the report to print.  Never a guess: it says
     /// which of the routes below actually worked.
     const char *how = "";
@@ -88,7 +98,10 @@ struct Api {
     /// a column in silence looks like a benchmark that measured no difference.
     const char *why = "";
 
-    bool ok() const { return alloc != nullptr && release != nullptr; }
+    bool ok() const {
+        return alloc != nullptr && release != nullptr && zeroed != nullptr &&
+               grow != nullptr;
+    }
 };
 
 namespace detail {
@@ -145,10 +158,16 @@ inline Api load_private_crt() {
         reinterpret_cast<void *>(GetProcAddress(priv, "malloc")));
     a.release = reinterpret_cast<void (*)(void *)>(
         reinterpret_cast<void *>(GetProcAddress(priv, "free")));
+    a.zeroed = reinterpret_cast<void *(*)(size_t, size_t)>(
+        reinterpret_cast<void *>(GetProcAddress(priv, "calloc")));
+    a.grow = reinterpret_cast<void *(*)(void *, size_t)>(
+        reinterpret_cast<void *>(GetProcAddress(priv, "realloc")));
     if (!a.ok()) {
         a.alloc = nullptr;
         a.release = nullptr;
-        a.why = "the private copy has no malloc/free";
+        a.zeroed = nullptr;
+        a.grow = nullptr;
+        a.why = "the private copy is missing one of malloc/calloc/realloc/free";
         return a;
     }
     a.how = "a private copy of msvcrt.dll, loaded from disk";
@@ -179,10 +198,14 @@ inline Api load_libc() {
     }
     a.alloc = reinterpret_cast<void *(*)(size_t)>(dlsym(h, "malloc"));
     a.release = reinterpret_cast<void (*)(void *)>(dlsym(h, "free"));
+    a.zeroed = reinterpret_cast<void *(*)(size_t, size_t)>(dlsym(h, "calloc"));
+    a.grow = reinterpret_cast<void *(*)(void *, size_t)>(dlsym(h, "realloc"));
     if (!a.ok()) {
         a.alloc = nullptr;
         a.release = nullptr;
-        a.why = "libc has no malloc/free under those names";
+        a.zeroed = nullptr;
+        a.grow = nullptr;
+        a.why = "libc is missing one of malloc/calloc/realloc/free";
         return a;
     }
     a.how = how;

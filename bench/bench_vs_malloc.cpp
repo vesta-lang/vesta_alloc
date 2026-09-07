@@ -58,6 +58,11 @@
 #include "util/mem/vesta_memcpy.h"
 #include "util/mem/vesta_memset.h"
 
+#include "affinity.h"
+#include "bench_stats.h"
+#include "report.h"
+#include "system_alloc.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -147,14 +152,34 @@ struct Owned {
     static constexpr bool is_ours = true;
 };
 
+/* THE SYSTEM'S, AND IT USED TO BE `std::malloc`, WHICH WAS THIS BENCHMARK
+ * COMPARING ITSELF WITH ITSELF.
+ *
+ * Since the interposition landed, `malloc` in this process IS this allocator:
+ * the linker renamed the call.  So the column labelled `malloc` was our own
+ * fast path with a thunk in front of it, and the "1.47x better than the system"
+ * it printed was the price of that thunk, not a win over anybody.  Measured
+ * side by side: this column read 1.98 ns while the real msvcrt, reached the way
+ * below, reads 11.9.  Six times off, and nothing in the output said so.
+ *
+ * `support/system_alloc.h` reaches the genuine one -- a private copy of the C
+ * runtime on Windows, libc by handle on ELF -- and the four entry points travel
+ * together because a block must go back to the pair that made it.
+ *
+ * Cached in plain globals rather than asked for per call: `api()` is a
+ * function-local static, and its guard check inside the timed loop would be
+ * measured as if it were part of the allocator. */
+void *(*g_sys_alloc)(size_t) = nullptr;
+void *(*g_sys_zeroed)(size_t, size_t) = nullptr;
+void *(*g_sys_grow)(void *, size_t) = nullptr;
+void (*g_sys_free)(void *) = nullptr;
+
 struct System {
-    static void *alloc(size_t n) noexcept { return std::malloc(n); }
-    static void *zeroed(size_t n) noexcept { return std::calloc(1, n); }
-    static void *grow(void *p, size_t n) noexcept {
-        return std::realloc(p, n);
-    }
-    static void release(void *p) noexcept { std::free(p); }
-    static const char *name() noexcept { return "malloc"; }
+    static void *alloc(size_t n) noexcept { return g_sys_alloc(n); }
+    static void *zeroed(size_t n) noexcept { return g_sys_zeroed(1, n); }
+    static void *grow(void *p, size_t n) noexcept { return g_sys_grow(p, n); }
+    static void release(void *p) noexcept { g_sys_free(p); }
+    static const char *name() noexcept { return "system"; }
     static constexpr bool is_ours = false;
 };
 
@@ -293,6 +318,32 @@ template <class A> double grow(size_t size, int rounds) {
 //  Measuring, A-B-B-A.
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief How many times each row is measured.
+ *
+ * IT USED TO BE TWO -- one forwards, one backwards, averaged -- and two samples
+ * cannot tell a difference from a hiccup.  The sister benchmarks settled this
+ * long ago: repeats, summarised by the clean half, with the spread kept so a
+ * row that moved is not allowed to name a winner.  See `support/bench_stats.h`.
+ *
+ * Odd on purpose: the summaries index a median, and with an even count that is
+ * a coin flip between two samples.
+ */
+constexpr int kReps = 11;
+
+/**
+ * @brief What this machine cannot resolve, measured rather than assumed.
+ *
+ * Filled in by @c calibrate, which runs THIS allocator in every column so that
+ * the true ratio is 1.00x by construction: whatever comes out instead is the
+ * size of the lie the machine tells today, and every row has to beat it before
+ * it is allowed to name a winner.
+ */
+double g_floor = 0.02;
+
+/// Which pass of the machine is being measured, on a hybrid part.
+const char *g_pass = "";
+
 struct Row {
     double ns[kCols] = {};
     /* And what each one KEEPS.  Time alone does not settle any of these rows:
@@ -300,6 +351,13 @@ struct Row {
      * holds on to a block is faster next time for a reason that has a price.
      * These are the committed bytes this process gained across the run. */
     double mem[kCols] = {};
+    /// System over the best of ours, paired repeat by repeat -- NOT the
+    /// quotient of the two summaries.  See @c measure.
+    double ratio = 0.0;
+    /// How much that ratio moved between repeats, which is what decides whether
+    /// the row may declare anything.  The columns' own spread is deliberately
+    /// not kept: see @c row for why the two cannot be shown together.
+    double ratio_spread = 0.0;
 };
 
 /**
@@ -379,35 +437,88 @@ template <class F, class A> double call_one(const F &run) {
 template <class A> bool column_is_ours() { return A::is_ours; }
 template <class A> const char *column_name() { return A::name(); }
 
-/// @param run  Called as `run.template operator()<Alloc>()`, returns ns/op.
-template <class F, class... A> Row abba(const F &run, Columns<A...>) {
+/**
+ * @brief Measures every column @c kReps times and summarises them.
+ *
+ * FORWARDS AND THEN BACKWARDS, alternating by repeat, which is A-B-B-A
+ * generalised: each column lands as often near the start as near the end, so
+ * drift in the machine -- thermal, another process, the scheduler settling --
+ * does not land on the difference between them.
+ *
+ * THE RATIO IS PAIRED INSIDE THE LOOP, not divided afterwards.  If the machine
+ * slows down during one repeat, every column of that repeat slows down together
+ * and their quotient does not notice; the quotient of two summaries does,
+ * because each column absorbs the slowdown differently.  It is the difference
+ * between comparing two things and comparing two measurements of two things,
+ * and it shows up exactly on the rows that sit near the margin.
+ *
+ * @param run  Called as `run.template operator()<Alloc>()`, returns ns/op.
+ */
+template <class F, class... A> Row measure(const F &run, Columns<A...>) {
     using Fn = double (*)(const F &);
     static const Fn fns[] = {&call_one<F, A>...};
     static const bool ours[] = {A::is_ours...};
     constexpr int n = int(sizeof...(A));
 
     Row r;
-    /* FORWARDS AND THEN BACKWARDS, which is A-B-B-A generalised: each column
-     * lands as often near the start as near the end, so drift in the machine
-     * -- thermal, another process, the scheduler settling -- does not land on
-     * the difference between them. */
-    for (int i = 0; i < n; ++i) {
-        /* The memory each one keeps is read around its FIRST run only: by the
-         * second the heap has already grown and the difference would read as
-         * zero for everybody.  Ours is read with our own committed-bytes
-         * counter, which is exact and counts only us; the system one with what
-         * the process gained, which is the only instrument that sees it. */
-        const uint64_t before =
-            ours[i] ? committed_by_us() : committed_by_process();
-        r.ns[i] = fns[i](run);
-        const uint64_t after =
-            ours[i] ? committed_by_us() : committed_by_process();
-        /* Signed on purpose: a negative reading means that column gave memory
-         * back to the system, which is a real answer and not an error to
-         * hide. */
-        r.mem[i] = double(int64_t(after) - int64_t(before));
+    double s[kCols][kReps];
+    double ratios[kReps];
+
+    for (int rep = 0; rep < kReps; ++rep) {
+        for (int k = 0; k < n; ++k) {
+            const int i = (rep & 1) ? n - 1 - k : k;
+            /* The memory each one keeps is read around its FIRST run only: by
+             * the second the heap has already grown and the difference would
+             * read as zero for everybody.  Ours is read with our own
+             * committed-bytes counter, which is exact and counts only us; the
+             * system one with what the process gained, which is the only
+             * instrument that sees it. */
+            if (rep == 0) {
+                const uint64_t before =
+                    ours[i] ? committed_by_us() : committed_by_process();
+                s[i][rep] = fns[i](run);
+                const uint64_t after =
+                    ours[i] ? committed_by_us() : committed_by_process();
+                /* Signed on purpose: a negative reading means that column gave
+                 * memory back to the system, which is a real answer and not an
+                 * error to hide. */
+                r.mem[i] = double(int64_t(after) - int64_t(before));
+            } else {
+                s[i][rep] = fns[i](run);
+            }
+        }
     }
-    for (int i = n; i-- > 0;) r.ns[i] = (r.ns[i] + fns[i](run)) / 2.0;
+
+    /* SUMMARISE FIRST, then pick which column the ratio is against.  `summarize`
+     * sorts in place, so the samples are copied for the pairing below. */
+    double kept[kCols][kReps];
+    for (int i = 0; i < n; ++i)
+        for (int rep = 0; rep < kReps; ++rep) kept[i][rep] = s[i][rep];
+
+    for (int i = 0; i < n; ++i) {
+        double noise = 0.0; // measured by `summarize`, not reported; see `Row`
+        r.ns[i] = bench_stats::summarize(s[i], kReps, &noise);
+    }
+
+    /* AGAINST THE BEST OF OURS, chosen ONCE from the summaries rather than
+     * repeat by repeat.  The question is "what can be had from this library",
+     * not "which of its forms did we pick" -- but taking the minimum inside the
+     * loop answered a third question nobody asked: which of the three got lucky
+     * this time.  With the three columns within a quarter of each other, that
+     * minimum is a coin toss, and it dragged the ratio with it: 113% of spread
+     * on a row whose columns each moved a few per cent.  Picking the column
+     * first and pairing against THAT one keeps the pairing -- both numbers from
+     * the same repeat, so a slow patch of machine cancels -- without the jitter
+     * of a statistic that changes which sample it names. */
+    int best = 0;
+    for (int i = 1; i < n - 1; ++i)
+        if (r.ns[i] > 0.0 && (r.ns[best] <= 0.0 || r.ns[i] < r.ns[best]))
+            best = i;
+    for (int rep = 0; rep < kReps; ++rep)
+        ratios[rep] = kept[best][rep] > 0.0
+                          ? kept[n - 1][rep] / kept[best][rep]
+                          : 0.0;
+    r.ratio = bench_stats::summarize_ratio(ratios, kReps, &r.ratio_spread);
     return r;
 }
 
@@ -423,19 +534,45 @@ void row(const char *label, size_t size, const Row &r) {
     std::printf("  %-16s", name);
     for (int i = 0; i < kCols; ++i) std::printf(" %10.2f", r.ns[i]);
 
-    /* The ratio is against the BEST of ours, because the question is "what can
-     * be had from this library", not "which of its forms did we pick".  Every
-     * column stays on show so the cost of sharing is visible. */
-    double best = 0.0;
-    for (int i = 0; i < kCols - 1; ++i)
-        if (r.ns[i] > 0.0 && (best == 0.0 || r.ns[i] < best)) best = r.ns[i];
-    const double sys = r.ns[kCols - 1];
-    const double ratio = best > 0.0 ? sys / best : 0.0;
-    std::printf("  %6.2fx  ", ratio);
+    /* The ratio was measured, not divided here; see @c measure.  Every column
+     * stays on show so the cost of sharing is visible. */
+    std::printf("  %6.2fx", r.ratio);
+
+    /* AND WHETHER IT MAY BE BELIEVED.  A row has to beat the floor this machine
+     * was measured at, or its own spread if that is worse, before it is allowed
+     * to say who won.  Without this a 3% difference read as a result on a
+     * machine that cannot resolve 20%. */
+    const double margin =
+        r.ratio_spread > g_floor ? r.ratio_spread : g_floor;
+    const double d = r.ratio > 1.0 ? r.ratio - 1.0 : 1.0 - r.ratio;
+    const char *verdict;
+    const char *tint;
+    if (r.ratio <= 0.0) {
+        verdict = "-";
+        tint = report::dim();
+    } else if (d <= margin) {
+        verdict = "too close";
+        tint = report::amber();
+    } else if (r.ratio > 1.0) {
+        verdict = "ours";
+        tint = report::green();
+    } else {
+        verdict = "SYSTEM";
+        tint = report::red();
+    }
+    /* THE RATIO'S SPREAD AND NOT THE TIMES', and it is the one that answers the
+     * question the row is asking: whether the COMPARISON holds.  The columns'
+     * own spread was tried here as a second figure and taken out again --
+     * `summarize` measures how far the median sits from the minimum while
+     * `summarize_ratio` measures the gap between quartiles, so the two numbers
+     * are not on the same scale and printing them side by side invites exactly
+     * the comparison that cannot be made. */
+    std::printf(" %s%-9s%s %s%4.0f%%%s  ", tint, verdict, report::reset(),
+                report::dim(), r.ratio_spread * 100.0, report::reset());
 
     const double mib = 1024.0 * 1024.0;
     for (int i = 0; i < kCols; ++i) std::printf(" %7.2f", r.mem[i] / mib);
-    std::printf("  %s\n", ratio >= 1.0 ? "" : "<- system wins");
+    std::printf("\n");
 }
 
 void header(const char *title) {
@@ -444,14 +581,15 @@ void header(const char *title) {
     std::printf("\n%s\n", title);
     std::printf("  %-16s", "case");
     for (int i = 0; i < kCols; ++i) std::printf(" %10s", names[i]);
-    std::printf("  %8s   %s\n", "best/sys", "MiB committed by the run");
+    std::printf("  %7s %-9s %5s   %s\n", "sys/best", "verdict", "spread",
+                "MiB committed by the run");
     std::printf("  %-16s", "");
     for (int i = 0; i < kCols; ++i) std::printf(" %10s", "ns/op");
-    std::printf("  %8s  ", "");
+    std::printf("  %7s %-9s %5s  ", "", "", "");
     for (int i = 0; i < kCols; ++i) std::printf(" %7s", names[i]);
     std::printf("\n  ----------------");
     for (int i = 0; i < kCols; ++i) std::printf(" ----------");
-    std::printf("  --------  ");
+    std::printf("  ------- --------- -----  ");
     for (int i = 0; i < kCols; ++i) std::printf(" -------");
     std::printf("\n");
 }
@@ -569,6 +707,109 @@ int rounds_for(size_t size) {
     return 4000;
 }
 
+/**
+ * @brief The control: this allocator in EVERY column, where the answer is 1.00x.
+ *
+ * Same driver, same repeats, same summarising -- the only difference is that
+ * both sides of the comparison run the same code, so anything the ratio reports
+ * other than 1.00x came from the machine and not from the allocators.
+ */
+using ControlColumns = Columns<Ours, Ours, Ours, Ours>;
+
+/**
+ * @brief Measures the verdict margin for this pass.
+ *
+ * Several sizes, because the floor is not the same at all of them: on small
+ * blocks a round lasts a few nanoseconds and the clock weighs more.  The WORST
+ * is taken, which is the only safe choice -- with the average, the small rows
+ * would keep deciding above their means.
+ *
+ * Measured once per pass: a small core does not resolve what a big one does, so
+ * carrying the number over would describe the wrong machine.
+ */
+void calibrate() {
+    g_floor = 0.02;
+    double worst = 0.0;
+    for (size_t s : {size_t(16), size_t(256), size_t(4096)}) {
+        const Row c = measure(HotCase{s, rounds_for(s) / 4}, ControlColumns{});
+        if (c.ratio <= 0.0) continue;
+        const double d = c.ratio > 1.0 ? c.ratio - 1.0 : 1.0 - c.ratio;
+        if (d > worst) worst = d;
+    }
+    if (worst > g_floor) g_floor = worst;
+    std::printf("\n%sVerdict margin floor, measured with this allocator in "
+                "every column (so the\ntrue ratio is 1.00x): %s%.1f%%%s.  A row "
+                "has to beat that, or its own spread\nif it is worse, before it "
+                "names a winner.%s\n",
+                report::dim(), report::bold(), g_floor * 100.0, report::dim(),
+                report::reset());
+}
+
+/// Every table, once per pass.  Extracted so that a hybrid machine can measure
+/// them on each kind of core: there is no single "speed of this machine" to
+/// report on a part with two.
+void run_sections() {
+    header("allocate and free immediately (hot)");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        row("hot", s, measure(HotCase{s, rounds_for(s)}, AllColumns{}));
+    }
+
+    header("allocate a batch, free the batch (burst)");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        const int n = rounds_for(s) / 512 + 1;
+        row("burst", s, measure(BurstCase{s, n}, AllColumns{}));
+    }
+
+    header("live set with random replacement (churn)");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        /* EIGHT TIMES the steps of the other patterns, and it is not a whim.
+         * A step here is one free and one allocate, so at the counts the rest
+         * of this file uses a whole sample lasted under half a millisecond and
+         * the row moved 107% between repeats -- it could not hold still long
+         * enough to mean anything.  The live set is what makes this pattern
+         * different, and it is set up OUTSIDE the timed region, so the extra
+         * steps buy resolution without buying setup. */
+        row("churn", s,
+            measure(ChurnCase{s, rounds_for(s) * 8}, AllColumns{}));
+    }
+
+    header("zeroed (calloc), and the caller reads ALL of it");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        row("calloc", s, measure(ZeroedCase{s, rounds_for(s), 1}, AllColumns{}));
+    }
+    for (int i = 0; i < kBigZeroedCount; ++i) {
+        const size_t s = kBigZeroedSizes[i];
+        row("calloc", s, measure(ZeroedCase{s, rounds_for(s), 1}, AllColumns{}));
+    }
+
+    std::printf("\nThe other half of the answer, not a second opinion: whoever\n"
+                "defers the zeroing wins below and loses above.  A row where a\n"
+                "1 MiB request is barely read says more about the caller asking\n"
+                "for the wrong size than about the allocator.\n");
+    header("zeroed (calloc), and the caller reads a SIXTY-FOURTH");
+    for (int i = 0; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        row("calloc", s,
+            measure(ZeroedCase{s, rounds_for(s), 64}, AllColumns{}));
+    }
+    for (int i = 0; i < kBigZeroedCount; ++i) {
+        const size_t s = kBigZeroedSizes[i];
+        row("calloc", s,
+            measure(ZeroedCase{s, rounds_for(s), 64}, AllColumns{}));
+    }
+
+    header("grow from 64 bytes by doubling (realloc)");
+    for (int i = 2; i < kSizeCount; ++i) {
+        const size_t s = kSizes[i];
+        const int n = rounds_for(s) / 8 + 1;
+        row("grow to", s, measure(GrowCase{s, n}, AllColumns{}));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -579,69 +820,58 @@ int main() {
                     "linked in.\n");
         return 1;
     }
-    std::printf("Both are called directly, in this process, interleaved A-B-B-A\n"
-                "so that drift in the machine does not land on the difference.\n");
+    /* THE SYSTEM'S, REACHED THE ONLY WAY IT STILL CAN BE.  See `System`: in
+     * this process `malloc` is us, so the column has to come from a copy of the
+     * C runtime our patch never touched. */
+    const system_alloc::Api &sys = system_alloc::api();
+    if (!sys.ok()) {
+        std::printf("No system column: %s.  There is nothing to compare\n"
+                    "against, so this benchmark has no answer to give.\n",
+                    sys.why);
+        return 1;
+    }
+    g_sys_alloc = sys.alloc;
+    g_sys_zeroed = sys.zeroed;
+    g_sys_grow = sys.grow;
+    g_sys_free = sys.release;
+    std::printf("%ssystem column: %s%s\n", report::dim(), sys.how,
+                report::reset());
+    std::printf("Both are called directly, in this process, interleaved and\n"
+                "repeated, so that drift in the machine does not land on the\n"
+                "difference between them.\n");
 
     // Warm both up: the first allocation registers a thread and asks the OS
     // for memory.  Timing that would measure startup, not steady state.
     for (int i = 0; i < 20000; ++i) {
         util::host_free(util::host_alloc(64));
-        std::free(std::malloc(64));
+        g_sys_free(g_sys_alloc(64));
     }
 
-    header("allocate and free immediately (hot)");
-    for (int i = 0; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s);
-        row("hot", s, abba(HotCase{s, n}, AllColumns{}));
-    }
+    const std::vector<affinity::Pass> passes = affinity::passes();
+    if (affinity::topology().why[0] != 0)
+        std::printf("\n%sOnly one pass: %s.%s\n", report::amber(),
+                    affinity::topology().why, report::reset());
 
-    header("allocate a batch, free the batch (burst)");
-    for (int i = 0; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s) / 512 + 1;
-        row("burst", s, abba(BurstCase{s, n}, AllColumns{}));
+    for (const affinity::Pass &p : passes) {
+        const bool pinned = affinity::pin(p.cpus);
+        const char *seen = isa::current_core_kind();
+        g_pass = p.name;
+        std::printf("\n%s%s#### %s ####%s\n", report::bold(), report::cyan(),
+                    p.name, report::reset());
+        /* Checked, not assumed: a pin that fails silently would turn the passes
+         * into the same measurement repeated, and the report would say there is
+         * no difference between kinds of core. */
+        if (!p.cpus.empty() && !pinned)
+            std::printf("%scould not pin to those cores; this pass measures "
+                        "whatever the scheduler gave it%s\n",
+                        report::amber(), report::reset());
+        else if (seen[0] != '\0')
+            std::printf("%srunning on a %s%s\n", report::dim(), seen,
+                        report::reset());
+        calibrate();
+        run_sections();
     }
-
-    header("live set with random replacement (churn)");
-    for (int i = 0; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s);
-        row("churn", s, abba(ChurnCase{s, n}, AllColumns{}));
-    }
-
-    header("zeroed (calloc), and the caller reads ALL of it");
-    for (int i = 0; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s);
-        row("calloc", s, abba(ZeroedCase{s, n, 1}, AllColumns{}));
-    }
-    for (int i = 0; i < kBigZeroedCount; ++i) {
-        const size_t s = kBigZeroedSizes[i];
-        row("calloc", s, abba(ZeroedCase{s, rounds_for(s), 1}, AllColumns{}));
-    }
-
-    std::printf("\nThe other half of the answer, not a second opinion: whoever\n"
-                "defers the zeroing wins below and loses above.  A row where a\n"
-                "1 MiB request is barely read says more about the caller asking\n"
-                "for the wrong size than about the allocator.\n");
-    header("zeroed (calloc), and the caller reads a SIXTY-FOURTH");
-    for (int i = 0; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s);
-        row("calloc", s, abba(ZeroedCase{s, n, 64}, AllColumns{}));
-    }
-    for (int i = 0; i < kBigZeroedCount; ++i) {
-        const size_t s = kBigZeroedSizes[i];
-        row("calloc", s, abba(ZeroedCase{s, rounds_for(s), 64}, AllColumns{}));
-    }
-
-    header("grow from 64 bytes by doubling (realloc)");
-    for (int i = 2; i < kSizeCount; ++i) {
-        const size_t s = kSizes[i];
-        const int n = rounds_for(s) / 8 + 1;
-        row("grow to", s, abba(GrowCase{s, n}, AllColumns{}));
-    }
+    affinity::unpin();
 
     memory_per_class();
     memory_over_aligned();
@@ -676,7 +906,9 @@ int main() {
                 "  per-row figures fall to zero after the first case: the memory\n"
                 "  is already ours.  That is the price of the speed above.\n");
     std::printf("\nA ratio above 1.00 means this allocator is that many times\n"
-                "faster.  Anything marked \"system wins\" is a real result, not\n"
-                "noise to be explained away.\n");
+                "faster than the system's.  A row marked SYSTEM is a real\n"
+                "result, not noise to be explained away -- and one marked\n"
+                "\"too close\" is the honest answer for a difference this\n"
+                "machine cannot resolve today, not a missing one.\n");
     return 0;
 }
