@@ -1073,7 +1073,7 @@ static_assert(__is_trivially_constructible(SpanStack),
  *
  * WHAT IT COSTS is that a span sitting here is not being coalesced, so two
  * adjacent free spans can stay apart.  That is fragmentation traded for the
- * lock, and it is bounded: past `kSpanRecycleBytes` a freed span goes back to
+ * lock, and it is bounded: past @c span_recycle_ceiling a freed span goes back to
  * the shared pool, where it gets merged as before.
  */
 SpanStack g_span_recycle[kMaxSpanChunks + 1];
@@ -1082,16 +1082,45 @@ SpanStack g_span_recycle[kMaxSpanChunks + 1];
 std::atomic<size_t> g_recycle_bytes;
 
 /**
- * @brief The ceiling for the whole process, not per thread.
+ * @brief The floor of the ceiling, and the share of the program it grows to.
  *
- * Per thread it would scale with the thread count, which is the wrong shape for
- * a bound: an allocator that holds back more memory the more threads you start
- * has no ceiling at all.
+ * IT IS A CAP, NOT A RESERVATION, and that distinction is what makes a generous
+ * one safe: only spans the program actually freed can be parked, so a program
+ * that never frees a megabyte parks nothing however high this is set.  What it
+ * bounds is the WORST case.
+ *
+ * WHY A SHARE AND NOT A NUMBER.  A fixed ceiling is the same mistake as the two
+ * before it -- `kSpanCacheSlots = 2` justified with one consumer's histogram --
+ * wearing different clothes: 64 MiB is generous for a compiler and sixteen
+ * buffers for something working on images, and neither of them wrote it.
+ * Measured on the span-heavy profile, that one constant was worth 2.5x:
+ *
+ *     ceiling    ns/op/core   over the locked policy
+ *      64 MiB        1315.6                    1.7x
+ *     256 MiB         625.0                    3.7x
+ *    1024 MiB         528.8                    4.3x
+ *
+ * ...with committed memory flat and fragmentation unchanged.  So the ceiling
+ * follows the program: a share of what it has taken from the region, which is
+ * the cheapest honest measure of "how big is this program" -- one relaxed load
+ * of a counter that already exists, and only on the parking path.
  */
-#ifndef VESTA_ALLOC_SPAN_RECYCLE_BYTES
-#define VESTA_ALLOC_SPAN_RECYCLE_BYTES (size_t(64) << 20)
+#ifndef VESTA_ALLOC_SPAN_RECYCLE_MIN
+#define VESTA_ALLOC_SPAN_RECYCLE_MIN (size_t(64) << 20)
 #endif
-constexpr size_t kSpanRecycleBytes = VESTA_ALLOC_SPAN_RECYCLE_BYTES;
+#ifndef VESTA_ALLOC_SPAN_RECYCLE_SHIFT
+#define VESTA_ALLOC_SPAN_RECYCLE_SHIFT 2 // a quarter of what has been taken
+#endif
+constexpr size_t kSpanRecycleMin = VESTA_ALLOC_SPAN_RECYCLE_MIN;
+
+/// How much may be parked right now.  Grows with the program, never shrinks
+/// below the floor.
+inline size_t span_recycle_ceiling() noexcept {
+    const size_t taken =
+        g_chunk_next.load(std::memory_order_relaxed) * kChunkBytes;
+    const size_t share = taken >> VESTA_ALLOC_SPAN_RECYCLE_SHIFT;
+    return share > kSpanRecycleMin ? share : kSpanRecycleMin;
+}
 
 /// Takes a span of exactly @p chunks from the lock-free tier, or nullptr.
 inline ChunkHeader *recycle_take(uint32_t chunks) noexcept {
@@ -1116,9 +1145,10 @@ inline bool recycle_park(ChunkHeader *h) noexcept {
     const uint32_t chunks = h->cls;
     if (chunks > kMaxSpanChunks) return false;
     const size_t bytes = size_t(chunks) * kChunkBytes;
+    const size_t ceiling = span_recycle_ceiling();
     size_t held = g_recycle_bytes.load(std::memory_order_relaxed);
     for (;;) {
-        if (held + bytes > kSpanRecycleBytes) {
+        if (held + bytes > ceiling) {
 #if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_DEFERRED
             /* THE DIFFERENCE BETWEEN THE TWO POLICIES IS THIS BRANCH.  The
              * hybrid one gives up and lets this span go down the locked path,
@@ -1140,7 +1170,7 @@ inline bool recycle_park(ChunkHeader *h) noexcept {
                 g_sweeping.store(0, std::memory_order_release);
             }
             held = g_recycle_bytes.load(std::memory_order_relaxed);
-            if (held + bytes > kSpanRecycleBytes) return false;
+            if (held + bytes > ceiling) return false;
             continue;
 #else
             return false;
