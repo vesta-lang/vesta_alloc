@@ -119,6 +119,52 @@ muere junta. No recicla, que es justamente por lo que es rapida, y esta
 documentada como insegura de compartir entre hilos a proposito -- quien la usa
 garantiza la exclusividad en vez de pagar un cerrojo en cada reserva.
 
+### Lo que cuesta, medido
+
+Nanosegundos por operacion en un nucleo grande de Raptor Lake, contra el
+asignador al que esta libreria sustituye. `nuestro` es la mejor de las tres vias
+de entrada; las tablas completas, con las otras dos y lo que cada una
+comprometio, estan en [`bench/baseline/`](bench/baseline/).
+
+| | Windows, vs msvcrt | | Linux, vs glibc | |
+| :--- | ---: | ---: | ---: | ---: |
+| | **nuestro** | sistema | **nuestro** | sistema |
+| `malloc`+`free`, 64 B | **1,33** | 11,92 | **1,26** | 1,72 |
+| `malloc`+`free`, 4 KiB | **1,34** | 11,73 | **1,25** | 6,02 |
+| `malloc`+`free`, 1 MiB | **3,80** | 3527,90 | **2,19** | 6,42 |
+| rafaga de 512, 64 B | **1,46** | 17,56 | **1,40** | 3,23 |
+| revuelto, 1024 vivos, 64 B | **1,15** | 13,15 | **1,08** | 2,04 |
+| `realloc` 64 B -> 1 MiB | **23,77** | 8023,00 | **22,65** | 44,59 |
+| `calloc` 8 MiB, leido entero | **169532** | 921714 | 170670 | 170657 |
+| `calloc` 8 MiB, leido 1/64 | 82707 | **25149** | 85720 | 85742 |
+
+**Los dos sistemas se leen por separado, nunca promediados.** El rival no es el
+mismo: msvcrt tarda unos 12 ns en dar un bloque pequeno y el `tcache` de glibc
+tarda 1,7. Asi que el ~9x de Windows es sobre todo msvcrt siendo lento, mientras
+que el ~1,4x de Linux es la medida honesta de lo que este diseno aporta frente a
+un buen asignador. Nosotros vamos igual en los dos -- alrededor de 1,3 ns -- y
+ese es el numero a vigilar.
+
+**La ultima fila es una derrota de verdad y se deja puesta.** Un `calloc` grande
+que el llamante apenas lee gana aplazando: el sistema mapea paginas que el
+nucleo ya tiene a cero y solo paga las que se tocan, mientras que este asignador
+pone el cero por adelantado porque su region se compromete una vez y se
+reutiliza, asi que un bloque reciclado lleva los bytes del inquilino anterior.
+La fila de encima es la MISMA peticion con el llamante leyendola entera, donde
+pagar por adelantado gana 5,4x. Ningun umbral por TAMANO puede decidir entre las
+dos -- el tamano es identico; lo que cambia es lo que hace el llamante. Ver
+`doc/PLAN_RESERVAS.md`.
+
+Cada fila es la media de la mitad limpia de once repeticiones intercaladas, y el
+banco mide primero su propio suelo -- el mismo asignador en todas las columnas,
+donde la razon verdadera es 1,00x -- para que una fila que no le gane a ese
+suelo diga "too close" en vez de nombrar un ganador. Se reproduce con:
+
+```bash
+./vesta_alloc_bench_vs_malloc       # cara a cara, por llamada
+./vesta_alloc_bench_allocator       # lo mismo por patron, y con hilos
+```
+
 ## Etiquetas de proposito
 
 Una arena sirve una reserva mucho mas barata que un asignador general, pero

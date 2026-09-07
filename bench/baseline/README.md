@@ -31,6 +31,25 @@ those are not remotely the same rival -- a 1 MiB `calloc` costs it 16 us on
 Linux and 120 us on Windows.  A number without its system on the label is not a
 number.
 
+## The head to head, again and for real, 2026-09-07 23:19
+
+Two more `alloc_vs_malloc_*` files, and they are not a repeat of the ones above:
+those were taken while the benchmark was **comparing this allocator with
+itself**.  It called `std::malloc`, and since the interposition landed that
+symbol IS this allocator -- the linker renames the call -- so the column
+labelled `malloc` was our own fast path with a thunk in front of it.  It read
+1.98 ns where the real msvcrt reads 11.9.
+
+These come from the fixed benchmark, which reaches the system allocator through
+`support/system_alloc.h`: a private copy of the C runtime on Windows, `libc.so.6`
+by handle on ELF.  They also carry what the older pair could not -- a measured
+verdict floor, a spread per row, and `calloc` and `realloc` against the real
+thing.
+
+The older files are kept rather than deleted: they are the correct record of
+what the numbers looked like before, and knowing that a table was wrong is worth
+more than not having it.  Do not subtract one pair from the other.
+
 ## What was measured
 
 `bench_memcpy` and `bench_memset` on the same machine, once per toolchain:

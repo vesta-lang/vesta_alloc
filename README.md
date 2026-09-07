@@ -118,6 +118,50 @@ together. It does not recycle, which is exactly why it is fast, and it is
 documented as unsafe to share between threads on purpose — the caller
 guarantees exclusivity instead of paying for a lock on every allocation.
 
+### What it costs, measured
+
+Nanoseconds per operation on one Raptor Lake P-core, against the allocator this
+library replaced. `ours` is the best of the three ways in; the full tables,
+including the other two and what each committed, are in
+[`bench/baseline/`](bench/baseline/).
+
+| | Windows, vs msvcrt | | Linux, vs glibc | |
+| :--- | ---: | ---: | ---: | ---: |
+| | **ours** | system | **ours** | system |
+| `malloc`+`free`, 64 B | **1.33** | 11.92 | **1.26** | 1.72 |
+| `malloc`+`free`, 4 KiB | **1.34** | 11.73 | **1.25** | 6.02 |
+| `malloc`+`free`, 1 MiB | **3.80** | 3527.90 | **2.19** | 6.42 |
+| burst of 512, 64 B | **1.46** | 17.56 | **1.40** | 3.23 |
+| churn, 1024 live, 64 B | **1.15** | 13.15 | **1.08** | 2.04 |
+| `realloc` 64 B → 1 MiB | **23.77** | 8023.00 | **22.65** | 44.59 |
+| `calloc` 8 MiB, read whole | **169532** | 921714 | 170670 | 170657 |
+| `calloc` 8 MiB, read 1/64 | 82707 | **25149** | 85720 | 85742 |
+
+**Read the two systems apart, never averaged.** The rival is not the same one:
+msvcrt takes about 12 ns to hand back a small block and glibc's `tcache` takes
+1.7. So the ~9x on Windows is mostly msvcrt being slow, while the ~1.4x on Linux
+is the honest measure of what this design buys over a good allocator. We are the
+same speed on both — around 1.3 ns — and that is the number to watch.
+
+**The last row is a real loss and is left in.** A large `calloc` whose caller
+barely reads it wins by deferring: the system maps pages the kernel already
+holds zeroed and pays only for the ones touched, while this allocator zeroes up
+front because its region is committed once and reused, so a recycled block
+carries the previous tenant's bytes. The row above is the same request with the
+caller reading all of it, where paying up front wins 5.4x. No threshold on
+*size* can choose between them — the size is identical; only the caller's
+behaviour differs. See `doc/PLAN_RESERVAS.md`.
+
+Every row is the mean of the clean half of eleven interleaved repeats, and the
+benchmark measures its own floor first — the same allocator in every column,
+where the true ratio is 1.00x — so a row that cannot beat that floor says "too
+close" instead of naming a winner. Reproduce with:
+
+```bash
+./vesta_alloc_bench_vs_malloc       # head to head, per call
+./vesta_alloc_bench_allocator       # the same, per pattern, plus threads
+```
+
 ## Purpose tags
 
 An arena serves an allocation far more cheaply than a general allocator, but
