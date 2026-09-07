@@ -921,13 +921,403 @@ inline bool is_free_span(const ChunkHeader *h) noexcept {
  * cogido.  Atomicos aqui serian pagar otra vez por una exclusion que ya existe.
  */
 constexpr size_t kMaxChunksTotal = size_t(256) << 14; ///< 256 GiB / 64 KiB
-uint64_t g_free_span_map[kMaxChunksTotal / 64];       ///< 512 KiB de `.bss`
+
+/* ATOMIC ONLY WHERE IT HAS TO BE.  Under the policies that keep a lock, every
+ * touch of this map already happens with that lock held, and making the words
+ * atomic would be paying a second time for an exclusion that exists -- which is
+ * what the note above said, and it was right for those.
+ *
+ * The lock-free policy is the exception, and not for the usual reason: there
+ * the bit is not just a note about the map, it IS the claim.  Absorbing a
+ * neighbour means clearing its bit, and whoever clears it owns the span; two
+ * threads reaching for the same neighbour have to have exactly one winner.  A
+ * read-modify-write on a plain word cannot promise that, and the failure would
+ * be the worst kind -- the same memory handed to two callers. */
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+using FreeMapWord = std::atomic<uint64_t>;
+#else
+using FreeMapWord = uint64_t;
+#endif
+FreeMapWord g_free_span_map[kMaxChunksTotal / 64]; ///< 512 KiB de `.bss`
+
+// -------------------------------------------------------------------------
+//  Span links, kept OUTSIDE the spans
+// -------------------------------------------------------------------------
+//
+//  WHY THEY CANNOT LIVE INSIDE.  A free span used to carry its own `prev`/`next`
+//  right behind its header, which works as long as one lock covers everything.
+//  Without that lock it stops working, and not because of tearing -- because of
+//  REPURPOSING: the moment a span is absorbed by its left neighbour, the bytes
+//  that held its links become interior payload of the merged span, and the next
+//  caller to receive it writes over them.  Another thread walking the list is
+//  then reading whatever a user wrote.  No atomic fixes that; the memory is
+//  simply not the list's any more.
+//
+//  With the link in a side array indexed by CHUNK NUMBER, the slot belongs to
+//  the allocator for the life of the process.  Reading it is always safe, even
+//  for a span that has since been absorbed, handed out and written over -- the
+//  reader gets a stale index, notices, and moves on.  That is what makes the
+//  atomic versions possible at all.
+//
+//  A 32-bit chunk index and not a pointer, on purpose: it halves the array and
+//  leaves room for a tag in the same 64-bit word as the head, which is what
+//  keeps the pop free of the ABA problem without a double-width compare.
+//
+//  16 MiB of `.bss`, and `.bss` is handed over a page at a time: a program that
+//  only ever touches a gigabyte of spans pays for 16 thousand entries, not for
+//  four million.
+
+/* Everything here stores a chunk number PLUS ONE, so that zero means "none".
+ * Chunk zero is a real chunk, so it cannot be the empty marker -- and the
+ * marker has to be zero, because these live in `.bss` and the loader zeroes
+ * them before a single instruction of the program runs.  Giving them an
+ * initialiser instead would make the arrays non-trivially-constructible and
+ * push them into DYNAMIC initialisation, which runs among the global
+ * constructors, by which time the allocator is already serving.  That exact
+ * mistake has already been made once in this file; see the guard next to
+ * `ThreadCache`. */
+std::atomic<uint32_t> g_span_next[kMaxChunksTotal];
 
 /// Que numero de trozo de la region es @p addr.  Fuera de la region sale un
-/// numero enorme, que los tres de abajo descartan por rango.
+/// numero enorme, que quien lo use descarta por rango.
 inline size_t chunk_index_of(uintptr_t addr) noexcept {
     return (addr - g_region_base.load(std::memory_order_relaxed)) / kChunkBytes;
 }
+
+/// Where chunk number @p i starts.  The inverse of @c chunk_index_of.
+inline ChunkHeader *chunk_at(uint32_t i) noexcept {
+    return reinterpret_cast<ChunkHeader *>(
+        g_region_base.load(std::memory_order_relaxed) +
+        uintptr_t(i) * kChunkBytes);
+}
+
+/**
+ * @brief A stack of spans that costs no lock, one per chunk count.
+ *
+ * The head carries a TAG in its upper half, and that is what makes the pop
+ * safe.  Without it the classic hole opens: a reader takes the head, is
+ * descheduled, and by the time it returns the same span has been popped, used,
+ * freed and pushed again -- the head looks untouched, the compare-exchange
+ * succeeds, and the stack is left pointing at whatever came after the span the
+ * FIRST time.  Bumping a counter on every push and pop means "the same head"
+ * can no longer be confused with "the head has not moved", and the exchange
+ * fails as it should.
+ *
+ * Thirty-two bits of tag: to fool it, four thousand million pushes would have
+ * to land inside one reader's window.
+ *
+ * @par Threads
+ * **Safe from any thread**, with no lock.  What it does NOT protect is the
+ * span's contents: a span in here must not be absorbed by anybody, and that is
+ * an invariant of the caller, not of this stack.
+ */
+struct SpanStack {
+    /* No initialiser, on purpose: see the note above `g_span_next`.  Zero is
+     * the empty stack, and the loader provides it. */
+    std::atomic<uint64_t> head;
+
+    /// Low half: chunk number plus one, zero meaning none.  High half: the tag.
+    static uint64_t pack(uint32_t idx1, uint32_t tag) noexcept {
+        return (uint64_t(tag) << 32) | idx1;
+    }
+    static uint32_t index1_of(uint64_t v) noexcept { return uint32_t(v); }
+    static uint32_t tag_of(uint64_t v) noexcept { return uint32_t(v >> 32); }
+
+    void push(ChunkHeader *h) noexcept {
+        const uint32_t idx1 =
+            uint32_t(chunk_index_of(reinterpret_cast<uintptr_t>(h))) + 1u;
+        uint64_t old = head.load(std::memory_order_relaxed);
+        for (;;) {
+            g_span_next[idx1 - 1u].store(index1_of(old),
+                                         std::memory_order_relaxed);
+            const uint64_t want = pack(idx1, tag_of(old) + 1u);
+            if (head.compare_exchange_weak(old, want, std::memory_order_release,
+                                           std::memory_order_relaxed))
+                return;
+        }
+    }
+
+    ChunkHeader *pop() noexcept {
+        uint64_t old = head.load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t idx1 = index1_of(old);
+            if (idx1 == 0) return nullptr;
+            /* Reading the link of a span somebody else may already have taken
+             * is fine: the slot is ours for the life of the process, so the
+             * worst case is a stale value -- and then the tag has moved and the
+             * exchange below refuses it. */
+            const uint32_t next =
+                g_span_next[idx1 - 1u].load(std::memory_order_relaxed);
+            const uint64_t want = pack(next, tag_of(old) + 1u);
+            if (head.compare_exchange_weak(old, want, std::memory_order_acq_rel,
+                                           std::memory_order_acquire))
+                return chunk_at(idx1 - 1u);
+        }
+    }
+};
+
+static_assert(__is_trivially_constructible(SpanStack),
+              "SpanStack must be constructible without running code: an array "
+              "of these has to live in .bss, or it is initialised AFTER the "
+              "allocator is already serving.  This has been broken once.");
+
+#if VESTA_SPAN_HAS_PARKING
+/**
+ * @brief Spans waiting to be handed out again, reached without any lock.
+ *
+ * WHAT MAKES IT SAFE is what it does NOT do: a span in here is not marked free
+ * and is in no free list, so no coalescer can find it, and nothing will absorb
+ * it while somebody is walking the stack.  It is the same invariant the
+ * per-thread span cache already relies on, moved up to something every thread
+ * can reach.
+ *
+ * WHAT IT COSTS is that a span sitting here is not being coalesced, so two
+ * adjacent free spans can stay apart.  That is fragmentation traded for the
+ * lock, and it is bounded: past `kSpanRecycleBytes` a freed span goes back to
+ * the shared pool, where it gets merged as before.
+ */
+SpanStack g_span_recycle[kMaxSpanChunks + 1];
+
+/// Bytes currently parked in @c g_span_recycle.
+std::atomic<size_t> g_recycle_bytes;
+
+/**
+ * @brief The ceiling for the whole process, not per thread.
+ *
+ * Per thread it would scale with the thread count, which is the wrong shape for
+ * a bound: an allocator that holds back more memory the more threads you start
+ * has no ceiling at all.
+ */
+#ifndef VESTA_ALLOC_SPAN_RECYCLE_BYTES
+#define VESTA_ALLOC_SPAN_RECYCLE_BYTES (size_t(64) << 20)
+#endif
+constexpr size_t kSpanRecycleBytes = VESTA_ALLOC_SPAN_RECYCLE_BYTES;
+
+/// Takes a span of exactly @p chunks from the lock-free tier, or nullptr.
+inline ChunkHeader *recycle_take(uint32_t chunks) noexcept {
+    if (chunks > kMaxSpanChunks) return nullptr;
+    ChunkHeader *h = g_span_recycle[chunks].pop();
+    if (h != nullptr)
+        g_recycle_bytes.fetch_sub(size_t(chunks) * kChunkBytes,
+                                  std::memory_order_relaxed);
+    return h;
+}
+
+/// Set while a deferred sweep is running, so only one thread does it.
+std::atomic<uint32_t> g_sweeping;
+
+/// Puts everything parked back into the pool and merges it.  Defined further
+/// down, next to the pool; declared here because the deferred policy calls it.
+size_t span_sweep() noexcept;
+
+/// Parks a span in the lock-free tier.  False when the caller has to take the
+/// slow path instead, where the span gets coalesced.
+inline bool recycle_park(ChunkHeader *h) noexcept {
+    const uint32_t chunks = h->cls;
+    if (chunks > kMaxSpanChunks) return false;
+    const size_t bytes = size_t(chunks) * kChunkBytes;
+    size_t held = g_recycle_bytes.load(std::memory_order_relaxed);
+    for (;;) {
+        if (held + bytes > kSpanRecycleBytes) {
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_DEFERRED
+            /* THE DIFFERENCE BETWEEN THE TWO POLICIES IS THIS BRANCH.  The
+             * hybrid one gives up and lets this span go down the locked path,
+             * so coalescing happens continuously, a span at a time, and the
+             * lock is taken for each of them.  The deferred one instead pays
+             * for it ALL AT ONCE, here, when the ceiling is hit: one sweep
+             * merges everything and the parking is empty again.
+             *
+             * Same total work, spread differently: rare and lumpy instead of
+             * constant and small.  Which one wins depends on whether the
+             * program can afford the lump, and that is what the benchmark is
+             * for -- guessing would be picking a shape and calling it a
+             * result.  Only one thread sweeps; the rest carry on. */
+            uint32_t idle = 0;
+            if (g_sweeping.compare_exchange_strong(idle, 1u,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed)) {
+                span_sweep();
+                g_sweeping.store(0, std::memory_order_release);
+            }
+            held = g_recycle_bytes.load(std::memory_order_relaxed);
+            if (held + bytes > kSpanRecycleBytes) return false;
+            continue;
+#else
+            return false;
+#endif
+        }
+        if (g_recycle_bytes.compare_exchange_weak(held, held + bytes,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed))
+            break;
+    }
+    h->extra = 0; // not free-marked: nobody may absorb it while it waits here
+    g_span_recycle[chunks].push(h);
+    return true;
+}
+#endif
+
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+inline void mark_free_span(const ChunkHeader *h) noexcept {
+    const size_t i = chunk_index_of(reinterpret_cast<uintptr_t>(h));
+    if (i < kMaxChunksTotal)
+        g_free_span_map[i >> 6].fetch_or(uint64_t(1) << (i & 63),
+                                         std::memory_order_release);
+}
+inline void clear_free_span(const ChunkHeader *h) noexcept {
+    const size_t i = chunk_index_of(reinterpret_cast<uintptr_t>(h));
+    if (i < kMaxChunksTotal)
+        g_free_span_map[i >> 6].fetch_and(~(uint64_t(1) << (i & 63)),
+                                          std::memory_order_acq_rel);
+}
+inline bool is_marked_free(uintptr_t addr) noexcept {
+    const size_t i = chunk_index_of(addr);
+    if (i >= kMaxChunksTotal) return false;
+    return ((g_free_span_map[i >> 6].load(std::memory_order_acquire) >>
+             (i & 63)) &
+            1u) != 0;
+}
+
+/**
+ * @brief Takes the span at @p addr for the caller, or says somebody else did.
+ *
+ * THE BIT IS THE CLAIM.  There is no separate state word and no lock: the same
+ * bit that says "a free span starts here" is what is competed for, and clearing
+ * it is what winning means.  Exactly one thread can see it go from set to
+ * clear, so exactly one owns the span -- which is the whole safety argument of
+ * the lock-free policy.
+ *
+ * Losing is NORMAL and costs nothing: it means a neighbour got there first, and
+ * the caller simply does not coalesce this time.  That is the property that
+ * makes all of this possible -- coalescing is allowed to be skipped.
+ *
+ * @return true if this thread now owns it.
+ */
+inline bool claim_free_span(uintptr_t addr) noexcept {
+    const size_t i = chunk_index_of(addr);
+    if (i >= kMaxChunksTotal) return false;
+    const uint64_t bit = uint64_t(1) << (i & 63);
+    const uint64_t was =
+        g_free_span_map[i >> 6].fetch_and(~bit, std::memory_order_acq_rel);
+    return (was & bit) != 0;
+}
+
+/**
+ * @brief The shared pool itself, with no lock anywhere.
+ *
+ * One stack per chunk count, and a span in it is ALSO marked free -- unlike the
+ * parking the other policies use, which hides its spans from coalescing on
+ * purpose.  Here they stay visible, because here coalescing is allowed to reach
+ * them: it claims the bit, and whoever loses the claim simply does not merge.
+ *
+ * WHAT A POP HAS TO DO, and why it is two steps.  Coming off the stack is not
+ * enough to own a span: a coalescer may have absorbed it a moment ago, and its
+ * entry is then a leftover pointing at memory that now belongs to the
+ * neighbour.  So the popper claims it too, and a failed claim means exactly
+ * that -- drop it and take the next.  Those leftovers are cleaned up by the
+ * very pops that trip over them, and none of them holds any memory: the memory
+ * went to whoever did the absorbing.
+ */
+SpanStack g_span_pool[kMaxSpanChunks + 1];
+
+/**
+ * @brief Puts @p h into the pool: marked free FIRST, then pushed.
+ *
+ * The order is not arbitrary.  Pushed first, a popper could take it in the
+ * window before the mark, fail its claim, and drop a span that was nobody's
+ * leftover -- losing it for good.  Marked first, the worst case is a neighbour
+ * absorbing it before the push, and then the push leaves a leftover, which is
+ * the case the pop already knows how to handle.
+ */
+inline void pool_push(ChunkHeader *h) noexcept {
+    h->extra = kSpanFree;
+    mark_free_span(h);
+    g_span_pool[h->cls].push(h);
+}
+
+/// Takes a span of exactly @p k chunks out of the pool, or nullptr.
+inline ChunkHeader *pool_pop_exact(uint32_t k) noexcept {
+    for (;;) {
+        ChunkHeader *h = g_span_pool[k].pop();
+        if (h == nullptr) return nullptr;
+        if (claim_free_span(reinterpret_cast<uintptr_t>(h))) {
+            h->extra = 0;
+            return h;
+        }
+        // A leftover: somebody absorbed it.  Drop it and take the next.
+    }
+}
+
+/**
+ * @brief A span of at least @p want chunks, splitting a bigger one if needed.
+ *
+ * Splitting needs nothing from anybody: the claim already made this span the
+ * caller's alone, and the remainder has never been in a list, so putting it
+ * back is a plain push.
+ */
+ChunkHeader *pool_take_lockfree(uint32_t want) noexcept {
+    for (uint32_t k = want; k <= kMaxSpanChunks; ++k) {
+        ChunkHeader *h = pool_pop_exact(k);
+        if (h == nullptr) continue;
+        if (k > want) {
+            ChunkHeader *r = reinterpret_cast<ChunkHeader *>(
+                reinterpret_cast<char *>(h) + size_t(want) * kChunkBytes);
+            r->magic = kSpanMagic;
+            r->cls = k - want;
+            r->owner = h->owner;
+            h->cls = want;
+            pool_push(r);
+        }
+        return h;
+    }
+    return nullptr;
+}
+
+/**
+ * @brief Returns @p h to the pool, absorbing free neighbours on the way.
+ *
+ * CLAIM BEFORE READING, and this is the ordering that matters most here.  The
+ * obvious shape -- look at the neighbour's size, decide, then take it -- reads
+ * a header that another thread may be absorbing at that instant, and once
+ * absorbed those bytes are the neighbour's payload and hold whatever a caller
+ * wrote.  So the bit is taken FIRST; only then is the header ours to read, and
+ * if the size turns out not to fit, the span is simply handed back.
+ *
+ * @param h           the span, owned by the caller and in no list.
+ * @param drop_addr   set to the pages to hand back, or left alone.
+ * @param drop_bytes  how many; zero means nothing to give back.
+ */
+void pool_return_lockfree(ChunkHeader *h, uintptr_t *drop_addr,
+                          size_t *drop_bytes) noexcept {
+    h->extra = 0;
+    for (;;) {
+        const uintptr_t next =
+            reinterpret_cast<uintptr_t>(h) + size_t(h->cls) * kChunkBytes;
+        if (!is_marked_free(next)) break;
+        if (!claim_free_span(next)) break; // somebody else got there first
+        ChunkHeader *r = reinterpret_cast<ChunkHeader *>(next);
+        if (size_t(h->cls) + r->cls > kMaxSpanChunks) {
+            pool_push(r); // too big together: give it straight back
+            break;
+        }
+        h->cls += r->cls;
+        r->magic = 0; // it is interior memory now, not a header
+    }
+
+    if (h->cls > kMaxSpanChunks) {
+        const size_t bytes = size_t(h->cls) * kChunkBytes;
+        const size_t page = os_page_size();
+        if (bytes > page) {
+            *drop_addr = reinterpret_cast<uintptr_t>(h) + page;
+            *drop_bytes = bytes - page;
+        }
+        h->magic = 0;
+        g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    pool_push(h);
+}
+#else
 inline void mark_free_span(const ChunkHeader *h) noexcept {
     const size_t i = chunk_index_of(reinterpret_cast<uintptr_t>(h));
     if (i < kMaxChunksTotal) g_free_span_map[i >> 6] |= uint64_t(1) << (i & 63);
@@ -942,6 +1332,7 @@ inline bool is_marked_free(uintptr_t addr) noexcept {
     if (i >= kMaxChunksTotal) return false;
     return ((g_free_span_map[i >> 6] >> (i & 63)) & 1u) != 0;
 }
+#endif
 
 void list_insert(ChunkHeader *h) noexcept {
     const uint32_t k = h->cls;
@@ -1064,6 +1455,35 @@ struct PendingCommit {
 bool try_extend_span(ChunkHeader *h, uint32_t want,
                      PendingCommit *pend) noexcept {
     // 1. Tragarse vecinos libres mientras no baste.
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+    /* THE SAME CLAIM AS EVERYWHERE ELSE, and it has to be: growing in place is
+     * absorbing a neighbour, which is the one operation that reaches out.  Get
+     * the bit first, read the header afterwards -- the other way round reads a
+     * span that may already be somebody's payload.  Losing the claim just means
+     * the buffer gets copied instead of grown, which is correct. */
+    while (h->cls < want) {
+        const uintptr_t next =
+            reinterpret_cast<uintptr_t>(h) + size_t(h->cls) * kChunkBytes;
+        if (!is_marked_free(next)) break;
+        if (!claim_free_span(next)) break;
+        ChunkHeader *r = reinterpret_cast<ChunkHeader *>(next);
+        h->cls += r->cls;
+        r->magic = 0;
+    }
+    if (h->cls >= want) {
+        // Puede haber sobrado: lo que sobre vuelve al fondo.
+        if (h->cls > want) {
+            ChunkHeader *r = reinterpret_cast<ChunkHeader *>(
+                reinterpret_cast<char *>(h) + size_t(want) * kChunkBytes);
+            r->magic = kSpanMagic;
+            r->cls = h->cls - want;
+            r->owner = h->owner;
+            h->cls = want;
+            pool_push(r);
+        }
+        return true;
+    }
+#else
     while (h->cls < want) {
         ChunkHeader *r = right_neighbour(h);
         if (r == nullptr || !is_free_span(r)) break;
@@ -1076,6 +1496,7 @@ bool try_extend_span(ChunkHeader *h, uint32_t want,
         split_span(h, want);
         return true;
     }
+#endif
 
     // 2. Si estamos al final de lo repartido, se toma mas region.
     const uintptr_t addr = reinterpret_cast<uintptr_t>(h);
@@ -1161,7 +1582,11 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     if (c != nullptr && chunks <= kSpanCacheSlots &&
         c->span_cache[chunks - 1] != nullptr) {
         ChunkHeader *h = c->span_cache[chunks - 1];
-        c->span_cache[chunks - 1] = nullptr;
+        /* The next one of the same size, if the thread was holding more than
+         * one.  The link is in the span's own node area; see `span_cache`. */
+        c->span_cache[chunks - 1] =
+            reinterpret_cast<ChunkHeader *>(node_of(h)->next);
+        c->span_cache_bytes -= bytes;
         h->magic = kSpanMagic;
         h->cls = chunks;
         h->owner = c->id;
@@ -1173,12 +1598,31 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     }
 
     bool needs_commit = false;
+#if VESTA_SPAN_HAS_PARKING
+    /* The lock-free tier, before anything that synchronises.  An exact-size hit
+     * here is the whole point of the non-locked policies: it is the case that
+     * used to take the lock on every single large allocation. */
+    if (ChunkHeader *r = recycle_take(chunks)) {
+        r->magic = kSpanMagic;
+        r->cls = chunks;
+        r->owner = c != nullptr ? c->id : 0;
+        r->extra = 0;
+        if (c != nullptr) c->stats.large_allocs++;
+        // Recycled: its memory is already committed and does NOT come zeroed.
+        return reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(r) +
+                                        sizeof(ChunkHeader));
+    }
+#endif
     if (chunks <= kMaxSpanChunks) {
-        SpanLock lk;
         /* Del tamano exacto si lo hay, y si no de uno mayor PARTIENDOLO.  Sin
          * esto, un tramo grande libre no puede servir una peticion pequena y
          * hay que ir a por region nueva; ver la nota de `g_span_free`. */
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+        ChunkHeader *h = pool_take_lockfree(chunks);
+#else
+        SpanLock lk;
         ChunkHeader *h = take_from_free_lists(chunks);
+#endif
         if (h != nullptr) {
             addr = reinterpret_cast<uintptr_t>(h);
             reused = true;
@@ -1210,6 +1654,114 @@ void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
 }
 
 /**
+ * @brief Puts a span back into the shared pool, coalescing it.
+ *
+ * Split out because two callers need exactly this: an ordinary free, and
+ * @c host_span_trim draining what the lock-free tier was holding.  What it
+ * must NOT do is talk to the operating system: pages to hand back are reported
+ * through @p drop_addr / @p drop_bytes and released by the caller once the lock
+ * is gone.  Doing it here would stop every other thread for a whole system
+ * call, which is where nearly all of this path's cost used to come from --
+ * measured, 267 ms against 1,534 with 48 threads.
+ *
+ * @param h           the span, already out of every list and cache.
+ * @param drop_addr   set to the pages to hand back, or left alone.
+ * @param drop_bytes  how many; zero means nothing to give back.
+ *
+ * @par Threads
+ * **Requires the span lock.**
+ */
+void pool_return_locked(ChunkHeader *h, uintptr_t *drop_addr,
+                        size_t *drop_bytes) noexcept {
+    h->extra = 0;
+    coalesce_right(h);
+
+    if (h->cls > kMaxSpanChunks) {
+        /* Demasiado grande para guardarlo.  Sus paginas SI vuelven al
+         * sistema -- quedarse con el rango y ademas con la memoria seria
+         * regalar las dos cosas --, y se cuenta, para que no sea mudo si
+         * deja de ser raro. */
+        const size_t bytes = size_t(h->cls) * kChunkBytes;
+        const size_t page = os_page_size();
+        if (bytes > page) {
+            *drop_addr = reinterpret_cast<uintptr_t>(h) + page;
+            *drop_bytes = bytes - page;
+        }
+        h->magic = 0; // deja de ser una cabecera: ya no es de nadie
+        g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        list_insert(h);
+    }
+}
+
+/**
+ * @brief Puts everything parked back into the pool and merges it.
+ *
+ * TWO PHASES, AND THE ORDER IS THE WHOLE POINT.  Coalescing only ever looks
+ * RIGHT, so returning spans one at a time merges nothing: the left one arrives
+ * while its right neighbour is still parked -- invisible, because parked spans
+ * are deliberately not marked free -- and by the time the right one arrives
+ * there is nothing to its right.  Two adjacent spans would go back to the pool
+ * as two, which is precisely what this exists to undo.  So: put them ALL back
+ * first, then merge.
+ *
+ * @return Bytes moved back into the pool.
+ */
+size_t span_sweep() noexcept {
+#if !VESTA_SPAN_HAS_PARKING
+    /* Nothing is ever parked here: with the lock, every free already goes
+     * straight to the pool; without it, reaching the pool costs nothing to
+     * begin with, so there is no reason to keep spans anywhere else. */
+    return 0;
+#else
+    size_t moved = 0;
+
+    // Phase 1: everything out of the parking and into the pool, unmerged.
+    for (uint32_t k = 1; k <= kMaxSpanChunks; ++k) {
+        for (;;) {
+            ChunkHeader *h = g_span_recycle[k].pop();
+            if (h == nullptr) break;
+            const size_t bytes = size_t(k) * kChunkBytes;
+            g_recycle_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+            moved += bytes;
+            SpanLock lk;
+            h->extra = 0;
+            list_insert(h);
+        }
+    }
+
+    /* Phase 2: merge until nothing more merges.  Restarting after each merge is
+     * blunt, and correct: the merged span changes size, so it moves to another
+     * list and the walk it was on no longer means anything.  This is a
+     * between-phases call, not a hot path -- see `host_span_trim`. */
+    for (bool merged = true; merged;) {
+        merged = false;
+        for (uint32_t k = 1; k <= kMaxSpanChunks && !merged; ++k) {
+            SpanLock lk;
+            for (SpanNode *n = g_span_free[k]; n != nullptr;) {
+                ChunkHeader *h = header_of(n);
+                const uint32_t before = h->cls;
+                coalesce_right(h);
+                if (h->cls != before) {
+                    /* It grew, so it is in the wrong list now: take it out and
+                     * put it back where its new size belongs. */
+                    const uint32_t grown = h->cls;
+                    h->cls = before;
+                    list_remove(h);
+                    h->cls = grown;
+                    list_insert(h);
+                    merged = true;
+                    break;
+                }
+                n = node_of(h)->next;
+            }
+        }
+    }
+    return moved;
+#endif
+}
+
+/**
  * @brief Devuelve un tramo.  @p h es su cabecera, la del primer trozo.
  *
  * @par Hilos
@@ -1226,11 +1778,21 @@ void free_span(ChunkHeader *h) noexcept {
      * Se guarda SIN marca de libre: no esta en ninguna lista, asi que nadie mas
      * lo puede absorber ni entregar, y por eso tampoco hace falta el cerrojo
      * para dejarlo aqui. */
-    if (c != nullptr && h->cls <= kSpanCacheSlots &&
-        c->span_cache[h->cls - 1] == nullptr) {
-        h->extra = 0;
-        c->span_cache[h->cls - 1] = h;
-        return;
+    if (c != nullptr && h->cls <= kSpanCacheSlots) {
+        const size_t bytes = size_t(h->cls) * kChunkBytes;
+        /* THE BUDGET IS IN BYTES, not in slots, so the promise -- "this thread
+         * will not sit on more than this much" -- means the same whatever sizes
+         * the consumer asks for.  It also gets the trade right on its own: a
+         * multi-megabyte span fills it alone and goes back to the shared pool,
+         * where somebody else can use it, while small ones pile up cheaply. */
+        if (c->span_cache_bytes + bytes <= kSpanCacheBytes) {
+            h->extra = 0;
+            node_of(h)->next =
+                reinterpret_cast<SpanNode *>(c->span_cache[h->cls - 1]);
+            c->span_cache[h->cls - 1] = h;
+            c->span_cache_bytes += bytes;
+            return;
+        }
     }
 
     /* Lo que haya que devolverle al sistema se APUNTA aqui y se hace despues,
@@ -1240,10 +1802,19 @@ void free_span(ChunkHeader *h) noexcept {
      * Hacerlo dentro paraba a TODOS los demas durante una llamada al sistema
      * entera, y con tramos de decenas de MiB eso no es un detalle: medido, es
      * la diferencia entre 267 ms y 1.534 con 48 hilos. */
+#if VESTA_SPAN_HAS_PARKING
+    /* Park it where anybody can pick it up, without a lock.  It is not
+     * coalesced while it waits, which is the trade; past the ceiling this
+     * returns false and the span goes down the path below, where it is. */
+    if (recycle_park(h)) return;
+#endif
+
     uintptr_t drop_addr = 0;
     size_t drop_bytes = 0;
     {
+#if VESTA_ALLOC_SPAN_POLICY != VESTA_SPAN_LOCKFREE
         SpanLock lk;
+#endif
         /* Se absorbe a los vecinos libres de la derecha ANTES de entrar en
          * ninguna lista.  Asi los trozos vuelven a estar juntos y sirven para
          * lo que venga despues, en vez de quedarse atrapados en la lista de su
@@ -1261,25 +1832,11 @@ void free_span(ChunkHeader *h) noexcept {
          * Lo retenido esta acotado por el pico de tramos libres a la vez, que
          * es memoria que el programa ya llego a tener.  Devolverla, si hace
          * falta, es cosa de una llamada explicita entre fases. */
-        h->extra = 0;
-        coalesce_right(h);
-
-        if (h->cls > kMaxSpanChunks) {
-            /* Demasiado grande para guardarlo.  Sus paginas SI vuelven al
-             * sistema -- quedarse con el rango y ademas con la memoria seria
-             * regalar las dos cosas --, y se cuenta, para que no sea mudo si
-             * deja de ser raro. */
-            const size_t bytes = size_t(h->cls) * kChunkBytes;
-            const size_t page = os_page_size();
-            if (bytes > page) {
-                drop_addr = reinterpret_cast<uintptr_t>(h) + page;
-                drop_bytes = bytes - page;
-            }
-            h->magic = 0; // deja de ser una cabecera: ya no es de nadie
-            g_spans_dropped.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            list_insert(h);
-        }
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+        pool_return_lockfree(h, &drop_addr, &drop_bytes);
+#else
+        pool_return_locked(h, &drop_addr, &drop_bytes);
+#endif
     }
 
     if (drop_bytes != 0)
@@ -1649,6 +2206,8 @@ size_t host_region_reserved() noexcept {
     return g_region_reserved.load(std::memory_order_relaxed);
 }
 
+size_t host_span_trim() noexcept { return span_sweep(); }
+
 uint64_t host_per_thread_exhausted() noexcept {
     return g_no_per_thread_id.load(std::memory_order_relaxed);
 }
@@ -1783,7 +2342,9 @@ void *host_realloc(void *p, size_t n) noexcept {
             PendingCommit pend;
             bool ok;
             {
+#if VESTA_ALLOC_SPAN_POLICY != VESTA_SPAN_LOCKFREE
                 SpanLock lk;
+#endif
                 ok = try_extend_span(h, want, &pend);
             }
             if (ok && pend.bytes != 0) {

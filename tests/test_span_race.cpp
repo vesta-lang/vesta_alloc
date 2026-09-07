@@ -370,6 +370,18 @@ void check_coalescing() {
     util::host_free(b); // el de la derecha primero
     util::host_free(a); // al soltar este se absorbe al de al lado
 
+    /* CON LAS POLITICAS SIN CERROJO NO BASTA CON SOLTARLOS.  Ahi un tramo
+     * liberado se aparca donde ningun fusionador lo ve -- que es justo lo que
+     * hace que llegar a el no cueste candado --, asi que los dos de arriba
+     * siguen separados y la pregunta "se fusionaron?" no tiene respuesta
+     * todavia.  Vaciar el aparcadero es lo que los devuelve al fondo comun y
+     * los pone en condiciones de fusionarse.
+     *
+     * Con la politica con cerrojo no hay nada aparcado y esto no hace nada, asi
+     * que la comprobacion es la MISMA para todas: no se debilita el test, se le
+     * quita una suposicion que solo valia para una de ellas. */
+    util::host_span_trim();
+
     void *big = util::host_alloc(two);
     check(big != nullptr, "y luego uno del doble de tamano");
     if (big == nullptr) return;

@@ -86,23 +86,78 @@ struct Rng {
     }
 };
 
-/// The size distribution, in percent, following the measured histogram: 81%
-/// below 64 B and a short tail into the kilobytes.
+/**
+ * @brief A size distribution, in percent.
+ *
+ * THERE IS MORE THAN ONE ON PURPOSE, and it is not a convenience.  This
+ * allocator is a separate library: whoever reuses it does not necessarily
+ * allocate the way a compiler does.  Tuning -- or worse, deciding what is not
+ * worth fixing -- from a single measured histogram bakes one consumer's
+ * profile into a general-purpose component.
+ *
+ * That mistake had already been made here: every profile stopped at 8 KiB while
+ * `kMaxSmall` is 16 KiB, so this benchmark **never once touched the span
+ * path**, and the lock that guards it had therefore never been measured under
+ * contention by anybody.
+ */
 struct Band {
     uint32_t upto_pct;
     uint32_t min, max;
 };
-const Band kBands[] = {
+
+struct Profile {
+    const char *name;
+    const Band *bands;
+    uint32_t count;
+    const char *what;
+};
+
+/// A compiler's shape: 81% below 64 B and a short tail into the kilobytes.
+/// Everything here is a size CLASS; the span path is never reached.
+const Band kSmallBands[] = {
     {81, 8, 64},       // what dominates
     {93, 65, 256},     //
     {98, 257, 1024},   //
     {100, 1025, 8192}, // the tail
 };
 
+/// The same, with a tail that DOES cross `kMaxSmall`.  Documents, buffers and
+/// images arrive mixed in with the small change, which is the common shape for
+/// a consumer that is not a compiler.
+const Band kMixedBands[] = {
+    {60, 8, 64},           //
+    {80, 65, 1024},        //
+    {92, 1025, 16384},     // still classes, right up to the edge
+    {100, 16385, 262144},  // spans: 16 KiB .. 256 KiB
+};
+
+/// Dominated by spans, which is what image, network or matrix code looks like.
+/// Here the span lock is the hot path, not a corner.
+const Band kLargeBands[] = {
+    {20, 64, 8192},          // the small change such code still does
+    {70, 16385, 262144},     // 16 KiB .. 256 KiB
+    {100, 262145, 4194304},  // 256 KiB .. 4 MiB
+};
+
+const Profile kProfiles[] = {
+    {"small", kSmallBands, 4, "a compiler's shape; never reaches a span"},
+    {"mixed", kMixedBands, 4, "small change plus real buffers"},
+    {"large", kLargeBands, 3, "dominated by spans"},
+};
+constexpr uint32_t kNumProfiles = 3;
+
+const Profile *g_profile = &kProfiles[0];
+
+/// Blocks kept alive per thread.  Set from the profile's mean size so the
+/// footprint stays comparable; see the note where the live set is created.
+int g_live_blocks = 512;
+
 uint32_t draw_size(Rng &r) noexcept {
     const uint32_t p = r.next() % 100;
-    for (const Band &b : kBands)
+    for (uint32_t i = 0; i < g_profile->count; ++i) {
+        const Band &b = g_profile->bands[i];
         if (p < b.upto_pct) return b.min + r.next() % (b.max - b.min + 1);
+    }
     return 64;
 }
 
@@ -135,12 +190,28 @@ uint32_t draw_size(Rng &r) noexcept {
  * replaces.
  */
 constexpr uint32_t kSizeTable = 4096; // power of two: the index just masks
-uint16_t g_sizes[kSizeTable];
+/* 32 bits, not 16.  A `uint16_t` cannot even REPRESENT a span, so with the
+ * large profiles every size would have silently wrapped to something small --
+ * the benchmark would have run, printed numbers, and measured the wrong path.
+ * The table doubles to 16 KiB and still sits in L1 beside everything else. */
+uint32_t g_sizes[kSizeTable];
 
 void fill_sizes() noexcept {
     Rng r(0xD1B54A32D192ED03ull);
-    for (uint32_t i = 0; i < kSizeTable; ++i)
-        g_sizes[i] = uint16_t(draw_size(r));
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < kSizeTable; ++i) {
+        g_sizes[i] = draw_size(r);
+        total += g_sizes[i];
+    }
+    /* Roughly two mebibytes of live set per thread, whatever the sizes are.
+     * The floor keeps the workload's SHAPE -- a set that gets replaced at
+     * random needs more than one or two slots to mean anything -- and the
+     * ceiling is the old fixed count, so the small profile is unchanged. */
+    const uint64_t mean = total / kSizeTable;
+    uint64_t blocks = (uint64_t(2) << 20) / (mean != 0 ? mean : 1);
+    if (blocks < 8) blocks = 8;
+    if (blocks > 512) blocks = 512;
+    g_live_blocks = int(blocks);
 }
 
 /**
@@ -318,8 +389,13 @@ void worker(unsigned id, unsigned threads, int steps,
     if (cpus != nullptr) affinity::pin(*cpus);
 
     Rng r(0x9E3779B97F4A7C15ull + id * 0x1000193ull);
-    constexpr int kLive = 512;
-    std::vector<void *> live(kLive, nullptr);
+    /* THE LIVE SET SCALES WITH THE SIZES, and it has to: 512 blocks alive is a
+     * few hundred KiB of small change and half a gigabyte PER THREAD once the
+     * profile reaches into the megabytes.  What must stay constant across
+     * profiles is the shape of the workload -- a live set that gets replaced at
+     * random -- not the block count, so the count is chosen to keep roughly the
+     * same footprint whatever the sizes are. */
+    std::vector<void *> live(size_t(g_live_blocks), nullptr);
 
     /* The clock starts AFTER pinning and after the vector exists: creating the
      * thread and placing it is not what is being measured. */
@@ -443,12 +519,74 @@ const Column kColumns[] = {
 };
 constexpr size_t kNumColumns = sizeof(kColumns) / sizeof(kColumns[0]);
 
-/// Which columns to run.  Empty name means all of them.
+/**
+ * @brief The largest span THE POOL can still serve, in MiB.
+ *
+ * "Can a big span still be allocated?" is the wrong question and it took a
+ * measurement that always answered 16 MiB to notice: the region holds hundreds
+ * of gigabytes of untouched address space, so a big request is always granted
+ * -- carved out of virgin ground, whatever state the freed memory is in.  That
+ * reads like an allocator with no fragmentation at all.
+ *
+ * The question that means something is whether what was FREED can serve it, and
+ * the allocator already answers it: `bytes_reserved` only moves when memory is
+ * committed for the first time.  So a request that does not move it was served
+ * from the pool, and one that does was not -- the pieces were there but not in
+ * one piece.
+ *
+ * Halving, because the answer spans four orders of magnitude, and every probe
+ * is freed again straight away: measuring must not be what exhausts the thing
+ * being measured.
+ */
+void print_largest_span(const char *when) {
+    size_t best = 0;
+    for (size_t n = size_t(util::kMaxSpanChunks) * util::kChunkBytes;
+         n >= util::kChunkBytes; n /= 2) {
+        const uint64_t before = util::host_alloc_stats().bytes_reserved;
+        void *p = util::host_alloc(n);
+        if (p == nullptr) continue;
+        const bool from_pool =
+            util::host_alloc_stats().bytes_reserved == before;
+        util::host_free(p);
+        if (from_pool) {
+            best = n;
+            break;
+        }
+    }
+    std::printf("  %slargest span the POOL can serve %-14s %6.1f MiB%s\n",
+                report::dim(), when, double(best) / (1024.0 * 1024.0),
+                report::reset());
+}
+
+/// Which single column to run, or null for all of them.
 const char *g_only = nullptr;
 
 /// Whether a column is in this run.  Matched by first letter, as before.
 bool wanted(const Column &c) noexcept {
     return g_only == nullptr || c.name[0] == g_only[0];
+}
+
+/**
+ * @brief Turns the command-line word into a column, or says it does not exist.
+ *
+ * IT COMPLAINS INSTEAD OF RUNNING NOTHING.  An unrecognised name used to leave
+ * the filter matching no column at all, so the benchmark printed its banner,
+ * printed its closing notes, and measured nothing in between -- which reads
+ * exactly like a run that had nothing to report.
+ */
+void pick_only(const char *word) noexcept {
+    if (word == nullptr || word[0] == '\0') return;
+    if (word[0] == 'a') return; // "all": the default, spelled out
+    const char *want = word[0] == 'o' ? "shared" : word; // "ours", as it was
+    for (size_t i = 0; i < kNumColumns; ++i)
+        if (kColumns[i].name[0] == want[0]) {
+            g_only = kColumns[i].name;
+            return;
+        }
+    std::printf("%sunknown column `%s'.  Use one of:", report::amber(), word);
+    for (size_t i = 0; i < kNumColumns; ++i)
+        std::printf(" %s", kColumns[i].name);
+    std::printf(", or `all'.  Running all of them.%s\n", report::reset());
 }
 
 /**
@@ -585,13 +723,23 @@ int main(int argc, char **argv) {
     /* Which column to run on its own, by first letter: s(hared), p(er-thread),
      * n(ew), m(alloc).  "ours" is still accepted for the shared one, which is
      * what it used to be called. */
-    if (argc > 4) g_only = argv[4][0] == 'o' ? "shared" : argv[4];
+    if (argc > 4) pick_only(argv[4]);
+    /* Which size profile, by first letter: s(mall), m(ixed), l(arge).  It is an
+     * argument and not a constant because this library is reused: the sizes one
+     * consumer asks for say nothing about what the next one will ask for, and
+     * the span path only exists above `kMaxSmall`. */
+    if (argc > 5)
+        for (uint32_t i = 0; i < kNumProfiles; ++i)
+            if (kProfiles[i].name[0] == argv[5][0]) g_profile = &kProfiles[i];
 
     std::printf("== the allocator with many threads at once ==\n\n");
-    std::printf("Each thread keeps 512 blocks alive and replaces one at random.\n"
-                "Sizes follow the histogram measured on a real compilation, and\n"
-                "one free in forty is handed to another thread -- the only place\n"
-                "where threads can contend.\n");
+    fill_sizes(); // also settles how many blocks the live set holds
+    std::printf("Each thread keeps %d blocks alive and replaces one at random,\n"
+                "and one free in forty is handed to another thread -- the only\n"
+                "place where threads can contend.\n\n"
+                "Size profile: %s%s%s -- %s.\n",
+                g_live_blocks, report::bold(), g_profile->name, report::reset(),
+                g_profile->what);
     if (!util::host_alloc_active()) {
         std::printf("\n%sThe allocator is OFF (VESTA_NO_HOST_SLAB): this measures\n"
                     "the system one instead.%s\n",
@@ -603,8 +751,9 @@ int main(int argc, char **argv) {
         std::printf("\n%sOnly one pass: %s.%s\n", report::amber(),
                     affinity::topology().why, report::reset());
 
-    /* The sizes are drawn HERE, once, outside everything that gets measured. */
-    fill_sizes();
+    /* The sizes were drawn ONCE, up top, outside everything that gets measured
+     * -- they have to be, because the live-set size is derived from them and it
+     * is printed in the banner. */
 
     const util::HostAllocStats before = util::host_alloc_stats();
     std::printf("\n%s%d steps per thread, median of %d (plus a warm-up)%s\n\n",
@@ -638,6 +787,59 @@ int main(int argc, char **argv) {
      * It is not the same question: threads that finish before the last ones
      * start never overlap, so a high thread count does NOT imply the limit was
      * ever reached. */
+    /* HOW BROKEN UP THE MEMORY ENDED UP, which is the price the lock-free
+     * policies pay and no timing column shows.  Total free bytes say nothing
+     * about it -- the same amount in one piece or in a thousand reads the same
+     * -- so what is asked is the question a program actually asks: how big a
+     * single contiguous span can still be had?
+     *
+     * And then the same question after `host_span_trim`, because the gap
+     * between the two IS the cost of having parked spans where nothing could
+     * merge them.  If the first number is much smaller than the second, the
+     * memory was there all along and only the shape was wrong. */
+    print_largest_span("before trimming");
+    const size_t trimmed = util::host_span_trim();
+    print_largest_span("after trimming");
+    if (trimmed != 0)
+        std::printf("  %s  (%.1f MiB were parked out of reach of coalescing)%s\n",
+                    report::dim(), double(trimmed) / (1024.0 * 1024.0),
+                    report::reset());
+
+    /* WHAT IT COST IN MEMORY, which no timing column can show.  It belongs
+     * next to the span figures because that is where the trade is: a thread
+     * holds freed spans back so it does not have to take the lock for them, and
+     * memory held back is memory nobody else can use.  A speed-up here that
+     * comes with a large jump in this line is not free, it is paid for. */
+    const double mib = 1024.0 * 1024.0;
+    std::printf("\n  %scommitted by this run: %.1f MiB (%.1f MiB per thread), "
+                "over a region of %.0f MiB%s\n",
+                report::dim(),
+                double(a.bytes_reserved - before.bytes_reserved) / mib,
+                double(a.bytes_reserved - before.bytes_reserved) / mib /
+                    double(g_boxes.empty() ? 1 : g_boxes.size()),
+                double(util::host_region_reserved()) / mib, report::reset());
+
+    /* DID THIS REACH THE SPAN PATH AT ALL?  Same rule as the note below, and
+     * for the same reason: anything at or under `kMaxSmall` is a size class and
+     * never takes the span lock, so a profile that stops short of it measures
+     * that lock exactly zero times.  Every profile here used to stop at 8 KiB
+     * with the limit at 16 KiB, and nobody could tell from the output. */
+    const uint64_t spans = a.large_allocs - before.large_allocs;
+    const uint64_t smalls = a.small_allocs - before.small_allocs;
+    std::printf("  %sspans (over kMaxSmall = %zu B): %llu of %llu allocations, "
+                "%.2f%%%s\n",
+                spans == 0 ? report::amber() : report::dim(), util::kMaxSmall,
+                (unsigned long long)spans,
+                (unsigned long long)(spans + smalls),
+                spans + smalls == 0
+                    ? 0.0
+                    : 100.0 * double(spans) / double(spans + smalls),
+                report::reset());
+    if (spans == 0)
+        std::printf("  %s  ...so the span lock was NOT measured here.  Run with "
+                    "a profile that crosses it: `mixed` or `large`.%s\n",
+                    report::amber(), report::reset());
+
     const uint64_t no_id = a.no_owner_id - before.no_owner_id;
     if (no_id != 0)
         std::printf("  %sran out of owner ids %llu times: in the SHARED column "

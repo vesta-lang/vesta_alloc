@@ -353,13 +353,140 @@ inline constexpr uint32_t kMaxSpanChunks = 256;
  * las listas compartidas.  Es lo mismo que el asignador ya hace con los
  * bloques pequenos, aplicado donde faltaba.
  *
- * POR QUE SOLO DOS.  Porque un tramo guardado esta RETENIDO: no lo ve ninguna
- * otra parte y, si el hilo muere, se pierde.  Con dos tamanos (uno y dos
- * trozos, o sea hasta 128 KiB) el techo es de 192 KiB por hilo, y ahi caen el
- * 90% de las reservas grandes segun el reparto medido.  Subirlo cambiaria unos
- * nanosegundos raros por memoria retenida en todos los hilos.
+ * HOW MANY SIZES IT COVERS, and why it is not two any more.  It used to be two
+ * -- spans of one and two chunks, up to 128 KiB -- and the reason given was
+ * that "90% of the large allocations land there according to the measured
+ * split".  That split was Vesta's.  This is a separate library, and the sizes
+ * one consumer asks for say nothing about the next one: code that works on
+ * images, network buffers or matrices lives entirely above that line, and for
+ * it the fast path did not exist at all.
+ *
+ * What that cost, measured with 24 threads on a profile with 8% spans: **72.5%
+ * of all CPU time spinning on the span lock**, against 6.8% doing the actual
+ * work.  And the span path stopped scaling completely -- cost per operation per
+ * core went from 10.3 ns on one thread to 302 ns on 24, and with a
+ * span-dominated profile from 38.5 to 2505, where adding threads makes the
+ * whole thing 3.8x SLOWER than running single-threaded.
+ *
+ * Overridable, because it is a property of the CONSUMER and not of this
+ * library: it decides the largest span that can ever take the fast path, and
+ * how much of `ThreadCache` is spent on the table.
+ *
+ * @see kSpanCacheBytes, which is what actually bounds the memory.
+ *
+ * @code
+ *   // Never allocates over 256 KiB, and wants the table small:
+ *   //   -DVESTA_ALLOC_SPAN_CACHE_SLOTS=4
+ * @endcode
  */
-inline constexpr uint32_t kSpanCacheSlots = 2;
+#ifndef VESTA_ALLOC_SPAN_CACHE_SLOTS
+#define VESTA_ALLOC_SPAN_CACHE_SLOTS 32
+#endif
+inline constexpr uint32_t kSpanCacheSlots = VESTA_ALLOC_SPAN_CACHE_SLOTS;
+
+/**
+ * @defgroup span_policy How the shared span pool synchronises
+ * @brief Four mechanisms for the same job, chosen at compile time.
+ *
+ * WHY THERE IS A CHOICE HERE AT ALL.  Measured with 24 threads, **60% of all
+ * CPU time was spent spinning on the span lock** even after the per-thread span
+ * cache took half the traffic away.  The lock is not needed to hand a span out
+ * or to take one back -- it is needed because spans get SPLIT and MERGED, and
+ * those reach into a second span and into a doubly-linked list at once.
+ *
+ * And that is the opening: splitting and coalescing exist only to fight
+ * fragmentation, so a coalesce that cannot happen right now can be SKIPPED and
+ * the result is still correct -- just a little more fragmented.  It is the only
+ * place in this allocator where the operation that needs exclusion is one you
+ * are allowed to give up on.
+ *
+ * Which of these wins is not something to reason about from first principles;
+ * it depends on how often each path is actually taken, so all four are built
+ * from the same source and measured with the same benchmark.
+ * @{
+ */
+/// Today's: one spin lock around the lists, the splitting and the coalescing.
+#define VESTA_SPAN_LOCKED 0
+/// Lock-free lists; the lock is left only for coalescing, which reaches out.
+#define VESTA_SPAN_HYBRID 1
+/// Lock-free lists and no coalescing on the free path; done later, in batch.
+#define VESTA_SPAN_DEFERRED 2
+/// No lock anywhere: the neighbour is claimed with a CAS, or given up on.
+/// NOT FINISHED -- see the guard below before reaching for it.
+#define VESTA_SPAN_LOCKFREE 3
+
+#ifndef VESTA_ALLOC_SPAN_POLICY
+#define VESTA_ALLOC_SPAN_POLICY VESTA_SPAN_HYBRID
+#endif
+
+/*
+ * THE LOCK-FREE POLICY IS WRITTEN AND IT IS NOT CORRECT.  It refuses to build
+ * on purpose, because the alternative is worse: it passes single-threaded, so
+ * it would go through anybody's quick check and corrupt memory later, under
+ * load, with nothing pointing back here.
+ *
+ * WHAT IS WRONG, kept because the diagnosis was the hard part.  A span that
+ * gets absorbed stays behind as a leftover entry in its stack, and its slot in
+ * `g_span_next` is still part of that chain.  If that same chunk is later handed
+ * out, freed, and pushed onto a DIFFERENT stack, the slot is overwritten and
+ * the first chain starts following a link that belongs to the second: the two
+ * stacks cross.
+ *
+ * A chunk owns ONE link slot and can be in TWO stacks at once -- as a real
+ * entry and as a leftover.  Moving the link out of the span made READING it
+ * safe, which was the earlier problem and is genuinely fixed; it does not stop
+ * the slot being REUSED.  That needs a chunk not to be reused while a leftover
+ * of it is still reachable, which is deferred reclamation -- epochs or hazard
+ * pointers -- and that does not exist yet.
+ *
+ * `test_span_race` catches it: it hangs.
+ */
+#if VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_LOCKFREE
+#error "VESTA_SPAN_LOCKFREE is not finished: a chunk can sit in two stacks at \
+once -- once for real and once as the leftover of an absorption -- and they \
+share a single link slot, so reusing the chunk crosses the two chains. It \
+needs deferred reclamation (epochs or hazard pointers), which is not written. \
+It passes single-threaded and hangs under `test_span_race`, so it would slip \
+through a quick check. Use VESTA_SPAN_HYBRID or VESTA_SPAN_DEFERRED."
+#endif
+
+/**
+ * @brief True for the policies that park freed spans out of reach.
+ *
+ * Two of the four do: they buy their speed by putting a freed span where no
+ * coalescer can find it, and pay for it later.  The locked one has nowhere to
+ * park -- every free goes straight to the pool -- and the lock-free one needs
+ * nowhere, because its pool costs no lock to reach in the first place.
+ */
+#define VESTA_SPAN_HAS_PARKING                                                 \
+    (VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_HYBRID ||                           \
+     VESTA_ALLOC_SPAN_POLICY == VESTA_SPAN_DEFERRED)
+/** @} */
+
+/**
+ * @brief How many bytes of freed spans a thread may hold back, at most.
+ *
+ * THIS, AND NOT THE SLOT COUNT, IS THE BOUND THAT MEANS SOMETHING.  A retained
+ * span is memory nobody else can see, so it has to be capped -- but capping it
+ * by "how many sizes" makes the real limit depend on which sizes the consumer
+ * happens to use: two slots is 192 KiB for one program and nothing at all for
+ * another.  Counting bytes gives the same promise to everybody: *this thread
+ * will not sit on more than this much*.
+ *
+ * It also gets the trade right by itself.  Small spans are cheap to keep, so
+ * many fit; a multi-megabyte one fills the budget on its own and the next free
+ * goes back to the shared pool, which is exactly where something that large
+ * belongs -- somebody else can use it.
+ *
+ * @code
+ *   // Bigger for a program with few threads and large buffers:
+ *   //   -DVESTA_ALLOC_SPAN_CACHE_BYTES=(16u << 20)
+ * @endcode
+ */
+#ifndef VESTA_ALLOC_SPAN_CACHE_BYTES
+#define VESTA_ALLOC_SPAN_CACHE_BYTES (size_t(2) << 20)
+#endif
+inline constexpr size_t kSpanCacheBytes = VESTA_ALLOC_SPAN_CACHE_BYTES;
 
 /**
  * @brief Cabecera al principio de cada trozo.

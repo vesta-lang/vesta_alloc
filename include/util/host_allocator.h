@@ -211,14 +211,26 @@ struct alignas(64) ThreadCache {
      */
     ChunkHeader *big_run[kClasses];
     /**
-     * @brief Un tramo guardado por este hilo, por numero de trozos.
+     * @brief Spans this thread is holding back, chained, by chunk count.
      *
-     * El indice es `trozos - 1`.  Nulo si no hay ninguno guardado, que es lo
-     * normal en un hilo que no pida reservas grandes.  Ver `kSpanCacheSlots`:
-     * existe porque el cerrojo de tramos era el 76% de lo que costaba una
-     * reserva grande, y era el unico sitio donde el camino rapido sincronizaba.
+     * The index is `chunks - 1`, and null means none -- which is the normal
+     * state of a thread that asks for no large blocks.  It exists because the
+     * span lock was 76% of what a large allocation cost, and it was the only
+     * place where the fast path still synchronised.
+     *
+     * A CHAIN AND NOT A SINGLE SLOT.  With one span per size, a thread that
+     * juggles three buffers of the same size caches one of them and takes the
+     * lock for the other two, which is the common shape -- a working set gets
+     * replaced, not swapped one at a time.  The link lives in the span's own
+     * `SpanNode` area, free to use because a held-back span is in no shared
+     * list: nobody else can see it, so nothing has to be excluded.
+     *
+     * How much is held back is bounded by `span_cache_bytes`, not by the number
+     * of slots.  @see kSpanCacheBytes.
      */
     ChunkHeader *span_cache[kSpanCacheSlots];
+    /// Bytes currently held back in `span_cache`, to enforce the budget.
+    size_t span_cache_bytes;
     HostAllocStats stats;
 };
 
@@ -938,6 +950,36 @@ class PerThreadAllocator {
  * @endcode
  */
 uint64_t host_per_thread_exhausted() noexcept;
+
+/**
+ * @brief Hands every parked span back to the shared pool, where it is merged.
+ *
+ * WHY THIS EXISTS.  The lock-free span policies buy their speed by parking
+ * freed spans somewhere no coalescer can see them -- that is exactly what makes
+ * reaching them cost no lock.  The price is that two spans lying next to each
+ * other stay apart, so a later request bigger than either of them cannot be
+ * served from the pair.  This is the way to pay that back: a phase boundary,
+ * where a program knows it has finished with one working set and is about to
+ * ask for a different one.
+ *
+ * It is also what makes coalescing TESTABLE under those policies: without it,
+ * "were these two merged?" has no answer, because they never reach the pool.
+ *
+ * Under the locked policy there is nothing parked and this returns zero.
+ *
+ * @return Bytes moved back into the shared pool.
+ *
+ * @par Threads
+ * **Safe from any thread**, but it takes the span lock repeatedly and merges as
+ * it goes, so it is a between-phases call and not something for a hot loop.
+ *
+ * @code
+ *   run_parsing_phase();
+ *   util::host_span_trim();   // let the next phase reuse what parsing freed
+ *   run_codegen_phase();
+ * @endcode
+ */
+size_t host_span_trim() noexcept;
 
 /**
  * @brief Sirve @p n bytes PUESTOS A CERO.
