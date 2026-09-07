@@ -23,7 +23,7 @@
  * data point, not a missing one.
  */
 
-#include "util/host_allocator.h"
+#include "util/alloc/host_allocator.h"
 
 #include <cstdio>
 #include <string>

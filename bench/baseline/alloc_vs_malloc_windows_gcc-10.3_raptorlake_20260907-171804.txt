@@ -1,0 +1,49 @@
+# bench_vs_malloc -- Windows, gcc 10.3, Raptorlake, vs msvcrt
+#
+# Medianas de 7 corridas, y la
+# dispersion de cada fila (peor/mejor).  Una diferencia menor que su
+# propia dispersion no es una diferencia.
+#
+section                                              case            shared  per-thread      owned      system  spread  vs system
+allocate and free immediately (hot)                  hot 16            1.38        1.50       1.37       12.13   1.11x      8.85x
+allocate and free immediately (hot)                  hot 64            1.36        1.49       1.36       12.30   1.05x      9.04x
+allocate and free immediately (hot)                  hot 256           1.39        1.49       1.39       12.39   1.23x      8.91x
+allocate and free immediately (hot)                  hot 1K            1.39        1.52       1.36       12.04   1.06x      8.85x
+allocate and free immediately (hot)                  hot 4K            1.95        1.65       1.43       12.65   1.25x      8.85x
+allocate and free immediately (hot)                  hot 64K           3.54        4.54       4.09       97.29   1.23x     27.48x
+allocate and free immediately (hot)                  hot 1M            3.84        4.97       4.21     3592.59   1.20x    935.57x
+allocate a batch, free the batch (burst)             burst 16          1.57        1.72       1.53       19.62   1.11x     12.82x
+allocate a batch, free the batch (burst)             burst 64          1.61        1.64       1.50       18.08   1.06x     12.05x
+allocate a batch, free the batch (burst)             burst 256         1.86        1.86       1.73       18.49   1.31x     10.69x
+allocate a batch, free the batch (burst)             burst 1K          2.98        3.09       3.18       25.33   1.08x      8.50x
+allocate a batch, free the batch (burst)             burst 4K          7.89        7.90       8.36       34.05   1.16x      4.32x
+allocate a batch, free the batch (burst)             burst 64K        14.66       10.45      10.26      909.18   1.14x     88.61x
+allocate a batch, free the batch (burst)             burst 1M         87.42       15.33      17.43     2707.89   3.26x    176.64x
+live set with random replacement (churn)             churn 16          1.53        1.50       1.25       21.46   1.53x     17.17x
+live set with random replacement (churn)             churn 64          1.46        1.57       1.20       13.56   1.13x     11.30x
+live set with random replacement (churn)             churn 256         1.51        1.46       1.21       23.91   1.15x     19.76x
+live set with random replacement (churn)             churn 1K          1.69        1.77       1.50       20.66   1.19x     13.77x
+live set with random replacement (churn)             churn 4K          3.37        3.18       3.20       32.99   1.21x     10.37x
+live set with random replacement (churn)             churn 64K         4.93        5.35       4.97       70.95   1.23x     14.39x
+live set with random replacement (churn)             churn 1M          7.78        5.41       6.81     2627.63   2.60x    485.70x
+zeroed (calloc), and the caller reads ALL of it      calloc 16         2.31        1.80       1.48       14.05   1.18x      9.49x
+zeroed (calloc), and the caller reads ALL of it      calloc 64         3.62        2.25       1.74       15.13   1.63x      8.70x
+zeroed (calloc), and the caller reads ALL of it      calloc 256        4.13        4.06       3.76       15.38   1.23x      4.09x
+zeroed (calloc), and the caller reads ALL of it      calloc 1K         7.12        6.63       6.21       20.00   1.20x      3.22x
+zeroed (calloc), and the caller reads ALL of it      calloc 4K        23.12       23.74      22.37       40.45   1.18x      1.81x
+zeroed (calloc), and the caller reads ALL of it      calloc 64K      840.56      836.67     835.85      913.92   1.08x      1.09x
+zeroed (calloc), and the caller reads ALL of it      calloc 1M     13509.72    13768.41   13921.67   108638.50   1.04x      8.04x
+zeroed (calloc), and the caller reads ALL of it      calloc 8M    176508.78   176418.68  176255.21   757070.19   1.01x      4.30x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 16         2.07        1.83       1.43       14.37   1.32x     10.05x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 64         2.07        1.76       1.43       14.42   1.18x     10.08x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 256        3.51        2.70       2.18       14.77   1.46x      6.78x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 1K         5.25        4.38       3.71       17.66   1.20x      4.76x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 4K        12.01       11.56      11.43       29.51   1.22x      2.58x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 64K      415.97      435.96     419.93      483.12   1.10x      1.16x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 1M      6467.54     6588.66    6592.81     5416.48   1.05x      0.84x
+zeroed (calloc), and the caller reads a SIXTY-FOURTH calloc 8M     86135.72    86418.53   85510.42    24575.38   1.02x      0.29x
+grow from 64 bytes by doubling (realloc)             grow to 256       7.54        7.86       7.33       43.69   1.16x      5.96x
+grow from 64 bytes by doubling (realloc)             grow to 1K        7.34        7.82       7.68       39.74   1.17x      5.41x
+grow from 64 bytes by doubling (realloc)             grow to 4K       10.18       10.15      10.11       42.97   1.13x      4.25x
+grow from 64 bytes by doubling (realloc)             grow to 64K      31.47       33.10      32.14      146.49   1.92x      4.65x
+grow from 64 bytes by doubling (realloc)             grow to 1M       77.11       24.90      26.65     8061.78   1.27x    323.77x

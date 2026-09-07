@@ -10,7 +10,7 @@
  * @brief Using the allocator from plain C.
  *
  * This file is compiled as **C, not C++**, on purpose.  It is the example and
- * the proof at the same time: if `util/host_allocator_c.h` ever stops being
+ * the proof at the same time: if `util/alloc/host_allocator_c.h` ever stops being
  * valid C -- a stray `bool`, a default argument, a namespace -- this stops
  * building, and the promise the header makes is checked instead of claimed.
  *
@@ -20,8 +20,8 @@
  * you how much you REALLY got, which is often more than you asked for.
  */
 
-#include "util/host_allocator_c.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator_c.h"
+#include "util/mem/vesta_memset.h"
 
 #include <stdio.h>
 #include <string.h>

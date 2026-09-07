@@ -28,10 +28,10 @@
  *  7. Que la base del modulo permite escribir un desplazamiento resoluble.
  */
 
-#include "util/alloc_sites.h"
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
-#include "util/os_memory.h"
+#include "util/report/alloc_sites.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h"
+#include "util/os/os_memory.h"
 
 #include <cstdio>
 #include <cstring>
@@ -126,8 +126,7 @@ size_t count_lines_with(const std::string &s, const char *needle) {
 int main() {
     std::printf("== de donde viene lo que no dice para que es ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  asignador apagado (VESTA_NO_HOST_SLAB): nada que "
-                    "comprobar\n");
+        std::printf("  el asignador no esta en vigor: nada que comprobar\n");
         return 0;
     }
 

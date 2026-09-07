@@ -17,9 +17,9 @@
  * Al enlazar este test contra el asignador, sus propios `new` ya pasan por el,
  * asi que la prueba es tambien de integracion.
  */
-#include "util/host_allocator.h"
-#include "util/vesta_memcpy.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator.h"
+#include "util/mem/vesta_memcpy.h"
+#include "util/mem/vesta_memset.h"
 
 #include <atomic>
 #include <chrono>

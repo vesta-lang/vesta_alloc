@@ -26,10 +26,10 @@
  *     cuando no puede crecer.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_c.h"
-#include "util/host_allocator_layout.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_c.h"
+#include "util/alloc/host_allocator_layout.h"
+#include "util/mem/vesta_memset.h"
 
 #include <cstdio>
 #include <cstring>
@@ -58,8 +58,7 @@ bool write_and_verify(void *p, size_t n, unsigned char seed) {
 int main() {
     std::printf("== reservas grandes y capa en C ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  asignador apagado (VESTA_NO_HOST_SLAB): nada que "
-                    "comprobar\n");
+        std::printf("  el asignador no esta en vigor: nada que comprobar\n");
         return 0;
     }
 

@@ -53,8 +53,8 @@
  * spread.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h" // kMaxThreads: the thread budget
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h" // kMaxThreads: the thread budget
 
 #include "affinity.h"
 #include "report.h"
@@ -741,8 +741,9 @@ int main(int argc, char **argv) {
                 g_live_blocks, report::bold(), g_profile->name, report::reset(),
                 g_profile->what);
     if (!util::host_alloc_active()) {
-        std::printf("\n%sThe allocator is OFF (VESTA_NO_HOST_SLAB): this measures\n"
-                    "the system one instead.%s\n",
+        std::printf("\n%sThis allocator is NOT in force: what follows measures "
+                    "the system one\ninstead.  Check that the static archive "
+                    "really linked in.%s\n",
                     report::amber(), report::reset());
     }
 

@@ -1,0 +1,154 @@
+{#-
+ VestaVM -- Distributed Virtual Machine
+ Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
+ License: MIT (see LICENSE).  Part of the VestaVM family.
+
+ A TREE GRID with the information IN the rows, and one panel that follows the
+ selection.  Not a chart -- the names do not fit in boxes -- and not a set of
+ tabs holding the same numbers side by side: totals you cannot line up with
+ what you have selected are a second report that happens to share a page.
+
+ Every string a person reads is marked with `data-t` and comes from the
+ catalogue, in whichever language is picked, switched without reloading.  What
+ is NOT marked is the measurement: function names, paths, modules and the
+ names of the CSV files and their columns are what the export calls things,
+ and translating them would make the page and the file disagree.
+
+ The raw export is still here, whole, at the bottom.  Nothing is summarised
+ away -- but it is an APPENDIX, which is what it is: the reading happens in
+ the tree.
+-#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<style>{{ css }}</style>
+</head>
+<body>
+
+<header>
+  <h1>{{ title }} <span class="sub" id="sub"></span></h1>
+  <div id="warns"></div>
+
+  <div class="tabs">
+    <button class="on" data-panel="p-tree" data-t="tab.tree"></button>
+    <button data-panel="p-raw"><span data-t="tab.raw"></span>
+      <span class="n">{{ raw_rows }}</span></button>
+    <span class="grow"></span>
+    <label class="pick"><span data-t="tool.lang"></span>
+      <select id="lang">
+        {%- for code, name in langs %}
+        <option value="{{ code }}">{{ name }}</option>
+        {%- endfor %}
+      </select>
+    </label>
+  </div>
+</header>
+
+<div class="panel on" id="p-tree">
+  <div class="row bar-tools">
+    <label class="pick"><span data-t="tool.grouping"></span>
+      <select id="grouping">
+        <option value="stack" data-t="group.stack"></option>
+        <option value="module" data-t="group.module"></option>
+        <option value="file" data-t="group.file"></option>
+        <option value="purpose" data-t="group.purpose"></option>
+      </select>
+    </label>
+    <label class="pick"><span data-t="tool.scope"></span>
+      <select id="scope">
+        <option value="all" data-t="scope.all"></option>
+        <option value="fold" data-t="scope.fold"></option>
+        <option value="hide" data-t="scope.hide"></option>
+        <option value="extern" data-t="scope.extern"></option>
+      </select>
+    </label>
+    <label class="pick"><span data-t="tool.langfilter"></span>
+      <select id="langfilter">
+        <option value="all" data-t="lang.all"></option>
+        <option value="c" data-t="lang.c"></option>
+        <option value="cpp" data-t="lang.cpp"></option>
+        <option value="unknown" data-t="lang.unknown"></option>
+      </select>
+    </label>
+    <div class="seg" role="group">
+      <button data-dir="td" class="on" data-t="dir.td"></button><button data-dir="bu" data-t="dir.bu"></button>
+    </div>
+    <input type="search" id="filter" data-tph="ph.filter">
+    <label class="chk"><input type="checkbox" id="bybytes">
+      <span data-t="chk.bytes"></span></label>
+    <button id="expand" data-t="btn.expand"></button>
+    <button id="collapse" data-t="btn.collapse"></button>
+    <span class="grow"></span>
+    <span class="stat" id="stat"></span>
+  </div>
+
+  <div class="wrap grid">
+  <table id="grid">
+    <thead><tr>
+      <th data-k="name"><span data-t="col.name"></span></th>
+      <th class="n" data-k="total"><span data-t="col.total"></span></th>
+      <th class="n" data-k="pct"><span data-t="col.pct"></span></th>
+      <th class="n" data-k="self"><span data-t="col.self"></span></th>
+      <th class="n" data-k="bytes"><span data-t="col.bytes"></span></th>
+      <th class="n" data-k="selfbytes"><span data-t="col.selfbytes"></span></th>
+      <th class="n" data-k="large" data-tt="tip.large"><span data-t="col.large"></span></th>
+      <th class="n" data-k="classes" data-tt="tip.classes"><span data-t="col.classes"></span></th>
+      <th data-k="purpose"><span data-t="col.purpose"></span></th>
+      <th class="n" data-k="sites"><span data-t="col.sites"></span></th>
+      <th data-k="module"><span data-t="col.module"></span></th>
+      <th data-k="file"><span data-t="col.file"></span></th>
+      <th class="n" data-k="addr"><span data-t="col.addr"></span></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  </div>
+
+  <div id="detail"></div>
+</div>
+
+<div class="panel" id="p-raw">
+  <p class="note" data-t="raw.note"></p>
+
+  {%- for t in tables %}
+  <h2 class="rawh"><code>{{ t.file }}</code> &mdash;
+    <span data-t="{{ t.note_key }}"></span></h2>
+  <div class="row">
+    <input type="search" data-for-table="t-{{ t.id }}" data-for-count="c-{{ t.id }}"
+           data-tph="raw.filter" data-tph-what="{{ t.file }}">
+    <span class="stat" id="c-{{ t.id }}" data-trows="{{ t.rows|length }}"></span>
+  </div>
+  <div class="wrap sm">
+  <table class="flat" id="t-{{ t.id }}">
+    <thead><tr>
+      {%- for c in t.columns %}
+      <th{% if c.numeric %} class="n"{% endif %}>{{ c.name }}</th>
+      {%- endfor %}
+    </tr></thead>
+    <tbody>
+      {%- for row in t.rows %}
+      <tr>
+        {#- The same rule as the tree: a number is a number, and any text is
+            capped in width and wrapped rather than allowed to stretch its
+            column across the screen.  Nothing is shortened. -#}
+        {%- for c in t.columns %}
+        {%- if c.numeric %}<td class="n">{{ row[loop.index0] }}</td>
+        {%- elif c.mono %}<td class="name"><span class="sym">{{ row[loop.index0] }}</span></td>
+        {%- else %}<td><span class="path">{{ row[loop.index0] }}</span></td>{% endif %}
+        {%- endfor %}
+      </tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+  </div>
+  {%- endfor %}
+</div>
+
+<script>const DATA = {{ data }};</script>
+{% for s in scripts %}
+<script>{{ s }}</script>
+{% endfor %}
+</body>
+</html>

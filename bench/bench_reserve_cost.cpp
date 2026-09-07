@@ -15,7 +15,7 @@
  * 2.7 MiB of commit and 0.5 ms per TiB reserved -- and that half-millisecond
  * lands in process STARTUP, which is a cost this project cares about.
  *
- * The region size in `util/host_allocator_layout.h` was chosen from this table.
+ * The region size in `util/alloc/host_allocator_layout.h` was chosen from this table.
  * Rather than leaving that as a number measured on someone else's computer,
  * this benchmark re-derives it wherever it runs.
  *
@@ -24,7 +24,7 @@
  * asks -- and this shows what the answer looks like.
  */
 
-#include "util/os_memory.h"
+#include "util/os/os_memory.h"
 
 #include <chrono>
 #include <cstdint>

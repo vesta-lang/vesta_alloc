@@ -1,0 +1,80 @@
+# =============================================================================
+#  vesta_alloc -- lo que comparten las dos generaciones de documentacion
+#  vesta_alloc -- what both documentation builds share
+# =============================================================================
+#
+#  \~spanish
+#  Este fichero NO se usa solo: lo incluyen `Doxyfile.en` y `Doxyfile.es`, que
+#  es lo unico que cambia entre los dos -- el idioma y donde se escribe.
+#
+#  La documentacion del codigo es BILINGUE, escrita con los marcadores `\~` de
+#  Doxygen dentro del mismo comentario.  La convencion y su unica trampa estan
+#  en `doc/BILINGUAL.md`; se resume en una linea: cada elemento se cierra con
+#  `\~`, y quien no lo cierre se lleva por delante lo que venga detras.
+#
+#  \~english
+#  This file is not used on its own: `Doxyfile.en` and `Doxyfile.es` include it,
+#  and the only thing they change is the language and where the output goes.
+#
+#  The code documentation is BILINGUAL, written with Doxygen's `\~` markers
+#  inside the same comment.  The convention and its one trap are in
+#  `doc/BILINGUAL.md`; it comes down to one line: every element is closed with
+#  `\~`, and whoever forgets takes whatever follows with them.
+
+PROJECT_NAME           = vesta_alloc
+PROJECT_BRIEF          =
+OUTPUT_DIRECTORY       = doc/out
+
+# Solo las CABECERAS.  Lo de `src/` son comentarios para quien mantiene esto,
+# no interfaz publica, y mezclarlos daria una referencia donde no se distingue
+# lo que se puede llamar de lo que es un detalle interno.
+INPUT                  = include
+RECURSIVE              = YES
+FILE_PATTERNS          = *.h
+
+# EXTRACT_ALL en NO a proposito: asi lo que sale es lo que alguien DOCUMENTO, y
+# un simbolo publico sin documentar se nota por su ausencia en vez de aparecer
+# como una linea vacia que parece documentada.
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = NO
+HIDE_UNDOC_MEMBERS     = YES
+
+# NO SE EXCLUYE `detail`, y conviene saber por que se intento y se quito.
+#
+# La idea era dejar fuera lo de dentro para que la referencia publica solo
+# tuviera lo que se puede llamar.  `EXCLUDE_SYMBOLS` no hace eso: silencia los
+# AVISOS de esos simbolos -- unos ciento veinte -- y los sigue publicando
+# igualmente.  O sea, deja los huecos donde estaban y ademas quita lo unico que
+# los senyalaba, que es peor que no haberlo tocado.
+#
+# Y ademas, aqui `detail` no es ruido: es donde se explica COMO funciona el
+# reparto por hilo, y esta libreria esta escrita para que alguien la lea, no
+# para ser una caja negra.  Se publica entero, con sus avisos a la vista.
+
+# Los avisos SI, y ademas al fichero: una referencia con huecos se publica
+# igual de bien que una completa, asi que la unica forma de que se noten es
+# que alguien los lea.
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+JAVADOC_AUTOBRIEF      = NO
+OPTIMIZE_OUTPUT_FOR_C  = NO
+MARKDOWN_SUPPORT       = YES
+SORT_MEMBER_DOCS       = NO
+GENERATE_TODOLIST      = NO
+GENERATE_TESTLIST      = NO
+
+GENERATE_HTML          = YES
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+GENERATE_LATEX         = NO
+
+# EL XML ES LO QUE HACE COMPROBABLE EL BILINGUE.  `doc/check_parity.py` genera
+# las dos versiones y compara sus arboles: un parrafo que solo existe en un
+# idioma sale como una cuenta distinta.  Sin esto, olvidarse de traducir algo
+# no da ningun aviso -- Doxygen se limita a no escribirlo.
+GENERATE_XML           = YES
+XML_PROGRAMLISTING     = NO

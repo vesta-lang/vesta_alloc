@@ -9,12 +9,16 @@
  * @file bench/bench_vs_malloc.cpp
  * @brief Head to head against malloc/calloc/realloc, in one process.
  *
- * WHY A SECOND BENCHMARK.  `bench_allocator` compares by re-running the same
- * binary with `VESTA_NO_HOST_SLAB=1`.  That is useful -- it measures the whole
- * program end to end -- but it has two weaknesses as a comparison: the system
- * allocator is reached THROUGH our wrapper, and the two numbers come from
- * different runs, so anything that drifts between them (CPU frequency, page
- * cache, another process waking up) lands on the difference.
+ * WHY A SECOND BENCHMARK.  It used to be that `bench_allocator` compared by
+ * re-running the same binary with the allocator switched off, and the two
+ * numbers came from different runs -- so anything that drifted between them
+ * (CPU frequency, page cache, another process waking up) landed on the
+ * difference.  That switch is gone and `bench_allocator` now interleaves both
+ * columns in one process as well, through `support/system_alloc.h`.
+ *
+ * What still separates the two: there the patterns are whole-program shapes
+ * (bursts, threads, cross-thread), here each call is measured on its own,
+ * including `realloc`, which the other one does not exercise at all.
  *
  * Here both allocators are called directly, in the same process, back to back.
  *
@@ -47,12 +51,12 @@
  * by whatever the allocator does with the operating system.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_c.h"
-#include "util/os_memory.h"
-#include "util/host_allocator_layout.h"
-#include "util/vesta_memcpy.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_c.h"
+#include "util/os/os_memory.h"
+#include "util/alloc/host_allocator_layout.h"
+#include "util/mem/vesta_memcpy.h"
+#include "util/mem/vesta_memset.h"
 
 #include <chrono>
 #include <cstdio>
@@ -455,6 +459,24 @@ void header(const char *title) {
 const size_t kSizes[] = {16, 64, 256, 1024, 4096, 65536, 1u << 20};
 const int kSizeCount = int(sizeof(kSizes) / sizeof(kSizes[0]));
 
+/**
+ * @brief Sizes only the zeroed cases use, and why they are only there.
+ *
+ * Above a few mebibytes the interesting question stops being the free list and
+ * becomes WHO puts the zeros there -- and the answer flips: past a threshold it
+ * is cheaper to hand the pages back to the system and let it zero what the
+ * caller actually touches.  Without a size up here, that path would not be
+ * exercised by anything, and a path nothing measures is a path nobody knows is
+ * working.
+ *
+ * They are not in `kSizes` because the other cases keep a live set of hundreds
+ * of blocks: at eight mebibytes each that is gigabytes of working set, which
+ * would measure the machine's memory and not the allocator.
+ */
+const size_t kBigZeroedSizes[] = {size_t(8) << 20};
+const int kBigZeroedCount =
+    int(sizeof(kBigZeroedSizes) / sizeof(kBigZeroedSizes[0]));
+
 // ---------------------------------------------------------------------------
 //  Lo que el reloj no ve: lo que cuesta un bloque en MEMORIA
 // ---------------------------------------------------------------------------
@@ -552,8 +574,9 @@ int rounds_for(size_t size) {
 int main() {
     std::printf("== head to head: this allocator vs malloc ==\n\n");
     if (!util::host_alloc_active()) {
-        std::printf("The allocator is OFF (VESTA_NO_HOST_SLAB), so both sides\n"
-                    "would be malloc.  Unset it and run again.\n");
+        std::printf("This allocator is NOT in force, so both sides would be\n"
+                    "the same malloc.  Check that the static archive really "
+                    "linked in.\n");
         return 1;
     }
     std::printf("Both are called directly, in this process, interleaved A-B-B-A\n"
@@ -593,6 +616,10 @@ int main() {
         const int n = rounds_for(s);
         row("calloc", s, abba(ZeroedCase{s, n, 1}, AllColumns{}));
     }
+    for (int i = 0; i < kBigZeroedCount; ++i) {
+        const size_t s = kBigZeroedSizes[i];
+        row("calloc", s, abba(ZeroedCase{s, rounds_for(s), 1}, AllColumns{}));
+    }
 
     std::printf("\nThe other half of the answer, not a second opinion: whoever\n"
                 "defers the zeroing wins below and loses above.  A row where a\n"
@@ -603,6 +630,10 @@ int main() {
         const size_t s = kSizes[i];
         const int n = rounds_for(s);
         row("calloc", s, abba(ZeroedCase{s, n, 64}, AllColumns{}));
+    }
+    for (int i = 0; i < kBigZeroedCount; ++i) {
+        const size_t s = kBigZeroedSizes[i];
+        row("calloc", s, abba(ZeroedCase{s, rounds_for(s), 64}, AllColumns{}));
     }
 
     header("grow from 64 bytes by doubling (realloc)");

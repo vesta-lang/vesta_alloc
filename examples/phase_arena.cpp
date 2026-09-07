@@ -24,11 +24,11 @@
  *
  * So: fixed-size objects, nodes that get linked, single-pass work buffers.
  * For small repeated allocations of containers that grow, use the size-class
- * allocator in `util/host_allocator.h`, which DOES return the old buffer.
+ * allocator in `util/alloc/host_allocator.h`, which DOES return the old buffer.
  */
 
-#include "util/host_allocator.h"
-#include "util/scratch_arena.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/scratch_arena.h"
 
 #include <chrono>
 #include <cstdio>

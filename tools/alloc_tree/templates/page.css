@@ -1,0 +1,322 @@
+/*
+ * VestaVM -- Distributed Virtual Machine
+ *
+ * Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
+ * License: MIT (see LICENSE).  Part of the VestaVM family.
+ *
+ * DENSE ON PURPOSE.  This is a grid to read numbers off, not a poster: small
+ * type, tight rows, and no decoration that costs a line of height.  A profiler
+ * view that fits forty rows on screen answers a question that one fitting
+ * twelve does not.
+ *
+ * AND NOTHING IS EVER CUT.  No ellipsis, no truncation, no max-width on a name
+ * cell: a C++ symbol runs to four hundred characters and the tail is where the
+ * template arguments are.  Wide content scrolls sideways inside its own box.
+ */
+
+:root {
+  --bg: #ffffff;
+  --ink: #1a1d21;
+  --dim: #6b7280;
+  --line: #e3e6ea;
+  --head: #f4f6f8;
+  --hot: #cfe3f7;      /* the bar behind a total */
+  --hot2: #f7d9cf;     /* the bar behind self */
+  --sel: #dbeafe;
+  --warn-bg: #fff8e1;
+  --warn-line: #b8860b;
+  --warn-ink: #7a5b00;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+  --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  /* How wide a name or a path is allowed to get before it wraps.  In `ch`,
+     so it is a count of CHARACTERS and not of pixels: the point is that a
+     column stays the width of a readable line, whatever the font does. */
+  --sym: 60ch;
+  --path: 44ch;
+  /* Y EL DESPLAZAMIENTO TAMBIEN, que se quedo sin cota y se noto en cuanto
+     hubo sitios de OTRO modulo: su desplazamiento se mide desde NUESTRA base,
+     asi que sale un numero de doce digitos hexadecimales que ensanchaba la
+     columna y descuadraba la tabla entera por una fila.  Una columna sin cota
+     es una columna que mide lo que mida su peor fila. */
+  --off: 16ch;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.35 var(--ui);
+}
+
+header {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 14px 0;
+}
+
+h1 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+h1 .sub { font-weight: 400; color: var(--dim); }
+
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.grow { flex: 1 1 auto; }
+.stat { color: var(--dim); font-variant-numeric: tabular-nums; }
+
+button, .seg button {
+  font: 12px var(--ui);
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 4px;
+  cursor: pointer;
+}
+button:hover { background: var(--head); }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 4px 4px 0; }
+.seg button.on { background: var(--sel); border-color: #93c5fd; }
+
+input[type=search] {
+  font: 12px var(--ui);
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  min-width: 260px;
+}
+.chk { font-size: 12px; color: var(--dim); display: inline-flex; gap: 4px; }
+
+.warn {
+  margin: 8px 0 0;
+  padding: 5px 10px;
+  border: 1px solid var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* -- tabs ---------------------------------------------------------------- */
+.tabs { display: flex; gap: 2px; margin-top: 9px; }
+.tabs button {
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  color: var(--dim);
+  margin-bottom: -1px;
+}
+.tabs button.on {
+  background: var(--bg);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+.tabs .n { color: var(--dim); font-weight: 400; }
+
+/* -- the grids ----------------------------------------------------------- */
+.panel { display: none; }
+.panel.on { display: block; }
+
+.wrap { overflow: auto; max-height: calc(100vh - 132px); }
+table { border-collapse: separate; border-spacing: 0; width: 100%; }
+
+th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--head);
+  border-bottom: 1px solid var(--line);
+  padding: 5px 8px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dim);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+th.n { text-align: right; }
+th .dir { color: #2563eb; }
+
+td {
+  padding: 2px 8px;
+  border-bottom: 1px solid #f2f4f6;
+  vertical-align: top;
+  white-space: nowrap;
+}
+td.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.name { font-family: var(--mono); }
+td.dimmed, .dim { color: var(--dim); }
+
+/* -- LONG TEXT IS WRAPPED, NEVER CUT ---------------------------------------
+   A demangled C++ symbol runs to four hundred characters, and one of them in
+   a cell makes its column four hundred characters wide -- the whole table
+   then resizes around a single row and nothing lines up any more.
+
+   So the text is capped in WIDTH and wraps onto more lines.  It is not
+   shortened: no ellipsis, no "first 60 characters of", nothing that would
+   stop the name being read whole or pasted into a search.  `code.js` marks
+   the seams (after a comma, a `::`, an angle or a paren) so the break lands
+   where the name has one; `overflow-wrap: anywhere` is the floor for the case
+   of a single identifier that is already too long by itself.
+
+   An inline-block and not `max-width` on the cell: in a table laid out
+   automatically a cell's max-width is advisory, and the column would go back
+   to being as wide as its widest row. */
+.sym, .path, .off {
+  display: inline-block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.sym { max-width: var(--sym); }
+.path { max-width: var(--path); }
+/* El desplazamiento parte por cualquier sitio: es un numero, no tiene costuras
+   donde cortar como las tiene un nombre.  Sigue sin recortarse -- se lee
+   entero en dos lineas antes que a medias en una. */
+.off { max-width: var(--off); }
+
+tbody tr:hover td { background: #f8fafc; }
+tbody tr.sel td { background: var(--sel); }
+
+/* The bar lives BEHIND the number instead of in a column of its own: a shape
+   is read at a glance and the exact figure is still right there to be read. */
+td.bar { position: relative; }
+td.bar i {
+  position: absolute; left: 0; top: 1px; bottom: 1px;
+  background: var(--hot);
+  border-radius: 2px;
+  z-index: 0;
+}
+td.bar.self i { background: var(--hot2); }
+td.bar span { position: relative; z-index: 1; }
+
+/* -- the tree column ------------------------------------------------------ */
+.tw { display: inline-block; }
+.tog {
+  display: inline-block;
+  width: 13px;
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--mono);
+}
+.tog.leaf { cursor: default; color: transparent; }
+.inl { color: #7c3aed; }              /* inlined into the next frame */
+.hit { background: #fde68a; border-radius: 2px; }
+
+/* -- symbols ---------------------------------------------------------------
+   Nothing is hidden or shortened here: what changes is WEIGHT.  The name the
+   function is really called stands out; its qualifiers, its template
+   arguments and its parameter list stay legible and step back, so a
+   four-hundred-character symbol can be scanned instead of deciphered. */
+.id { font-weight: 600; color: var(--ink); }
+.kw { color: #0550ae; }                  /* void, const, unsigned...        */
+.ns { color: #55606d; }                  /* namespaces and qualifiers       */
+.arg { color: #97a1ad; }                 /* inside <> and ()                */
+.pn { color: #8b96a5; }                  /* :: , * & and the rest           */
+
+/* The LANGUAGE of the code, on the name it is called by and on its module.
+   "Who allocated this" reads very differently when the answer is a C library
+   carried inside the project and when it is the C++ standard library. */
+.lang-c, .id.lang-c { color: #0f766e; }        /* C   -- teal              */
+.lang-cpp, .id.lang-cpp { color: #4338ca; }    /* C++ -- indigo            */
+
+/* What a count INHERITED when it evicted a weaker entry.  Beside the number
+   and never inside it: the total is a floor, the two together a ceiling. */
+td.bar em {
+  font-style: normal;
+  color: var(--warn-ink);
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+/* -- the toolbar ---------------------------------------------------------- */
+.bar-tools { padding: 6px 14px; }
+.pick { font-size: 12px; color: var(--dim); display: inline-flex; gap: 5px;
+        align-items: center; }
+select {
+  font: 12px var(--ui);
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--ink);
+}
+
+/* A purpose is a LABEL, not prose: several fit on a row and each one is read
+   whole.  Never abbreviated -- "+2" says nothing, and what the memory was for
+   is the question the tag system exists to answer. */
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 0 5px;
+  margin-right: 3px;
+  border-radius: 8px;
+  background: #eef2f7;
+  color: #33507a;
+  border: 1px solid #dbe3ee;
+}
+
+/* -- the panel that follows the selection --------------------------------- */
+#detail {
+  border-top: 2px solid var(--line);
+  padding: 8px 14px 12px;
+  max-height: 38vh;
+  overflow: auto;
+  background: #fcfdfe;
+}
+#detail h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--dim);
+  margin: 0 0 5px;
+}
+.dnums {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.dnums b { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+.dnums span { color: var(--dim); font-variant-numeric: tabular-nums; }
+.dnums em { color: var(--warn-ink); font-style: normal; }
+
+.dcols { display: flex; gap: 20px; align-items: flex-start; }
+.dcols > div:first-child { flex: 0 0 300px; }
+.dsites { flex: 1 1 auto; min-width: 0; }
+
+/* The purpose split of the SELECTED branch.  Same shape as the bar behind a
+   number in the grid, on purpose: it is the same quantity seen another way. */
+.pbar {
+  position: relative;
+  padding: 2px 6px;
+  margin-bottom: 2px;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.pbar i {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: var(--hot);
+  border-radius: 3px;
+  z-index: 0;
+}
+.pbar span, .pbar b, .pbar em { position: relative; z-index: 1; }
+.pbar span { flex: 1 1 auto; }
+.pbar b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.pbar em { color: var(--dim); font-style: normal; width: 46px; text-align: right; }
+
+.wrap.grid { max-height: calc(62vh - 90px); }
+.wrap.sm { max-height: 30vh; }
+
+/* -- the raw appendix ------------------------------------------------------ */
+.note { margin: 10px 14px 0; color: var(--dim); max-width: 70ch; }
+.rawh { font-size: 12px; margin: 16px 14px 2px; }
+#p-raw .row { padding: 0 14px 4px; }
+
+.empty { padding: 14px; color: var(--dim); }

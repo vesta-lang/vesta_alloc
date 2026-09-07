@@ -47,9 +47,9 @@
  * run that recorded ten million allocations without a hitch.
  */
 
-#include "util/alloc_sites.h"
-#include "util/call_site.h"
-#include "util/host_allocator.h"
+#include "util/report/alloc_sites.h"
+#include "util/interpose/call_site.h"
+#include "util/alloc/host_allocator.h"
 
 #include <chrono>
 #include <cstdio>

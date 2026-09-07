@@ -36,10 +36,10 @@
  * se probo y cuadraba; lo que se busca es justamente lo que ese bucle no tiene.
  */
 
-#include "util/alloc_sites.h"
-#include "util/call_site.h"
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
+#include "util/report/alloc_sites.h"
+#include "util/interpose/call_site.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -172,7 +172,7 @@ void report(const char *que, const Shot &a, const Shot &b) {
 int main() {
     std::printf("== las dos formas de contar una reserva, con UN SOLO HILO ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  asignador apagado (VESTA_NO_HOST_SLAB): nada que contar\n");
+        std::printf("  el asignador no esta en vigor: nada que contar\n");
         return 0;
     }
 

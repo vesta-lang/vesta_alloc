@@ -1,0 +1,5 @@
+# Documentacion en INGLES.  Ver `Doxyfile.common` para todo lo demas.
+@INCLUDE               = doc/Doxyfile.common
+OUTPUT_LANGUAGE        = English
+OUTPUT_DIRECTORY       = doc/out/en
+WARN_LOGFILE           = doc/out/en/warnings.txt

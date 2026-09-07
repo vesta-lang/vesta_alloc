@@ -7,8 +7,37 @@
 
 /**
  * @file util/mem/x86/avx2_memcpy.h
- * @brief Copiar con movimientos de 32 bytes.  Solo si la CPU tiene AVX2.
+ * @brief
+ * \~english Copying with 32-byte moves.  Only if the CPU has AVX2.
+ * \~spanish Copiar con movimientos de 32 bytes.  Solo si la CPU tiene AVX2.
+ * \~
  *
+ * \~english
+ * @c target("avx2") compiles this function with AVX2 enabled WITHOUT requiring
+ * it of the whole binary: whoever calls it asks about the CPU first
+ * (@c vesta_mem_x86_has_avx2).  It is the way to take advantage of the
+ * extension without losing the executable's portability.
+ *
+ * IN EXCHANGE IT CANNOT BE INLINED into a function that does not carry the same
+ * @c target -- GCC forbids it, and rightly: it would inherit instructions its
+ * caller cannot run.  That is why there are two distinct public entry points:
+ * @c vesta_memcpy dispatches here and pays ONE call, and
+ * @c vesta_memcpy_inline stays on the base path and pays none.  Compiling with
+ * @c -mavx2 the distinction disappears; see @c VESTA_MEM_TARGET_AVX2.
+ *
+ * MIND the detail that already bit in the previous version of this code:
+ * wrapping the body in `#if defined(__AVX2__)` does NOT work.  That macro is
+ * only defined if the WHOLE binary is compiled with AVX2, which never happens
+ * here -- the baseline is @c -march=x86-64 -- so the body vanished and the
+ * dispatch, which DID detect AVX2 on the CPU, ended up calling the SSE2 path
+ * anyway.  With @c target the body is always compiled.
+ *
+ * The accesses go through @c VESTA_MEM_LOAD32 / @c VESTA_MEM_STORE32 and not
+ * through a plain assignment.  The reason -- that GCC splits every 32-byte
+ * access into two of 16 -- is in @c util/mem/x86/x86_vec.h, with the
+ * measurement.
+ *
+ * \~spanish
  * @c target("avx2") compila esta funcion con AVX2 habilitado SIN exigirlo al
  * binario entero: quien la llama pregunta antes por la CPU
  * (@c vesta_mem_x86_has_avx2).  Es la forma de aprovechar la extension sin
@@ -22,7 +51,7 @@
  * distincion desaparece; ver @c VESTA_MEM_TARGET_AVX2.
  *
  * OJO al detalle que ya mordio en la version anterior de este codigo: NO vale
- * envolver el cuerpo en @c #if defined(__AVX2__).  Ese macro solo esta definido
+ * envolver el cuerpo en `#if defined(__AVX2__)`.  Ese macro solo esta definido
  * si el binario ENTERO se compila con AVX2, cosa que aqui no pasa nunca -- la
  * linea base es @c -march=x86-64 --, asi que el cuerpo desaparecia y el
  * despacho, que SI detectaba AVX2 en la CPU, terminaba llamando al camino de
@@ -31,6 +60,8 @@
  * Los accesos van por @c VESTA_MEM_LOAD32 / @c VESTA_MEM_STORE32 y no por una
  * asignacion normal.  El motivo -- que GCC parte cada acceso de 32 bytes en dos
  * de 16 -- esta en @c util/mem/x86/x86_vec.h, con la medida.
+ *
+ * \~
  */
 #ifndef VESTA_UTIL_MEM_X86_AVX2_MEMCPY_H
 #define VESTA_UTIL_MEM_X86_AVX2_MEMCPY_H
@@ -40,22 +71,52 @@
 #if defined(VESTA_MEM_ARCH_X86_64)
 
 /**
- * @brief Copia @p n bytes con movimientos de 32.
+ * @brief
+ * \~english Copies @p n bytes with 32-byte moves.
+ * \~spanish Copia @p n bytes con movimientos de 32.
+ * \~
  *
+ * \~english
+ * The loop's step -- how many bytes per turn -- is fixed by
+ * @c VESTA_MEM_AVX2_STEP, and it comes out of a profile, not out of intuition.
+ * Below 32 it ends up on the base path, which already covers 16 and the tail.
+ *
+ * @par Threads
+ * Safe, as long as the buffers belong to the caller.
+ *
+ * \~spanish
  * El escalon del bucle -- cuantos bytes por vuelta -- lo fija
  * @c VESTA_MEM_AVX2_STEP, y sale de un perfil, no de la intuicion.  Por debajo
  * de 32 termina en el camino base, que ya cubre 16 y la cola.
  *
- * @param d Destino.
- * @param s Origen.  No puede solapar con @p d.
- * @param n Cuantos bytes.
- *
  * @par Hilos
  * Segura, mientras los bufers sean de quien llama.
  *
+ * \~
+ * @param d
+ * \~english the destination.
+ * \~spanish destino.
+ * \~
+ * @param s
+ * \~english the source.  It must not overlap @p d.
+ * \~spanish origen.  No puede solapar con @p d.
+ * \~
+ * @param n
+ * \~english how many bytes.
+ * \~spanish cuantos bytes.
+ * \~
+ *
+ * \~english
  * @code
  *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_copy(dst, src, n);
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_copy(dst, src, n);
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_AVX2_FN void vesta_mem_avx2_copy(uint8_t *d, const uint8_t *s,
                                            size_t n) VESTA_MEM_NOEXCEPT {

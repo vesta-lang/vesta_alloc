@@ -45,8 +45,8 @@
  * policy can name.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h"
 
 #include <atomic>
 #include <cstdio>
@@ -313,7 +313,7 @@ void per_thread_only() {
 int main() {
     std::printf("== the allocator variants, one battery ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  allocator off (VESTA_NO_HOST_SLAB): nothing to check\n");
+        std::printf("  this allocator is not in force: nothing to check\n");
         return 0;
     }
     std::printf("  kMaxThreads=%u  kPerThreadCaches=%u  kBigClassMin=%zu\n\n",

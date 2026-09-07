@@ -14,6 +14,79 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Anadido
 
+- **`malloc` es este asignador tambien DENTRO del runtime de C.**  El
+  renombrado al enlazar alcanza toda llamada del enlace y ahi se acaba: lo que
+  la libreria de C reserva por dentro y devuelve -- `strdup`, `getline`,
+  `_wgetdcwd` -- no es una referencia pendiente, asi que ningun enlazador puede
+  tocarla.  Esa memoria salia como cero, y cero se lee como "no hay".
+
+  Se cierra con un mecanismo por sistema, los dos **encendidos por defecto**:
+  `VESTA_ALLOC_DEFINE_MALLOC` en ELF (definir el simbolo, como jemalloc: las
+  llamadas internas de la libreria salen por la PLT) y `VESTA_ALLOC_HOOK_MSVCRT`
+  en Windows (un salto en la entrada de `msvcrt!malloc`, porque una DLL no
+  tiene PLT y una llamada interna no sale de ella).  SOLO msvcrt: ni kernel32,
+  ni ntdll.
+
+  Tres cosas costaron su vuelta y estan escritas donde se deciden: que las dos
+  vias **no conviven** con `--wrap` para el mismo simbolo -- `__real_malloc` se
+  resolveria con nuestra propia definicion y la primera reserva se llamaria a
+  si misma --; que en Windows los saltos tienen que entrar desde un callback de
+  TLS y no desde un constructor, porque los cuatro bloques de diferencia
+  incluyen la tabla de `atexit`, que crece con `realloc`; y que en ELF hace
+  falta una arena de arranque, porque ser `malloc` significa que te pregunten
+  antes de que el asignador haya decidido si esta activo.
+
+- **Las entradas ALINEADAS, en las dos plataformas.**  `posix_memalign`,
+  `aligned_alloc`, `memalign` y la familia `_aligned_*` de Windows entera.  En
+  POSIX el bloque se suelta con el `free` de siempre, asi que tiene que decir
+  lo que es por si mismo: se sirve como un TRAMO, cuya cabecera `free` ya
+  encuentra enmascarando -- sin marca, sin tabla lateral y sin una instruccion
+  mas en el camino de liberar.
+
+  `_aligned_realloc` y sus parientes se cubren aunque no las llame nadie: son
+  las que reciben un puntero YA reservado, y sin cubrirlas una de nuestras
+  reservas acababa en el monton del runtime.  Eso no falla en la llamada, falla
+  mucho despues y en otro sitio.
+
+- **De QUIEN es una direccion** (`util/symbols/module_symbols.h`).  Todo lo que
+  resuelve nombres leia la imagen PROPIA y ninguno comprobaba que la direccion
+  lo fuera: una de `libc` no encontraba nada en nuestra tabla y salia con el
+  ultimo simbolo que hubiera, `_fini`, con la misma cara que un nombre cierto.
+  Un informe se lee como un hecho, y un nombre equivocado es peor que ninguno.
+
+  De un modulo ajeno los simbolos se leen de SU fichero -- `slurp` y
+  `build_table` nunca fueron especificos de "uno mismo" --, y lo que da el
+  cargador queda de respaldo para un modulo despojado.
+
+- **El volcado de texto tambien resuelve nombres**, y las reservas de otros
+  modulos salen en su propia seccion.  Antes el mismo proceso escribia
+  `parse_tokens` en el CSV y un desplazamiento crudo en la terminal; y los
+  sitios ajenos, con nueve reservas frente a trescientas treinta, no asomaban
+  en una lista ordenada por cuenta -- justo lo unico que se acababa de ganar.
+
+- **La pagina del informe filtra por AMBITO y por LENGUAJE**, y los dos ejes se
+  combinan: todo / solo mis llamadas plegando hacia mi funcion / solo mis
+  llamadas en sentido estricto / solo lo externo, cruzado con C, C++ o sin
+  determinar.  "Sin determinar" es una vista propia y no un cajon: sin
+  informacion de depuracion no hay fichero, y sin fichero un nombre a secas no
+  dice en que lenguaje se escribio -- la pagina lo DICE, y dice como
+  arreglarlo.  Lo que un filtro deja fuera se cuenta siempre.
+
+### Cambiado
+
+- **`include/` y `src/` se reparten en seis carpetas** por lo que hace cada
+  cosa: `alloc/`, `interpose/`, `report/`, `symbols/` (con `symbols/dwarf/`
+  debajo), `os/` y `mem/`.  Estaban las veinticuatro cabeceras y las treinta y
+  seis fuentes en un solo sitio, que a partir de una docena deja de ser una
+  lista y pasa a ser un monton donde hay que buscar.  Las cabeceras se incluyen
+  ahora como `util/<carpeta>/<nombre>.h`.
+
+- **Las cabeceras instalables ya no se enumeran a mano.**  Habia cuatro listas,
+  una por subdirectorio, y les faltaban `call_site.h`, `module_symbols.h` y
+  `msvcrt_hook.h`.  Su modo de fallar era el caro: no rompia al construir,
+  rompia en la maquina de quien INSTALARA la libreria.  Se instala el arbol de
+  `include/` entero.
+
 - **`util::PerThreadAllocator`: muchos hilos y NI UN cerrojo hasta 16 KiB.**
   Segunda forma de desbordar, elegida por TIPO al compilar como manda D13.  El
   asignador del proceso acota MEMORIA: puede nombrar `kMaxThreads` duenos y a
@@ -248,6 +321,78 @@ invita a creer que ampara.
 ## [Unreleased]
 
 ### Added
+
+- **`malloc` is this allocator INSIDE the C runtime too.**  Link-time renaming
+  reaches every call in the link and stops there: what the C library allocates
+  inside itself and hands back — `strdup`, `getline`, `_wgetdcwd` — is not a
+  pending reference, so no linker can touch it.  That memory showed as zero,
+  and zero reads like "there is none".
+
+  Closed by one mechanism per platform, **both on by default**:
+  `VESTA_ALLOC_DEFINE_MALLOC` on ELF (define the symbol, the way jemalloc does:
+  the library's own calls go out through the PLT) and `VESTA_ALLOC_HOOK_MSVCRT`
+  on Windows (a jump at the entry of `msvcrt!malloc`, because a DLL has no PLT
+  and an internal call never leaves it).  ONLY msvcrt: not kernel32, not ntdll.
+
+  Three things cost a round trip each, and are written where they are decided:
+  the two ways **cannot coexist** with `--wrap` for the same symbol —
+  `__real_malloc` would resolve against our own definition and the first
+  allocation would call itself; on Windows the jumps have to go in from a TLS
+  callback rather than a constructor, because the four blocks of difference
+  include the `atexit` table, which grows with `realloc`; and on ELF a
+  bootstrap arena is needed, because being `malloc` means being asked before
+  the allocator has decided whether it is active.
+
+- **The aligned entries, on both platforms.**  `posix_memalign`,
+  `aligned_alloc`, `memalign` and the whole Windows `_aligned_*` family.  On
+  POSIX such a block is released with plain `free`, so it has to say what it is
+  by itself: it is served as a span, whose header `free` already finds by
+  masking — no marker, no side table, and not one instruction added to the free
+  path.
+
+  `_aligned_realloc` and its relatives are covered even though nobody calls
+  them: they are the ones handed an ALREADY allocated pointer, and leaving them
+  alone meant one of our blocks reaching the runtime's heap.  That does not
+  fail at the call; it fails much later and somewhere else.
+
+- **Whose address is this** (`util/symbols/module_symbols.h`).  Everything that
+  resolves names read the program's OWN image and none of them checked that the
+  address was the program's: one inside `libc` found nothing in our table and
+  came back wearing the last symbol we happened to have, `_fini`, with the same
+  confidence as a true name.  A report is read as fact, and a wrong name is
+  worse than a missing one.
+
+  For a foreign module the symbols are read from ITS file — `slurp` and
+  `build_table` were never specific to "self" — with what the loader offers as
+  the fallback for a stripped one.
+
+- **The text dump resolves names too**, and allocations from other modules get
+  a section of their own.  The same process used to write `parse_tokens` into
+  the CSV and a bare offset to the terminal; and foreign sites, with nine
+  allocations against three hundred and thirty, never surfaced in a list sorted
+  by count — which was exactly what had just been gained.
+
+- **The report page filters by SCOPE and by LANGUAGE**, and the two axes
+  combine: everything / only my calls folded onto my function / only my calls
+  strictly / only external, crossed with C, C++ or undetermined.
+  "Undetermined" is a view of its own and not a bin: with no debug information
+  there is no file, and without a file a bare name does not say which language
+  wrote it — the page SAYS so, and says how to fix it.  Whatever a filter
+  leaves out is always counted.
+
+### Changed
+
+- **`include/` and `src/` are split into six folders** by what each one does:
+  `alloc/`, `interpose/`, `report/`, `symbols/` (with `symbols/dwarf/` under
+  it), `os/` and `mem/`.  Twenty-four headers and thirty-six sources sat in one
+  place, which past a dozen stops being a list and becomes a pile to search.
+  Headers are now included as `util/<folder>/<name>.h`.
+
+- **The installable headers are no longer listed by hand.**  There were four
+  lists, one per subdirectory, and they were missing `call_site.h`,
+  `module_symbols.h` and `msvcrt_hook.h`.  The expensive failure mode: it did
+  not break the build, it broke on the machine of whoever INSTALLED the
+  library.  The whole `include/` tree is installed instead.
 
 - **`util::PerThreadAllocator`: many threads and NOT ONE lock up to 16 KiB.**
   A second overflow policy, picked by TYPE at compile time as D13 requires.

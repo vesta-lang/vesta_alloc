@@ -47,7 +47,7 @@
 #include "util/mem/mem_config.h"
 /* La copia es la de esta libreria, no la del sistema: seria raro que el
  * andamiaje que la mide se fiara de otra. */
-#include "util/vesta_memcpy.h"
+#include "util/mem/vesta_memcpy.h"
 
 #if defined(VESTA_MEM_ARCH_X86)
 #include "util/mem/x86/x86_cpuid.h"

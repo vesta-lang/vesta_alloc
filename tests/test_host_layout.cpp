@@ -39,10 +39,10 @@
  *      se devolvio no es el que se reservo, asi que el camino de liberacion
  *      cruzada tiene que leer la cabecera antes de decidir de quien es.
  */
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
-#include "util/vesta_memcpy.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h"
+#include "util/mem/vesta_memcpy.h"
+#include "util/mem/vesta_memset.h"
 
 #include <cstdio>
 #include <new>

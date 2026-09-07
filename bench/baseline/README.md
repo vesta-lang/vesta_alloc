@@ -8,6 +8,29 @@ cannot be answered by reading two tables side by side -- it is answered by
 subtracting them, and subtracting needs the older one written down.  That is all
 this folder is.
 
+## The allocator itself, 2026-09-07
+
+Four more files, from `bench_vs_malloc` and `bench_contention`, taken before a
+decision that may have to be undone: whether the fraction of a block a caller
+touches should be LEARNED -- and if so, keyed by size class or by the site that
+allocated it.  Whatever that turns into, this is what it started from.
+
+| file | what it holds |
+| :--- | :------------ |
+| `alloc_vs_malloc_*` | head to head against the system allocator: hot, burst, churn, calloc read whole and read a sixty-fourth, realloc growth.  Four columns -- shared, per-thread, single-owner, system -- plus what each committed |
+| `alloc_contention_*` | the same allocator with 24 threads, over the three size profiles (`small`, `mixed`, `large`), which is the only way the span path gets exercised at all |
+
+Plain text and not CSV because these two benches print a table rather than
+writing one; the point here is having the numbers written down, and a
+diff over the text answers "what moved" perfectly well.
+
+WHY BOTH SYSTEMS, and why they cannot be averaged: they disagree by more than
+they agree.  Zeroing a recycled block is 4 MiB against never; the system
+allocator they are measured against is glibc on one and msvcrt on the other, and
+those are not remotely the same rival -- a 1 MiB `calloc` costs it 16 us on
+Linux and 120 us on Windows.  A number without its system on the label is not a
+number.
+
 ## What was measured
 
 `bench_memcpy` and `bench_memset` on the same machine, once per toolchain:

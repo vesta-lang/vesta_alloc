@@ -30,9 +30,9 @@
  * unsupported target does not produce a red test, it produces a stopped build.
  */
 
-#include "util/alloc_sites.h"
-#include "util/call_site.h"
-#include "util/host_allocator.h"
+#include "util/report/alloc_sites.h"
+#include "util/interpose/call_site.h"
+#include "util/alloc/host_allocator.h"
 
 #include <cstdint>
 #include <cstdio>

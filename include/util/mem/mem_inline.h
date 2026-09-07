@@ -7,8 +7,29 @@
 
 /**
  * @file util/mem/mem_inline.h
- * @brief Lo que se resuelve SIN llamar a nadie y sin bucle: menos de 16 bytes.
+ * @brief
+ * \~english What gets resolved WITHOUT calling anybody and without a loop:
+ *          under 16 bytes.
+ * \~spanish Lo que se resuelve SIN llamar a nadie y sin bucle: menos de 16
+ *          bytes.
+ * \~
  *
+ * \~english
+ * It depends on no micro-ISA -- these are word moves, which exist on any
+ * architecture -- so it lives outside the architecture folders and every path
+ * shares it as its tail.
+ *
+ * WHY IT IS A SEPARATE FILE AND NOT THE START OF THE VECTOR LOOP.  Because this
+ * is where the real gain is: below 16 bytes the WHOLE cost of a @c memcpy is
+ * the call, and that is by far the common case in an allocator.  Measured, 0.34
+ * ns against 1.53 for the C library -- 4.5x -- and the difference is not in the
+ * copy's code but in not having left here.
+ *
+ * @par Threads
+ * Everything is safe from any thread: there is no state, only the caller's
+ * buffers.
+ *
+ * \~spanish
  * No depende de ninguna micro-ISA -- son movimientos de palabra, que existen en
  * cualquier arquitectura --, asi que vive fuera de las carpetas de arquitectura
  * y lo comparten todos los caminos como cola.
@@ -22,6 +43,8 @@
  * @par Hilos
  * Todo es seguro desde cualquier hilo: no hay estado, solo los bufers de quien
  * llama.
+ *
+ * \~
  */
 #ifndef VESTA_UTIL_MEM_INLINE_H
 #define VESTA_UTIL_MEM_INLINE_H
@@ -31,17 +54,40 @@
 #if VESTA_ALLOC_FREESTANDING
 
 /**
- * @brief Un byte repetido en los ocho de una palabra.
+ * @brief
+ * \~english One byte repeated across the eight of a word.
+ * \~spanish Un byte repetido en los ocho de una palabra.
+ * \~
  *
- * @param v Byte a repetir.
- * @return  El mismo byte en las ocho posiciones.
+ * \~english
+ * @par Threads
+ * Safe.  It only computes.
  *
+ * \~spanish
  * @par Hilos
  * Segura.  Solo calcula.
  *
+ * \~
+ * @param v
+ * \~english the byte to repeat.
+ * \~spanish byte a repetir.
+ * \~
+ * @return
+ * \~english the same byte in all eight positions.
+ * \~spanish el mismo byte en las ocho posiciones.
+ * \~
+ *
+ * \~english
  * @code
  *   const uint64_t pat = vesta_mem_broadcast8(0xFF);   // 0xFFFF...FF
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   const uint64_t pat = vesta_mem_broadcast8(0xFF);   // 0xFFFF...FF
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE uint64_t vesta_mem_broadcast8(uint8_t v)
     VESTA_MEM_NOEXCEPT {
@@ -49,8 +95,36 @@ VESTA_MEM_ALWAYS_INLINE uint64_t vesta_mem_broadcast8(uint8_t v)
 }
 
 /**
- * @brief Copia de MENOS de 16 bytes sin llamar a nadie y sin bucle.
+ * @brief
+ * \~english A copy of UNDER 16 bytes without calling anybody and without a
+ *          loop.
+ * \~spanish Copia de MENOS de 16 bytes sin llamar a nadie y sin bucle.
+ * \~
  *
+ * \~english
+ * The technique is OVERLAPPING BLOCKS: two accesses of the widest size that
+ * fits, one at the start and one at the end, cover any length in their range.
+ * They overlap in the middle, and that does not matter: the same data gets
+ * written twice.  No loop means no branch per byte, and also none of the
+ * pattern @c -ftree-loop-distribute-patterns recognises in order to turn it
+ * INTO a call to @c memcpy -- exactly the one being avoided.
+ *
+ * @c __builtin_memcpy with a CONSTANT size is not a call: the compiler expands
+ * it into a move.  It is the only way to move eight bytes from an unaligned
+ * address without dropping to assembly.
+ *
+ * IT WORKS WITH OVERLAP, and that is NOT a coincidence: it reads both ends
+ * BEFORE writing either, and between them they cover the whole range, so what
+ * it writes cannot trample what it has left to read.  The tails of
+ * @c vesta_mem_sse2_copy_backward and of its scalar equivalent depend on that
+ * property, which means that if somebody reorders this into interleaved loads
+ * and stores, they break @c vesta_memmove without it showing in the ordinary
+ * copy.
+ *
+ * @par Threads
+ * Safe, as long as the buffers belong to the caller.
+ *
+ * \~spanish
  * La tecnica es la de BLOQUES SOLAPADOS: dos accesos del mayor ancho que quepa,
  * uno al principio y otro al final, cubren cualquier longitud de su rango.  Se
  * solapan en el medio, y eso da igual: se escribe dos veces el mismo dato.  Sin
@@ -69,16 +143,34 @@ VESTA_MEM_ALWAYS_INLINE uint64_t vesta_mem_broadcast8(uint8_t v)
  * sea que si alguien reordena esto en cargas y escrituras intercaladas, rompe
  * @c vesta_memmove sin que se note en la copia normal.
  *
- * @param d Destino.
- * @param s Origen.  Puede solapar con @p d.
- * @param n Cuantos bytes, de 0 a 15.  Con 0 no hace nada.
- *
  * @par Hilos
  * Segura, mientras los bufers sean de quien llama.
  *
+ * \~
+ * @param d
+ * \~english the destination.
+ * \~spanish destino.
+ * \~
+ * @param s
+ * \~english the source.  It may overlap @p d.
+ * \~spanish origen.  Puede solapar con @p d.
+ * \~
+ * @param n
+ * \~english how many bytes, from 0 to 15.  With 0 it does nothing.
+ * \~spanish cuantos bytes, de 0 a 15.  Con 0 no hace nada.
+ * \~
+ *
+ * \~english
+ * @code
+ *   vesta_mem_copy_small(dst, src, 7);   // no loop and no call
+ * @endcode
+ *
+ * \~spanish
  * @code
  *   vesta_mem_copy_small(dst, src, 7);   // ni bucle ni llamada
  * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE void vesta_mem_copy_small(uint8_t *d, const uint8_t *s,
                                                   size_t n) VESTA_MEM_NOEXCEPT {
@@ -110,22 +202,53 @@ VESTA_MEM_ALWAYS_INLINE void vesta_mem_copy_small(uint8_t *d, const uint8_t *s,
 }
 
 /**
- * @brief El equivalente de @c vesta_mem_copy_small para rellenar.
+ * @brief
+ * \~english The equivalent of @c vesta_mem_copy_small for filling.
+ * \~spanish El equivalente de @c vesta_mem_copy_small para rellenar.
+ * \~
  *
+ * \~english
+ * The same overlapping blocks and the same absence of a loop and of a call.
+ * The pattern arrives ALREADY repeated across the eight bytes (see
+ * @c vesta_mem_broadcast8) so that the writes of 8, 4 and 2 all come out of the
+ * same word.
+ *
+ * @par Threads
+ * Safe, as long as the buffer belongs to the caller.
+ *
+ * \~spanish
  * Mismos bloques solapados y misma ausencia de bucle y de llamada.  El patron
  * llega YA repetido en los ocho bytes (ver @c vesta_mem_broadcast8) para que
  * las escrituras de 8, 4 y 2 salgan todas de la misma palabra.
  *
- * @param d   Destino.
- * @param pat El byte repetido en los ocho de una palabra.
- * @param n   Cuantos bytes, de 0 a 15.  Con 0 no hace nada.
- *
  * @par Hilos
  * Segura, mientras el bufer sea de quien llama.
  *
+ * \~
+ * @param d
+ * \~english the destination.
+ * \~spanish destino.
+ * \~
+ * @param pat
+ * \~english the byte repeated across the eight of a word.
+ * \~spanish el byte repetido en los ocho de una palabra.
+ * \~
+ * @param n
+ * \~english how many bytes, from 0 to 15.  With 0 it does nothing.
+ * \~spanish cuantos bytes, de 0 a 15.  Con 0 no hace nada.
+ * \~
+ *
+ * \~english
  * @code
  *   vesta_mem_fill_small(dst, vesta_mem_broadcast8(0), 5);
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   vesta_mem_fill_small(dst, vesta_mem_broadcast8(0), 5);
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE void vesta_mem_fill_small(uint8_t *d, uint64_t pat,
                                                   size_t n) VESTA_MEM_NOEXCEPT {

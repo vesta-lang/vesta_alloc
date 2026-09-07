@@ -24,7 +24,7 @@
  * `main` takes `envp` on purpose: it is a THIRD source, independent of both,
  * and it is what proves the count is right rather than merely self-consistent.
  */
-#include "util/os_env.h"
+#include "util/os/os_env.h"
 
 #include <cstdio>
 #include <cstdlib>

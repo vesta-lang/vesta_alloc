@@ -21,8 +21,8 @@
  *     box.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_c.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_c.h"
 
 #include <cstdio>
 #include <string>
@@ -32,9 +32,9 @@ int main() {
     std::printf("== basic usage ==\n\n");
 
     if (!util::host_alloc_active()) {
-        std::printf("The allocator is OFF (VESTA_NO_HOST_SLAB).\n"
-                    "Everything goes to the system one; the program still "
-                    "works.\n");
+        std::printf("This allocator is NOT in force -- most likely the static\n"
+                    "archive did not link in.  Everything goes to the system "
+                    "one;\nthe program still works.\n");
         return 0;
     }
 

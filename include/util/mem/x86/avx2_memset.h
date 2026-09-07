@@ -7,8 +7,22 @@
 
 /**
  * @file util/mem/x86/avx2_memset.h
- * @brief Rellenar con escrituras de 32 bytes.  Solo si la CPU tiene AVX2.
+ * @brief
+ * \~english Filling with 32-byte writes.  Only if the CPU has AVX2.
+ * \~spanish Rellenar con escrituras de 32 bytes.  Solo si la CPU tiene AVX2.
+ * \~
  *
+ * \~english
+ * The same two consequences of @c target as in @c avx2_memcpy.h, and for the
+ * same reasons: the binary does not require AVX2 to start, but this function
+ * cannot be inlined into one that does not carry it.  That is why
+ * @c vesta_memset_inline stays on the base path.
+ *
+ * The writes go through @c VESTA_MEM_STORE32 and not through a plain
+ * assignment; the reason -- that GCC splits them into two of 16 bytes, and what
+ * that cost -- is in @c util/mem/x86/x86_vec.h.
+ *
+ * \~spanish
  * Las mismas dos consecuencias de @c target que en @c avx2_memcpy.h, y por las
  * mismas razones: el binario no exige AVX2 para arrancar, pero esta funcion no
  * se puede meter en linea en una que no lo lleve.  Por eso
@@ -17,6 +31,8 @@
  * Las escrituras van por @c VESTA_MEM_STORE32 y no por una asignacion normal;
  * el motivo -- que GCC las parte en dos de 16 bytes, y lo que costaba -- esta
  * en @c util/mem/x86/x86_vec.h.
+ *
+ * \~
  */
 #ifndef VESTA_UTIL_MEM_X86_AVX2_MEMSET_H
 #define VESTA_UTIL_MEM_X86_AVX2_MEMSET_H
@@ -26,21 +42,50 @@
 #if defined(VESTA_MEM_ARCH_X86_64)
 
 /**
- * @brief Pone @p n bytes al valor @p v con escrituras de 32.
+ * @brief
+ * \~english Sets @p n bytes to the value @p v with 32-byte writes.
+ * \~spanish Pone @p n bytes al valor @p v con escrituras de 32.
+ * \~
  *
+ * \~english
+ * The loop's step is fixed by @c VESTA_MEM_AVX2_STEP.  Below 32 it ends up on
+ * the base path, which already covers 16 and the tail.
+ *
+ * @par Threads
+ * Safe, as long as the buffer belongs to the caller.
+ *
+ * \~spanish
  * El escalon del bucle lo fija @c VESTA_MEM_AVX2_STEP.  Por debajo de 32
  * termina en el camino base, que ya cubre 16 y la cola.
- *
- * @param d Destino.
- * @param v Byte a repetir.
- * @param n Cuantos bytes.
  *
  * @par Hilos
  * Segura, mientras el bufer sea de quien llama.
  *
+ * \~
+ * @param d
+ * \~english the destination.
+ * \~spanish destino.
+ * \~
+ * @param v
+ * \~english the byte to repeat.
+ * \~spanish byte a repetir.
+ * \~
+ * @param n
+ * \~english how many bytes.
+ * \~spanish cuantos bytes.
+ * \~
+ *
+ * \~english
  * @code
  *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_fill(dst, 0, n);
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_fill(dst, 0, n);
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_AVX2_FN void vesta_mem_avx2_fill(uint8_t *d, uint8_t v,
                                            size_t n) VESTA_MEM_NOEXCEPT {

@@ -1,0 +1,28 @@
+# vesta_alloc -- tools
+#
+# THIS IS OPTIONAL, and that is the point.  It renders the page and nothing
+# else: loading the export, folding the tree and printing the whole thing use
+# the standard library alone, so
+#
+#     python -m alloc_tree <dir> --text
+#
+# gives the same tree AND the same five tables on a machine where nothing can
+# be installed -- which is the usual situation on the machine a problem
+# actually shows up on.
+#
+#     python -m pip install -r requirements.txt
+#
+# The floor is where the features being used arrived, not the newest release:
+# pinning to today's version would make the tool refuse to run on a perfectly
+# good older one for no reason.
+#
+# Jinja2 turns `alloc_tree/templates/page.html.j2` into the page.  It is here
+# instead of string concatenation for one reason above the rest: it escapes by
+# default.  This page is fed function names straight out of a symbol table, and
+# one carrying a `<` would close a tag and swallow the rest of the row -- which
+# does not look like an error, it looks like a shorter report.
+#
+# 3.0 is where the current API settled; nothing here needs anything newer.
+# It brings MarkupSafe with it, which is what marks the stylesheet, the script
+# and the JSON as the three things that must NOT be escaped.
+jinja2>=3.0

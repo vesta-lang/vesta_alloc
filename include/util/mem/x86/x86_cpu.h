@@ -7,8 +7,22 @@
 
 /**
  * @file util/mem/x86/x86_cpu.h
- * @brief Que sabe hacer la CPU en la que estamos corriendo.
+ * @brief
+ * \~english What the CPU we are running on can do.
+ * \~spanish Que sabe hacer la CPU en la que estamos corriendo.
+ * \~
  *
+ * \~english
+ * This is what separates "the path is COMPILED" from "the path is USED".  The
+ * AVX2 functions are always compiled on x86-64 -- with per-function @c target,
+ * so the binary does not require AVX2 to start -- and who decides whether they
+ * get called is this, at run time.
+ *
+ * Every new capability (AVX-512, fast @c rep @c movsb...) adds its question
+ * here, and NOT in the copy's code: that way the dispatcher stays a list of
+ * branches and the routines know nothing about detection.
+ *
+ * \~spanish
  * Esto es lo que separa "el camino esta COMPILADO" de "el camino se USA".  Las
  * funciones de AVX2 se compilan siempre en x86-64 -- con @c target por funcion,
  * asi que el binario no exige AVX2 para arrancar --, y quien decide si se
@@ -17,6 +31,8 @@
  * Cada capacidad nueva (AVX-512, @c rep @c movsb rapido...) anade aqui su
  * pregunta, y NO en el codigo de la copia: asi el despachador sigue siendo una
  * lista de ramas y las rutinas no saben nada de deteccion.
+ *
+ * \~
  */
 #ifndef VESTA_UTIL_MEM_X86_CPU_H
 #define VESTA_UTIL_MEM_X86_CPU_H
@@ -31,24 +47,72 @@
 
 /* Una bandera por capacidad.  Anadir una es anadir su bit aqui y su linea en
  * `vesta_mem_x86_detect`, sin tocar nada mas: ni las rutinas ni el despacho. */
-#define VESTA_MEM_X86_READY (1u << 0) ///< ya se ha preguntado
-#define VESTA_MEM_X86_AVX2 (1u << 1)  ///< movimientos de 32 bytes
-#define VESTA_MEM_X86_ERMS (1u << 2)  ///< `rep movsb`/`rep stosb` RAPIDOS
+/// \~english it has been asked already  \~spanish ya se ha preguntado  \~
+#define VESTA_MEM_X86_READY (1u << 0)
+/// \~english 32-byte moves  \~spanish movimientos de 32 bytes  \~
+#define VESTA_MEM_X86_AVX2 (1u << 1)
+/// \~english FAST `rep movsb`/`rep stosb`
+/// \~spanish `rep movsb`/`rep stosb` RAPIDOS  \~
+#define VESTA_MEM_X86_ERMS (1u << 2)
 
 /**
- * @brief Lo que sabe hacer esta CPU.  Cero mientras no se haya preguntado.
+ * @brief
+ * \~english What this CPU can do.  Zero while it has not been asked.
+ * \~spanish Lo que sabe hacer esta CPU.  Cero mientras no se haya preguntado.
+ * \~
  *
+ * \~english
+ * It is @c static, that is, one copy per translation unit.  It sounds wasteful
+ * and it is not: four bytes and one more query per unit, in exchange for the
+ * header needing no global symbol -- which is what lets it work in C, where
+ * there are no @c inline variables.
+ *
+ * \~spanish
  * Es @c static, o sea una copia por unidad de traduccion.  Suena a desperdicio
  * y no lo es: son cuatro bytes y una consulta mas por unidad, a cambio de que
  * la cabecera no necesite ningun simbolo global -- que es lo que la deja valer
  * en C, donde no hay variables @c inline.
+ *
+ * \~
  */
 static unsigned int vesta_mem_x86_features_state = 0;
 
 /**
- * @brief Pregunta a la CPU con @c CPUID por todo lo que aqui se usa.  Se hace
- *        una vez; el resultado no cambia.
+ * @brief
+ * \~english Asks the CPU with @c CPUID about everything used here.  It is done
+ *          once; the answer does not change.
+ * \~spanish Pregunta a la CPU con @c CPUID por todo lo que aqui se usa.  Se
+ *          hace una vez; el resultado no cambia.
+ * \~
  *
+ * \~english
+ * WHY @c CPUID BY HAND AND NOT @c __builtin_cpu_supports.  Because the builtin
+ * is not code, it is a CALL into the compiler's support library: it leaves
+ * @c __cpu_model and @c __cpu_indicator_init unresolved, which libgcc provides.
+ * That breaks the two things this library promises -- working without a system
+ * library, and compiling with any compiler: with Clang targeting MSVC that
+ * symbol does not exist and the LINK FAILS, checked.  @c CPUID depends on
+ * nobody.
+ *
+ * AND THE CHECK THAT CANNOT BE SKIPPED is the operating system's, not the
+ * CPU's.  The processor having AVX2 is not enough: the system has to be SAVING
+ * the wide registers on a task switch, and that is asked with @c XGETBV.  If
+ * AVX2 is used where the system does not save YMM, what gets corrupted is
+ * another thread's registers -- a failure that does not look like a failure and
+ * that shows up somewhere else entirely.  The builtin did this check inside; on
+ * removing it, it has to be done here.
+ *
+ * The state is kept with the COMPILER's atomics (@c __atomic_store_n) and not
+ * with `<atomic>`, because this header is also compiled by a C compiler -- and
+ * along the way it does not drag a C++ header into a path that wants to be
+ * freestanding.
+ *
+ * @par Threads
+ * Safe.  Two threads arriving at once both ask and both write the SAME thing,
+ * so the race cannot give an incorrect result and nothing else has to be
+ * synchronised.
+ *
+ * \~spanish
  * POR QUE @c CPUID A MANO Y NO @c __builtin_cpu_supports.  Porque el builtin no
  * es codigo, es una LLAMADA a la biblioteca de soporte del compilador: deja
  * @c __cpu_model y @c __cpu_indicator_init sin resolver, que los pone libgcc.
@@ -66,20 +130,32 @@ static unsigned int vesta_mem_x86_features_state = 0;
  * dentro; al quitarlo hay que hacerla aqui.
  *
  * El estado se guarda con los atomicos del COMPILADOR (@c __atomic_store_n) y
- * no con @c <atomic>, porque esta cabecera la compila tambien un compilador de
+ * no con `<atomic>`, porque esta cabecera la compila tambien un compilador de
  * C -- y de paso no arrastra una cabecera de C++ a un camino que quiere ser
  * freestanding.
- *
- * @return Las banderas @c VESTA_MEM_X86_*, siempre con @c READY puesto.
  *
  * @par Hilos
  * Segura.  Dos hilos que lleguen a la vez preguntan los dos y escriben lo
  * MISMO, asi que la carrera no puede dar un resultado incorrecto y no hace
  * falta sincronizar nada mas.
  *
+ * \~
+ * @return
+ * \~english the @c VESTA_MEM_X86_* flags, always with @c READY set.
+ * \~spanish las banderas @c VESTA_MEM_X86_*, siempre con @c READY puesto.
+ * \~
+ *
+ * \~english
+ * @code
+ *   const unsigned int f = vesta_mem_x86_detect();   // forces the query
+ * @endcode
+ *
+ * \~spanish
  * @code
  *   const unsigned int f = vesta_mem_x86_detect();   // fuerza la consulta
  * @endcode
+ *
+ * \~
  */
 VESTA_MEM_INLINE unsigned int vesta_mem_x86_detect(void) VESTA_MEM_NOEXCEPT {
     unsigned int f = VESTA_MEM_X86_READY;
@@ -112,17 +188,38 @@ VESTA_MEM_INLINE unsigned int vesta_mem_x86_detect(void) VESTA_MEM_NOEXCEPT {
 }
 
 /**
- * @brief Lo mismo por el camino caliente: una lectura relajada y una rama que
- *        acierta siempre menos la primera vez.
+ * @brief
+ * \~english The same thing on the hot path: one relaxed load and one branch
+ *          that is right every time but the first.
+ * \~spanish Lo mismo por el camino caliente: una lectura relajada y una rama
+ *          que acierta siempre menos la primera vez.
+ * \~
  *
- * @return Las banderas @c VESTA_MEM_X86_*.
+ * \~english
+ * @par Threads
+ * Safe.
  *
+ * \~spanish
  * @par Hilos
  * Segura.
  *
+ * \~
+ * @return
+ * \~english the @c VESTA_MEM_X86_* flags.
+ * \~spanish las banderas @c VESTA_MEM_X86_*.
+ * \~
+ *
+ * \~english
  * @code
  *   if (vesta_mem_x86_features() & VESTA_MEM_X86_AVX2) { ... }
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (vesta_mem_x86_features() & VESTA_MEM_X86_AVX2) { ... }
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE unsigned int
 vesta_mem_x86_features(void) VESTA_MEM_NOEXCEPT {
@@ -133,16 +230,36 @@ vesta_mem_x86_features(void) VESTA_MEM_NOEXCEPT {
 }
 
 /**
- * @brief Se pueden usar los movimientos de 32 bytes?
+ * @brief
+ * \~english Can the 32-byte moves be used?
+ * \~spanish Se pueden usar los movimientos de 32 bytes?
+ * \~
  *
- * @return distinto de 0 si la CPU tiene AVX2 y el sistema lo respalda.
+ * \~english
+ * @par Threads
+ * Safe.
  *
+ * \~spanish
  * @par Hilos
  * Segura.
  *
+ * \~
+ * @return
+ * \~english other than 0 when the CPU has AVX2 and the system backs it.
+ * \~spanish distinto de 0 si la CPU tiene AVX2 y el sistema lo respalda.
+ * \~
+ *
+ * \~english
  * @code
  *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_copy(d, s, n);
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (vesta_mem_x86_has_avx2()) vesta_mem_avx2_copy(d, s, n);
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE int vesta_mem_x86_has_avx2(void) VESTA_MEM_NOEXCEPT {
 #if defined(VESTA_MEM_TARGET_AVX2)
@@ -156,21 +273,46 @@ VESTA_MEM_ALWAYS_INLINE int vesta_mem_x86_has_avx2(void) VESTA_MEM_NOEXCEPT {
 }
 
 /**
- * @brief Es rapido el @c rep @c movsb de esta CPU?
+ * @brief
+ * \~english Is this CPU's @c rep @c movsb fast?
+ * \~spanish Es rapido el @c rep @c movsb de esta CPU?
+ * \~
  *
+ * \~english
+ * The question matters because @c rep @c movsb has existed since the 8086 and
+ * on old machines it is SLOW -- it runs byte by byte.  From ERMS on, the
+ * microcode turns it into the fastest loop the CPU knows how to do, one that
+ * also knows its own widths and its own cache hierarchy.
+ *
+ * @par Threads
+ * Safe.
+ *
+ * \~spanish
  * La pregunta importa porque @c rep @c movsb existe desde el 8086 y en las
  * maquinas viejas es LENTO -- se ejecuta byte a byte --.  A partir de ERMS el
  * microcodigo lo convierte en el bucle mas rapido que la CPU sabe hacer, que
  * ademas conoce sus propios anchos y su propia jerarquia de cache.
  *
- * @return distinto de 0 si @c rep @c movsb esta acelerado.
- *
  * @par Hilos
  * Segura.
  *
+ * \~
+ * @return
+ * \~english other than 0 when @c rep @c movsb is accelerated.
+ * \~spanish distinto de 0 si @c rep @c movsb esta acelerado.
+ * \~
+ *
+ * \~english
  * @code
  *   if (vesta_mem_x86_has_erms()) vesta_mem_erms_copy(d, s, n);
  * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (vesta_mem_x86_has_erms()) vesta_mem_erms_copy(d, s, n);
+ * @endcode
+ *
+ * \~
  */
 VESTA_MEM_ALWAYS_INLINE int vesta_mem_x86_has_erms(void) VESTA_MEM_NOEXCEPT {
 #if defined(VESTA_MEM_TARGET_ERMS)

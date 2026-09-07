@@ -37,8 +37,8 @@
  *     proyecto persigue, asi que se comprueba con nombres y direcciones.
  */
 
-#include "util/host_allocator.h"
-#include "util/host_allocator_layout.h"
+#include "util/alloc/host_allocator.h"
+#include "util/alloc/host_allocator_layout.h"
 
 #include <atomic>
 #include <cstdint>
@@ -397,7 +397,7 @@ void check_coalescing() {
 int main(int argc, char **argv) {
     std::printf("== el camino de tramos con varios hilos ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  asignador apagado (VESTA_NO_HOST_SLAB): nada que probar\n");
+        std::printf("  el asignador no esta en vigor: nada que probar\n");
         return 0;
     }
 

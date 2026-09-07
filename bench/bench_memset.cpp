@@ -34,7 +34,7 @@
  * C library is most likely to have a special path for.
  */
 
-#include "util/vesta_memset.h"
+#include "util/mem/vesta_memset.h"
 
 #include "affinity.h"
 #include "chart.h"

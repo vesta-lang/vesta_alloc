@@ -23,6 +23,33 @@ CTestTestfile.cmake
 Testing/
 compile_commands.json
 
+# Python -- lo genera la herramienta de `tools/`, y son artefactos: el
+# bytecode compilado se reconstruye solo, y un entorno virtual es de la
+# maquina de quien lo creo, no del proyecto.
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Lo que exporta el asignador y lo que la herramienta hace con ello.  Son
+# MEDICIONES de una corrida concreta: no se pueden reproducir desde el
+# repositorio y no dicen nada fuera de la maquina donde salieron.
+sites.csv
+frames.csv
+summary.csv
+sizes.csv
+tags.csv
+alloc_tree.html
+
 # Editores
 .vscode/
 .idea/
+
+# La referencia generada con Doxygen: se genera, no se versiona.
+doc/out/

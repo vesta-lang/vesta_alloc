@@ -28,8 +28,8 @@
  * are the actual incantations for four libraries you are likely to have.
  */
 
-#include "util/host_allocator_c.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/host_allocator_c.h"
+#include "util/mem/vesta_memset.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -25,8 +25,8 @@
  *     `InPoolTaskScope` en `src/ir/parallel_for.cpp`.
  */
 
-#include "util/alloc_tag.h"
-#include "util/host_allocator.h"
+#include "util/alloc/alloc_tag.h"
+#include "util/alloc/host_allocator.h"
 
 #include <cstdio>
 #include <thread>
@@ -70,7 +70,7 @@ const util::AllocTag kUnknown{};
 int main() {
     std::printf("== etiqueta de reservas ==\n");
     if (!util::host_alloc_active()) {
-        std::printf("  asignador apagado (VESTA_NO_HOST_SLAB): no hay nada que "
+        std::printf("  el asignador no esta en vigor: no hay nada que "
                     "comprobar\n");
         return 0;
     }
@@ -145,8 +145,43 @@ int main() {
         }
         check(delta(base, kLong) >= 20,
               "pasandola a mano, el hilo cuenta donde toca");
-        check(delta(base, kUnknown) == 0,
-              "y entonces NO se cuela ninguna en \"no se\"");
+
+        /* Aqui habia un `== 0`, y era cierto MIENTRAS `malloc` no fuera
+         * nuestro.  Desde que las entradas de C tambien pasan por aqui, crear
+         * un hilo deja UNA reserva sin etiquetar: la primera del hilo NUEVO,
+         * hecha por el runtime de hilos antes de que corra una linea nuestra.
+         * Nadie podia declararla -- no es deuda que migrar, es codigo ajeno --
+         * y con `VESTA_HOST_ALLOC_SITES` se ve de quien es, que es la unica
+         * pregunta que esa reserva puede contestar.
+         *
+         * Asi que lo que se vigila ya no es un numero, que dependeria de la
+         * implementacion de hilos de cada sistema, sino que ese resto sea
+         * CONSTANTE por hilo.  Es una comprobacion mas fuerte que la de antes:
+         * si creciera con el trabajo, la etiqueta heredada no estaria
+         * funcionando, que es justo lo que este caso existe para vigilar. */
+        const uint64_t leak_small = delta(base, kUnknown);
+
+        const util::HostAllocStats base2 = util::host_alloc_stats();
+        {
+            const util::AllocScope scope{kLong};
+            const util::AllocTag parent_tag = util::AllocScope::current();
+            std::thread t([parent_tag] {
+                const util::AllocScope inherited{parent_tag};
+                // Tres tandas y no `allocate_some(192)`: el ayudante TOPA en
+                // 64 (guarda los punteros en un array de ese tamano), asi que
+                // pedirle mas no reserva mas y la comprobacion de abajo se
+                // cumpliria sola sin comprobar nada.
+                allocate_some(64);
+                allocate_some(64);
+                allocate_some(64);
+            });
+            t.join();
+        }
+        check(delta(base2, kLong) >= 192,
+              "con casi diez veces mas trabajo, cuenta casi diez veces mas");
+        check(delta(base2, kUnknown) <= leak_small,
+              "y lo que queda sin etiquetar NO crece con el trabajo: es el "
+              "arranque del hilo, no lo que la tarea reserva");
     }
 
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);

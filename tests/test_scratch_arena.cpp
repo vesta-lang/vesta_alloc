@@ -14,8 +14,8 @@
  * arena no reaprovechara sus bloques, pediria memoria sin parar y el programa
  * se comeria la maquina en vez de ir mas rapido.
  */
-#include "util/scratch_arena.h"
-#include "util/vesta_memset.h"
+#include "util/alloc/scratch_arena.h"
+#include "util/mem/vesta_memset.h"
 
 #include <atomic>
 #include <chrono>

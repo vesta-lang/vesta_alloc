@@ -1,0 +1,79 @@
+===== size profile: small, 24 threads, median of 5 =====
+== the allocator with many threads at once ==
+
+Each thread keeps 512 blocks alive and replaces one at random,
+and one free in forty is handed to another thread -- the only
+place where threads can contend.
+
+Size profile: small -- a compiler's shape; never reaches a span.
+
+200000 steps per thread, median of 5 (plus a warm-up)
+
+  all cores  24 threads, 4800000 operations a round
+      shared       4.9 ms    1.14 ns/op   14.19 ns/op/core   slow/fast  2.2x   +-34.0%
+      per-thread     4.6 ms    1.16 ns/op   13.99 ns/op/core   slow/fast  2.3x   +-36.0%
+      new          5.3 ms    1.29 ns/op   15.25 ns/op/core   slow/fast  2.4x   +-50.4%
+      malloc      12.0 ms    2.90 ns/op   45.01 ns/op/core   slow/fast  2.3x   +-27.9%
+      ratio      3.17x
+
+  freed by another thread: 2.47% (3918585 of 158402192) -- the shape being imitated is 2.5%
+  largest span the POOL can serve before trimming    0.0 MiB
+  largest span the POOL can serve after trimming    8.0 MiB
+    (14.5 MiB were parked out of reach of coalescing)
+
+  committed by this run: 110.2 MiB (4.6 MiB per thread), over a region of 262144 MiB
+  spans (over kMaxSmall = 16384 B): 0 of 158402194 allocations, 0.00%
+    ...so the span lock was NOT measured here.  Run with a profile that crosses it: `mixed` or `large`.
+
+===== size profile: mixed, 24 threads, median of 5 =====
+== the allocator with many threads at once ==
+
+Each thread keeps 176 blocks alive and replaces one at random,
+and one free in forty is handed to another thread -- the only
+place where threads can contend.
+
+Size profile: mixed -- small change plus real buffers.
+
+200000 steps per thread, median of 5 (plus a warm-up)
+
+  all cores  24 threads, 4800000 operations a round
+      shared      20.2 ms    4.36 ns/op   82.76 ns/op/core   slow/fast  1.9x   +-11.4%
+      per-thread    20.4 ms    4.51 ns/op   87.38 ns/op/core   slow/fast  2.1x   +-18.5%
+      new         20.1 ms    4.64 ns/op   85.64 ns/op/core   slow/fast  2.3x   +-14.5%
+      malloc      50.5 ms   12.04 ns/op  195.03 ns/op/core   slow/fast  2.5x   +-40.2%
+      ratio      2.36x
+
+  freed by another thread: 2.49% (3629898 of 145794773) -- the shape being imitated is 2.5%
+  largest span the POOL can serve before trimming    8.0 MiB
+  largest span the POOL can serve after trimming    8.0 MiB
+    (114.4 MiB were parked out of reach of coalescing)
+
+  committed by this run: 622.2 MiB (25.9 MiB per thread), over a region of 262144 MiB
+  spans (over kMaxSmall = 16384 B): 12607419 of 158402194 allocations, 7.96%
+
+===== size profile: large, 24 threads, median of 5 =====
+== the allocator with many threads at once ==
+
+Each thread keeps 8 blocks alive and replaces one at random,
+and one free in forty is handed to another thread -- the only
+place where threads can contend.
+
+Size profile: large -- dominated by spans.
+
+200000 steps per thread, median of 5 (plus a warm-up)
+
+  all cores  24 threads, 4800000 operations a round
+      shared     229.3 ms   49.80 ns/op  1034.69 ns/op/core   slow/fast  1.5x   +-6.8%
+      per-thread   239.2 ms   51.45 ns/op  1083.69 ns/op/core   slow/fast  1.5x   +-5.1%
+      new        231.2 ms   49.29 ns/op  1012.74 ns/op/core   slow/fast  1.6x   +-7.2%
+      malloc    2701.0 ms   671.50 ns/op  8947.61 ns/op/core   slow/fast 30.3x   +-65.3%
+      ratio      8.65x
+
+  freed by another thread: 2.49% (801900 of 32140925) -- the shape being imitated is 2.5%
+  largest span the POOL can serve before trimming    8.0 MiB
+  largest span the POOL can serve after trimming    8.0 MiB
+    (3655.6 MiB were parked out of reach of coalescing)
+
+  committed by this run: 14704.6 MiB (612.7 MiB per thread), over a region of 262144 MiB
+  spans (over kMaxSmall = 16384 B): 126261267 of 158402194 allocations, 79.71%
+

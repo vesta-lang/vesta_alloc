@@ -56,7 +56,7 @@
  * delete the thing being measured -- which it will, given the chance.
  */
 
-#include "util/vesta_memcpy.h"
+#include "util/mem/vesta_memcpy.h"
 
 #include "affinity.h"
 #include "chart.h"

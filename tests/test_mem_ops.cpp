@@ -36,8 +36,8 @@
  *     es constante.  Sin esto, en una maquina con AVX2 no las mira nadie.
  */
 
-#include "util/vesta_memcpy.h"
-#include "util/vesta_memset.h"
+#include "util/mem/vesta_memcpy.h"
+#include "util/mem/vesta_memset.h"
 
 #include <cstdio>
 #include <cstring>

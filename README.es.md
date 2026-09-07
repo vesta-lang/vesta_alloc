@@ -2,156 +2,50 @@
 
 *[English version](README.md)*
 
-Un asignador de memoria del anfitrion: listas libres por clase de tamano y por
-hilo, reservas grandes servidas por tramos, una arena de golpe para el trabajo
-de una fase, y un mecanismo de etiquetas para averiguar **para que** reserva de
-verdad un programa.
+Un asignador de memoria del anfitrion para C y C++: listas de libres por clase
+de tamano y por hilo, reservas grandes servidas con tramos, una arena de golpe
+para trabajo acotado a una fase, y un mecanismo de etiquetas que contesta *para
+que* esta reservando un programa.
 
-Escrito para el compilador de VestaVM, donde `malloc` y `free` eran el **18,5%
-del tiempo de compilar** y estaban repartidos por todos los sitios de llamada --
-el mayor de ellos era el 8,7% de esa cifra, asi que ningun arreglo puntual los
-movia --.  Cambiar el asignador los mueve todos a la vez.
+Reemplaza `operator new` y `operator delete` globales y, si se le pide,
+`malloc` y su familia tambien, de forma que el codigo de terceros que uno no
+escribio ni puede recompilar reserve tambien de aqui.
 
-No depende de nada mas que del sistema operativo.  Ni de bibliotecas de
-terceros, ni de ninguna parte del compilador del que salio.
+No depende de nada mas que del sistema operativo: ni de librerias de terceros,
+ni de ninguna parte del proyecto para el que se escribio.
 
-```
-     este asignador      3,2 ns/op
-     malloc del sistema 45,4 ns/op          ~14x, medido por tests/test_host_allocator
-```
+> **Estado.** En desarrollo. Las interfaces de abajo funcionan y tienen
+> pruebas, pero todavia no ha habido una version estable: los nombres pueden
+> cambiar, y no se publican cifras de rendimiento porque describirian un blanco
+> movil. `bench/` las reproduce en tu maquina, que es el unico sitio donde
+> significan algo.
 
-## Que hay aqui
-
-| | |
-| :--- | :--- |
-| `include/util/host_allocator.h` | El asignador.  Reemplaza `operator new`/`delete` globales. |
-| `include/util/host_allocator_c.h` | Lo mismo con enlace C, para librerias en C y sus ganchos de asignador. |
-| `include/util/host_allocator_layout.h` | La geometria: region, trozos, clases de tamano.  La comparten todos los de abajo. |
-| `include/util/alloc_tag.h` | Etiqueta de proposito con dos ejes (vida x fijo-o-creciente). |
-| `include/util/scratch_arena.h` | Arena de golpe para memoria que muere junta. |
-| `include/util/os_memory.h` | El unico sitio que habla de memoria con el sistema.  Apalabrar y entregar van por separado. |
-| `include/util/thread_slot.h` | Un puntero por hilo que NO pasa por la TLS emulada. |
-| `include/util/vesta_memcpy.h` | Copiar (y mover con solape) sin llamar a la biblioteca C. |
-| `include/util/vesta_memset.h` | Rellenar, igual. |
-| `include/util/mem/` | Las implementaciones: **una carpeta por arquitectura, un fichero por micro-ISA**.  Ver abajo. |
-
-### Las primitivas de memoria
-
-`memcpy` y `memset` no se le piden a la biblioteca C.  La razon de peso es que
-eran los **dos ultimos simbolos** que quedaban sin resolver: sin ellos, el
-asignador funciona donde no hay libc.  La segunda es el tamano pequeno, que en
-un asignador es el caso comun: por debajo de 16 bytes esto no llama a nadie
--- bloques solapados, sin bucle -- y ahi gana entre 2x y 4,5x.
-
-Estan repartidas asi, y el reparto es el punto: **anadir NEON es crear
-`mem/arm/` y una rama en el despachador**, sin tocar nada de x86.
-
-```
-util/vesta_memcpy.h          <- lo unico que se incluye desde fuera
-util/vesta_memset.h
-util/mem/mem_config.h        que hay compilado, y por que
-util/mem/mem_inline.h        menos de 16 bytes: sin ISA, sin bucle, sin llamada
-util/mem/x86/x86_vec.h       tipos vectoriales
-util/mem/x86/x86_cpuid.h     CPUID y XGETBV, envueltas y nada mas
-util/mem/x86/x86_cpu.h       que sabe hacer esta CPU (interpreta lo anterior)
-util/mem/x86/sse2_memcpy.h   camino base, el unico que se puede meter en linea
-util/mem/x86/sse2_memset.h
-util/mem/x86/avx2_memcpy.h   solo si la CPU lo admite
-util/mem/x86/avx2_memset.h
-util/mem/x86/erms_memcpy.h   `rep movsb`: lo resuelve el microcodigo
-util/mem/x86/erms_memset.h
-util/mem/generic/scalar_*.h  donde todavia no hay carpeta propia
-```
-
-El despacho va de mas barato a mas caro:
-
-| tamano | que hace |
-| :--- | :--- |
-| < 16 B | bloques solapados: sin bucle, sin llamada |
-| 16 - 128 B | hasta ocho movimientos direccionados desde los dos extremos, **sin bucle** |
-| 128 B - 2 KiB | bucle vectorial, **con el destino alineado antes de entrar** |
-| > 2 KiB | `rep movsb` / `rep stosb`, que lo resuelve el microcodigo |
-
-**Los umbrales salen de medir**, y cada uno lleva su tabla en el fichero donde
-vive; no se copiaron de nadie.
-
-Dos de esas decisiones no salieron de un banco sino de **desensamblar glibc**, y
-valen la pena por separado: que hasta 128 bytes no haya bucle, y que el bucle
-alinee el destino antes de empezar.  Lo segundo es lo que mas pesa -- una
-escritura sin alinear que cruza linea de cache se parte en dos, y en un bucle
-eso se paga cada vuelta --: en una copia de 1 KiB son 9,6 ns contra 5,2.
-
-Hay **dos entradas por operacion**, y la diferencia es si puede haber una
-llamada:
-
-| | |
-| :--- | :--- |
-| `vesta_memcpy` / `vesta_memset` | Despachan por CPU.  Con AVX2 en la maquina pagan una llamada, que a partir de 32 bytes sale a cuenta. |
-| `vesta_memcpy_inline` / `vesta_memset_inline` | **No llaman a nadie, nunca.**  Se quedan en el camino base -- una funcion con `target("avx2")` no se puede meter en linea en otra que no lo lleve -- y con tamano constante lo expande el compilador. |
-| `vesta_memcpy_noinline` / `vesta_memset_noinline` | Una llamada y ya.  Con tamanos grandes la expansion en linea son cientos de instrucciones EN CADA SITIO; aqui el sitio de llamada es minimo.  Estan para poder elegir, no para sustituir. |
-
-### Y en C++, la version con TIPO
+## Empezar
 
 ```cpp
-util::vesta_memcopy(&destino, &origen);       // UN objeto
-util::vesta_memcopy(v_dst, v_src, cuantos);   // `cuantos` OBJETOS
-util::vesta_memfill(&cabecera, 0);
+#include "util/alloc/host_allocator.h"
+
+int main() {
+    // No hay nada que inicializar: `new` y `delete` ya vienen aqui.
+    auto *p = new int[1024];
+    delete[] p;
+
+    // O la interfaz explicita, que tambien puede usar C.
+    void *raw = util::host_alloc(64);
+    util::host_free(raw);
+}
 ```
 
-`memcpy`/`memset` cuentan **bytes**; `memcopy`/`memfill` cuentan **objetos**.
-Los nombres son distintos a proposito: con el mismo nombre, la deduccion de
-plantilla elegiria la version con tipo sin que nadie lo escriba y el tercer
-argumento cambiaria de unidad en silencio.
+Desde C:
 
-Lo que gana con saber el tipo: `sizeof(T)` hace constante el tamano y
-`alignof(T)` **quita el prologo que alinea el destino**.  Ese prologo calcula un
-desplazamiento en ejecucion, y eso convierte un tamano constante en variable, con
-lo que el bucle deja de desenrollarse.  Desensamblado, un relleno de 256 bytes
-pasa de 66 instrucciones con 4 ramas a **19 en linea recta**.
+```c
+#include "util/alloc/host_allocator_c.h"
 
-Y esto **no se afirma con un cronometro sino con el desensamblado**, porque un
-banco tiene ruido y el codigo emitido no.  Instrucciones y ramas de la misma
-operacion, con el MISMO numero de bytes, en las dos secciones de
-`tests`/`validate`:
+void *p = vesta_host_alloc(64);
+vesta_host_free(p);
+```
 
-| | GCC: C -> C++ | Clang: C -> C++ |
-| :--- | :--- | :--- |
-| relleno de 256 B | 94/12 ramas -> **12/1** | 49/9 -> **12/1** |
-| copia de 256 B | 92/9 -> **17/1** | 63/9 -> **16/1** |
-| relleno de 4 KiB | 204/38 -> **123/26** | 137/18 -> **97/10** |
-| copia de 1 KiB | 141/24 -> **65/14** | 108/14 -> **58/6** |
-| por debajo de 256 B | identico | identico |
-| tipo sin alineacion declarada | **identico** | **identico** |
-
-Las tres condiciones se cumplen en los dos compiladores: nunca emite mas, de
-256 en adelante emite bastante menos, y cuando el tipo no promete nada sale
-**exactamente el mismo codigo** -- el envoltorio no anade nada, que era el
-requisito.
-
-Por debajo de 256 las dos son identicas porque la cascada ya se plegaba sola:
-no habia nada que ganar, y eso es un resultado, no una decepcion.
-
-**Una trampa que costo encontrar**: un tipo sobrealineado NO puede tener un
-tamano que no sea multiplo de su alineacion -- `sizeof` se redondea hacia
-arriba, asi que un `alignas(32)` de 50 bytes mide 64 --.  Comparar "50 bytes por
-C contra un tipo de 50 declarado" es comparar 50 contra 64, y eso no mide nada.
-
-**Son cabeceras de C**, no de C++.  Para que una dependencia en C no pague una
-llamada, su compilador tiene que ver el cuerpo; una capa en C++ con envoltorio
-en C daria justo el coste que se esta quitando.  En C++ estan ademas como
-`util::vesta_memcpy` y companyia.  `examples/c_mem_ops.c` se compila **como C**
-y es lo que comprueba que siga siendo cierto.
-
-Lo que cuesta cada camino, medido contra la libc: `bench_memcpy` y
-`bench_memset`.  Las medidas NO se copian a este documento -- una tabla de
-nanosegundos aqui no dice en que maquina, en que nucleo ni con que compilador
-salio, y esas tres cosas la mueven mas que el propio codigo --: viven en
-[`bench/baseline/`](bench/baseline/), una tanda por compilador, con la ficha de
-la CPU al lado.  Ahi esta tambien lo que sigue MAL: siete filas donde la version
-con tipo pierde contra la de C, que por como esta construida no deberia poder
-pasar.
-
-## Construir
+## Instalar
 
 Como parte de otro proyecto CMake:
 
@@ -160,173 +54,328 @@ add_subdirectory(ruta/a/vesta_alloc)
 target_link_libraries(tu_objetivo PRIVATE vesta_alloc)
 ```
 
-Por su cuenta:
+Suelto:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build          # 5 binarios de prueba
-./build/vesta_alloc_bench_allocator          # este asignador contra el del sistema
-./build/vesta_alloc_bench_reserve_cost       # que cuesta apalabrar direcciones aqui
+ctest --test-dir build
 ```
 
-Construido solo genera `libvesta_alloc.a`, las pruebas, tres ejemplos y dos
-bancos.  Con `-DVESTA_ALLOC_BUILD_SHARED=ON` sale tambien la biblioteca
-dinamica; antes de usarla, leer el aviso de abajo.
+Construido suelto genera ademas `libvesta_alloc.a`, los ejemplos y los bancos
+de medida. `-DVESTA_ALLOC_BUILD_SHARED=ON` anade la libreria dinamica; lee las
+dos notas de abajo antes de usar cualquiera de las dos.
 
-## Lo unico que te va a morder
+### Enlazar el archivo estatico
 
-**Esta biblioteca reemplaza `operator new` y `operator delete` globales.**  De
-un archivo estatico (`.a`, `.lib`) el enlazador solo saca los objetos que
-alguien referencia POR SU NOMBRE, y a `operator new` no lo nombra nadie: la
-llamada la genera el compilador.  Asi que el objeto que lo define no se extrae,
-tu programa se queda con el asignador del sistema, y **no falla nada**.  Sale un
-binario que funciona y va mas lento, que es el peor modo de fallo posible.
+**Lee esta.** De un archivo estatico el enlazador solo saca los objetos que
+alguien referencia *por su nombre*, y nadie referencia `operator new` por su
+nombre: la llamada la genera el compilador. El objeto que lo define no se
+extrae, el programa se queda en silencio con el asignador del sistema y **no
+falla nada**: sale un binario que funciona y va mas lento, que es el peor modo
+de fallo que hay.
 
-Por eso el objetivo por defecto es una **biblioteca de objetos**, que entran
-siempre.  Si enlazas el archivo estatico, hay que forzarlo:
+Por eso el objetivo por defecto es una **libreria de objetos**, cuyos objetos
+entran siempre. Si enlazas el archivo, forzalo:
 
-```
-GNU ld / lld    -Wl,--whole-archive libvesta_alloc.a -Wl,--no-whole-archive
-MSVC            /WHOLEARCHIVE:vesta_alloc.lib
-Apple ld        -force_load libvesta_alloc.a
-```
+| herramientas | bandera |
+| :--- | :--- |
+| GNU ld, lld | `-Wl,--whole-archive libvesta_alloc.a -Wl,--no-whole-archive` |
+| MSVC | `/WHOLEARCHIVE:vesta_alloc.lib` |
+| Apple ld | `-force_load libvesta_alloc.a` |
 
-Para comprobar que de verdad entro: `util::host_alloc_active()`, o ejecutar con
-`VESTA_HOST_ALLOC_STATS=1` y mirar si el resumen del final cuenta alguna
+Para confirmar que surtio efecto, llama a `util::host_alloc_active()`, o ejecuta
+con `VESTA_HOST_ALLOC_STATS=1` y mira si el resumen de salida cuenta alguna
 reserva.
 
-**La biblioteca dinamica es otra cosa.**  Un ejecutable trae su propio
-`operator new` y no lo cede a una DLL o un `.so` que se cargue despues, asi que
-ahi el reemplazo no es fiable.  La interfaz en C (`vesta_host_alloc` y
-companyia) funciona igual en los dos casos.  Por eso la version dinamica esta
-apagada por defecto.
+### La libreria dinamica
 
-## Donde PIERDE, y por que
+Un ejecutable trae su propio `operator new` y no lo cede a una libreria cargada
+despues, asi que **el reemplazo no es fiable desde un objeto compartido**. La
+interfaz en C (`vesta_host_alloc` y companyia) funciona en los dos casos. Por
+eso la construccion dinamica viene apagada.
 
-Al ejecutar `vesta_alloc_bench_vs_malloc` salen filas marcadas
-`<- system wins`.  Estan ahi a proposito: un asignador que solo publica los
-casos que gana no esta diciendo nada.  En Linux contra glibc:
-
-| caso | nuestro | glibc | por que |
-| :--- | ---: | ---: | :--- |
-| `hot` de 1 MiB | ~14 ns | ~12 ns | Camino de tramos: un cerrojo y un recorrido de lista, contra el `mmap` cacheado de glibc. |
-| `churn` de 64 KiB | ~11 ns | ~10 ns | Lo mismo, y **cambia de signo entre corridas**: minutos antes marcaba 1,32x a favor y despues 0,91x en contra.  A ese tamano la medida tiene mas ruido que la diferencia. |
-| `calloc` de 64 KiB en adelante | ~430 ns / ~7 us | igual | Empate POR CONSTRUCCION: ahi el coste es materializar paginas, que es identico para los dos.  Ninguno puede ser mas rapido en eso. |
-
-Todo lo demas lo ganamos, entre 1,0x y 36x.  Tres cosas cerraron casi todo el
-hueco, y cada una esta explicada donde vive:
-
-- **Las clases de tamano llegan ya a 16 KiB.**  Se paraban en 2 KiB, asi que una
-  peticion de 4 KiB se llevaba un trozo entero de 64 KiB -- dieciseis veces el
-  desperdicio -- y pasaba por el camino de tramos, con cerrojo.  `hot` de 4 KiB
-  fue de 6,17 a 1,63 ns, y `churn` de 10,8 a 3,66, por un +6% de memoria.
-- **Los tramos se parten y se juntan.**  Con listas de ajuste exacto, un tramo de
-  diecisiete trozos no podia servir una peticion de uno, asi que un bufer que
-  crece consumia region nueva en cada vuelta.  `realloc` creciendo hasta 1 MiB
-  fue de 3.583 a 74 ns, y el pico de 144 a 21 MiB.
-- **La ranura por hilo lee el puntero de hilo con una instruccion.**  Antes
-  llamaba a `pthread_getspecific` en CADA reserva, y por eso los tamanos
-  pequenos perdian por 0,83-0,98x.
-
-En Windows el cuadro es otro: ganamos en todo entre 2x y 500x, porque el
-asignador de msvcrt es mucho mas flojo.  Las filas de arriba son un resultado de
-LINUX, y glibc es un rival duro.
-
-**Lo que NO es explicacion.**  Ninguno de esos casos es ruido de medida, y
-ninguno se arregla diciendo que el banco es injusto.  Dos de ellos son huecos de
-diseno de verdad, con arreglo conocido y escrito ahi arriba.
-
-## Seguridad entre hilos
-
-Cada funcion lleva una seccion `@par Hilos` que dice cual de las tres es, porque
-la distincion ES el diseno:
-
-- **Segura** -- se llama desde donde sea.
-- **Segura por particion** -- no sincroniza nada *porque* cada hilo solo toca lo
-  suyo.  `host_alloc` y `host_free` son de estas: el camino rapido no sincroniza
-  absolutamente nada.
-- **NO segura, a proposito** -- `pop_block`, `push_block` y todo lo de
-  `ScratchArena`.  Reservar son dos lecturas y una escritura; un cerrojo ahi
-  costaria mas que el trabajo que protege.  Quien llama garantiza la
-  exclusividad en su lugar.
-
-Liberar desde un hilo que no reservo esta plenamente soportado: el bloque va a
-una pila sin cerrojos del hilo que lo reservo, y ese se la lleva entera de un
-golpe la proxima vez que se quede sin bloques.
-
-## Variables de entorno
+## El asignador
 
 | | |
 | :--- | :--- |
-| `VESTA_NO_HOST_SLAB=1` | Apaga el asignador; todo va al del sistema.  Existe para que haya con que comparar -- sin eso no hay forma de saber si un asignador mejora algo. |
-| `VESTA_HOST_ALLOC_STATS=1` | Imprime un resumen al salir: cuentas, bytes comprometidos, reparto por tamano pedido y reparto por proposito. |
+| `util::host_alloc(n)` | Reservar. Los tamanos pequenos salen de una lista por hilo. |
+| `util::host_alloc_zeroed(n)` | Lo mismo, a cero, sin escribir memoria que el sistema ya puso a cero. |
+| `util::host_alloc_aligned(n, a)` | Sobre-alineada. Se suelta con `host_free_aligned`. |
+| `util::host_realloc(p, n)` | Crece en el sitio cuando la forma lo permite. |
+| `util::host_free(p)` | Soltar, desde cualquier hilo, incluido uno que no reservo. |
+| `util::host_usable_size(p)` | Cuanto del bloque se puede usar de verdad. |
+| `util::host_alloc_stats()` | Contadores: reservas, bytes, trozos, reparto por tamano. |
+
+Las peticiones de hasta unos pocos kibibytes salen de listas por hilo sin
+sincronizar nada. Las mayores vienen de tramos -- rachas de trozos seguidos que
+se parten y se juntan --, y por encima de eso del sistema operativo.
+
+Que un bloque sea nuestro se sabe con dos comparaciones contra los limites de
+la region: sin tablas, sin cerrojos y sin anadir nada al camino de liberar.
+
+`util::ScratchArena` es la otra forma: una arena de golpe para memoria que
+muere junta. No recicla, que es justamente por lo que es rapida, y esta
+documentada como insegura de compartir entre hilos a proposito -- quien la usa
+garantiza la exclusividad en vez de pagar un cerrojo en cada reserva.
 
 ## Etiquetas de proposito
 
-Una arena de golpe sirve una reserva cinco veces mas rapido que un asignador
-general, pero **solo** para las que mueren pronto y no crecen.  Equivocarse ahi
-sale caro y en silencio: meter un analisis de rangos en una arena -- donde las
-vidas encajaban perfectamente -- llevo el pico de memoria de 2.414 MB a 5.455 MB
-(**+126%**) a cambio de un 4% de velocidad, porque los contenedores que crecen
-abandonan su bufer viejo y una arena no reclama nada.
+Una arena sirve una reserva mucho mas barata que un asignador general, pero
+solo para reservas que mueren pronto y no crecen. Equivocarse ahi sale caro y
+callado: un contenedor que crece abandona sus buferes viejos, y una arena no
+recupera nada.
 
-Por eso la etiqueta tiene dos ejes, y el `0` significa *no se* en los dos:
+Asi que un proposito tiene dos ejes, y `0` significa *no se* en los dos:
 
 ```cpp
 util::AllocScope fase{{util::AllocUse::Medium, util::AllocShape::Growing}};
-// todo lo que reserve este hilo hasta que acabe el ambito se cuenta ahi,
-// incluidos los std::string y los std::vector, que no pueden declarar nada
+// todo lo que este hilo reserve hasta que acabe el ambito se cuenta ahi,
+// incluidos `std::string` y `std::vector`, que no pueden declarar nada
 ```
 
-Que el `0` sea "no se" no es decoracion: el estado por hilo es un POD puesto a
-cero al arrancar, asi que el valor por defecto no cuesta ninguna inicializacion
-**y** es honesto -- dice "no lo se" en vez de suponer --.  Lo que el informe
-saque como `unknown` es, literalmente, la lista de lo que falta por clasificar.
+Que lo desconocido sea el valor por defecto no es decoracion: el estado por
+hilo es un POD puesto a cero al arrancar, asi que no cuesta inicializacion, y
+ademas es honesto -- lo que el informe ensena como desconocido es, literalmente,
+lo que todavia no se ha clasificado.
 
-Un ambito vale para **su** hilo.  Si el trabajo se reparte, hay que leer la
-etiqueta en el hilo que reparte y volver a ponerla en el que trabaja;
+Un ambito vale para **su propio hilo**. Si el trabajo se reparte, hay que leer
+la etiqueta en el hilo que reparte y volver a ponerla en el trabajador;
 `examples/purpose_tags.cpp` ensena el patron.
 
-## Usarlo desde librerias en C
+## Reemplazar `malloc`
 
-Casi todas las librerias en C dejan cambiarles el asignador, y asi su memoria
-entra en los mismos contadores que la tuya:
+`operator new` esta reemplazado, asi que todo `new` del programa ya llega aqui.
+Las entradas en C no tenian nada equivalente, y ese hueco nunca fue solo de C:
+un `.cpp` que llama a `malloc` directamente se iba al sistema igual.
 
-```c
-cs_opt_mem mem = { vesta_host_alloc, vesta_host_calloc,
-                   vesta_host_realloc, vesta_host_free, vsnprintf };
-cs_option(handle, CS_OPT_MEM, (size_t)&mem);
+Asi que `malloc`, `calloc`, `realloc` y `free` se redirigen **al enlazar**, con
+`-Wl,--wrap=`, y las banderas viajan en el objetivo como `INTERFACE`: quien
+enlaza `vesta_alloc` las hereda sin tener que saber que existen. Del hecho de
+renombrar en el enlace FINAL, y no libreria a libreria, salen dos propiedades:
+
+- **Alcanza a todo objeto del enlace**, venga de donde venga. El codigo de
+  terceros que uno no escribio queda cubierto sin tocarle una linea y sin
+  comprobar si la version que uno tiene ofrece un gancho de asignador.
+- **El lenguaje de quien llama da igual.** Un `.c` y un `.cpp` que llaman a
+  `malloc` son la misma referencia pendiente cuando el enlazador los ve.
+
+Con un enlazador sin `--wrap` (el de Apple, el de Microsoft) se avisa al
+configurar, en vez de generar una linea de enlazado que falla por una opcion
+desconocida.
+
+Los bloques ajenos se tratan, no se suponen imposibles: cuando esto entra en
+vigor el runtime de C ya ha reservado en su arranque, y todo lo que devuelve
+para que lo suelte quien llama llega como un bloque que este asignador no hizo.
+El `free` interpuesto lo reconoce y lo devuelve al suyo. La regla de dentro no
+se mueve: `host_free` sigue tratando un puntero ajeno como el error duro que es.
+
+### Entradas alineadas
+
+`posix_memalign`, `aligned_alloc`, `memalign` y, en Windows, la familia
+`_aligned_*` entera pasan por el mismo mecanismo. Una reserva alineada es una
+reserva, y dejarla fuera daria un informe al que le falta justamente la memoria
+de los tipos que piden linea de cache o pagina.
+
+En POSIX ese bloque se suelta con el `free` de siempre, asi que tiene que ser
+reconocible por si mismo: se sirve como un tramo, cuya cabecera `free` ya
+encuentra enmascarando. Sin marca, sin tabla lateral y sin anadir nada al
+camino de liberar.
+
+### Alcanzar el interior del runtime de C
+
+Lo que la libreria de C reserva *dentro de si misma* y devuelve -- `strdup`,
+`getline`, `asprintf` -- nunca es una referencia pendiente, asi que ningun
+enlazador puede renombrarlo. Cerrarlo necesita un mecanismo distinto en cada
+sistema, y los dos vienen encendidos:
+
+| | |
+| :--- | :--- |
+| **ELF** | `VESTA_ALLOC_DEFINE_MALLOC` -- definir el simbolo. Una definicion en el ejecutable gana a la de la libreria de C, y las llamadas internas de esta salen por la PLT. |
+| **Windows** | `VESTA_ALLOC_HOOK_MSVCRT` -- escribir un salto en la entrada de `msvcrt!malloc`. Una DLL no tiene PLT y una llamada interna no sale de ella, asi que el codigo es el unico sitio que queda. Solo se toca el runtime de C. |
+
+Ninguno convive con `--wrap` para el mismo simbolo: con los dos puestos, el
+enlazador resuelve `__real_malloc` con la unica definicion que hay y la primera
+reserva se llama a si misma. La construccion quita el renombrado justo de los
+simbolos que el otro mecanismo define.
+
+Los dos se pueden apagar, y no por cortesia: sin algo con que comparar no hay
+forma de saber si suman.
+
+## Informes de reservas
+
+Con el apuntado encendido, el asignador guarda quien reservo, cuanto y para
+que, en una tabla por hilo, sin cerrojos y sin reservar para hacerlo.
+
+```cpp
+util::AllocSite sitios[64];
+unsigned n = util::alloc_sites_snapshot(sitios, 64);
 ```
 
-La misma forma vale para `sqlite3_config(SQLITE_CONFIG_MALLOC, ...)`,
-`CRYPTO_set_mem_functions` y los ganchos `zalloc`/`zfree` al estilo de zlib.
-Comprobar que expone la version que llevas vendorizada en vez de darlo por
-hecho.
+### Nombres, ficheros y modulos
 
-`examples/c_basic.c` y `examples/c_library_hook.c` se compilan **como C**, no
-como C++.  Es a proposito: son lo unico que comprueba que
-`host_allocator_c.h` sea C de verdad, en vez de limitarse a decirlo.
+Un desplazamiento no es una respuesta. La libreria lee su propia informacion de
+depuracion y su propia tabla de simbolos, asi que un informe sale con nombres
+sin que nadie enlace una libreria de simbolos:
 
-**Una trampa al llamar desde un programa en C**: la biblioteca es C++, asi que
-el enlace final necesita la biblioteca estandar de C++.  Si tu ejecutable solo
-tiene fuentes en C, tu sistema de construccion elegira el enlazador de C y
-saldran simbolos `std::` sin resolver.  En CMake:
-
-```cmake
-set_target_properties(tu_programa_c PROPERTIES LINKER_LANGUAGE CXX)
+```cpp
+vesta_alloc_set_symbol_resolver(vesta_self_resolver);
+vesta_alloc_write_csv("informe/");
 ```
 
-o enlazar con `g++`/`clang++` en vez de con `gcc`/`clang`.
+Dos lineas, y las mismas dos desde C -- `examples/symbol_report.cpp` y
+`examples/c_symbol_report.c` son el mismo programa escrito dos veces, porque
+"la libreria sabe nombrar sus propias direcciones" valdria la mitad si fuera
+una capacidad de C++.
+
+El resolutor intenta tres cosas, en orden, y cada una dice lo que no pudo en
+vez de inventarselo:
+
+| | da |
+| :--- | :--- |
+| La informacion de depuracion (DWARF) | la cadena de inline entera: funcion, fichero, linea |
+| La tabla de simbolos | un marco, un nombre, sin fichero |
+| Los rangos de funcion (`.pdata`, `st_size`) | no es un nombre -- es donde empieza la funcion, que aun asi agrupa los sitios de una misma funcion |
+
+Y pregunta primero **de quien** es la direccion. Los tres leen la imagen propia,
+asi que una direccion de una libreria del sistema saldria si no con un nombre de
+nuestra tabla -- y un nombre equivocado es peor que ninguno, porque el que falta
+hace una pregunta y el equivocado la cierra. De un modulo ajeno los simbolos se
+leen de su fichero, no solo de lo que exporta.
+
+### El informe como dato
+
+`vesta_alloc_write_csv` escribe seis ficheros CSV, y `tools/alloc_tree` los
+convierte en una pagina: un arbol ordenable que pliega por pila de llamadas,
+modulo, fichero o proposito, con el reparto de tamanos por sitio, dos idiomas
+de interfaz, y filtros por ambito ("solo mis llamadas") y por lenguaje (C o
+C++). En la pagina viaja siempre todo lo medido -- el filtrado ocurre ahi,
+porque decidir que mirar es una forma de mirar y no una forma de exportar.
+
+## Primitivas de memoria
+
+`memcpy` y `memset` no se le piden a la libreria de C. Eran los dos ultimos
+simbolos sin resolver: sin ellos el asignador corre donde no hay libc. La
+segunda razon son los tamanos pequenos, que en un asignador son el caso comun.
+
+La disposicion es lo importante: **anadir una arquitectura es crear una carpeta
+y una rama en el despachador**, sin tocar nada mas.
+
+```text
+util/mem/vesta_memcpy.h      lo unico que se incluye desde fuera
+util/mem/vesta_memset.h
+util/mem/mem_config.h        que se compila y por que
+util/mem/mem_inline.h        tamanos pequenos: sin ISA, sin bucle, sin llamada
+util/mem/x86/                un fichero por micro-ISA (SSE2, AVX2, ERMS)
+util/mem/generic/            donde todavia no hay carpeta propia
+```
+
+El despacho va de lo mas barato a lo mas caro: bloques solapados sin bucle en
+los tamanos mas pequenos, luego un numero fijo de movimientos direccionados
+desde los dos extremos, luego un bucle vectorial con el destino alineado antes
+de entrar, y por ultimo `rep movsb`, donde el trabajo lo hace el microcodigo.
+
+Hay dos entradas por operacion, y la diferencia es si puede haber una llamada:
+
+| | |
+| :--- | :--- |
+| `vesta_memcpy`, `vesta_memset` | Despachan por CPU. Una llamada, que se amortiza a partir de cierto tamano. |
+| `..._inline` | **No llaman a nadie nunca.** Se quedan en el camino base para que el compilador pueda meterlas en linea: una funcion compilada para una ISA mas ancha no se puede meter dentro de otra que no. |
+| `..._noinline` | Una llamada y nada mas. En tamanos grandes la expansion en linea son cientos de instrucciones en CADA sitio de llamada. |
+
+Son **cabeceras de C, no de C++**: para que una dependencia en C no pague una
+llamada, su compilador tiene que ver el cuerpo. En C++ estan ademas como
+`util::vesta_memcpy` y companyia, y como ayudantes con TIPO que reciben un
+objeto en vez de una cuenta de bytes:
+
+```cpp
+util::vesta_memcopy(&dst, &src);          // UN objeto
+util::vesta_memcopy(v_dst, v_src, count); // `count` objetos
+util::vesta_memfill(&cabecera, 0);
+```
+
+`examples/c_mem_ops.c` se compila **como C**, que es lo que mantiene honestas a
+las cabeceras en eso.
+
+## Configuracion
+
+### Opciones de CMake
+
+| | por defecto | |
+| :--- | :--- | :--- |
+| `VESTA_ALLOC_INTERPOSE_MALLOC` | on | `malloc` y companyia son este asignador, via `-Wl,--wrap`. |
+| `VESTA_ALLOC_DEFINE_MALLOC` | on (ELF) | Alcanzar tambien lo que la libreria de C reserva por dentro. |
+| `VESTA_ALLOC_HOOK_MSVCRT` | on (Windows) | Lo mismo, parcheando las entradas del runtime de C. |
+| `VESTA_ALLOC_BUILD_SHARED` | off | Construir tambien la libreria dinamica. Ver la nota de arriba. |
+| `VESTA_ALLOC_SIZE_HISTOGRAM` | on | Compilar el reparto por tamano. |
+| `VESTA_ALLOC_SPAN_CACHE_SLOTS` | 32 | Cuantos tamanos de tramo se guarda un hilo para si. |
+| `VESTA_ALLOC_SPAN_CACHE_BYTES` | 2 MiB | Y cuanta memoria puede retener como mucho. |
+
+### Variables de entorno
+
+| | |
+| :--- | :--- |
+| `VESTA_HOST_ALLOC_STATS=1` | Imprimir un resumen al salir: cuentas, bytes comprometidos, reparto por tamano y por proposito. |
+| `VESTA_HOST_ALLOC_SITES=1` | Apuntar ademas de donde viene cada reserva. Implica `..._STATS`. Es la que instala el salto sobre `operator new`; sin ella esas entradas no se tocan. |
+| `VESTA_HOST_ALLOC_CSV=<dir>` | Escribir el informe como CSV en esa carpeta. |
+
+Puesta, no vacia y distinta de `0` significa encendida.
+
+Cada una se lee **una vez, en la primera reserva**, y del bloque de entorno que
+el sistema operativo le dio al proceso -- no por `getenv`, que lee una copia que
+el runtime de C monta al arrancar. La primera reserva puede ocurrir antes de que
+esa copia exista: cualquier global cuyo constructor pida memoria llega antes que
+`main`. Leyendo el bloque del sistema no hay un "demasiado pronto", y es tambien
+por lo que esta libreria no necesita nada del runtime de C para contestar.
+
+Como la respuesta se toma antes de reservar nada, ponerlas desde dentro del
+programa mas tarde no tiene efecto. Encender la medicion a mitad dejaria en
+silencio fuera del informe todo lo reservado en el arranque.
+
+## Seguridad entre hilos
+
+Cada funcion documenta cual de estas tres es, porque la distincion es el diseno:
+
+- **Segura** -- llamala desde donde quieras.
+- **Segura por reparto** -- no sincroniza *porque* cada hilo solo toca lo suyo.
+  `host_alloc` y `host_free` son esto: el camino rapido no sincroniza nada.
+- **No segura, a proposito** -- las primitivas de las listas de libres y todo lo
+  de `ScratchArena`. Reservar ahi son dos cargas y un almacen; un cerrojo
+  costaria mas que el trabajo que protege, asi que quien llama garantiza la
+  exclusividad.
+
+Soltar desde un hilo que no reservo esta soportado del todo: el bloque va a una
+pila sin cerrojos del hilo que lo reservo, que recoge la pila entera en un solo
+intercambio cuando se queda sin bloques.
+
+## Sistemas soportados
+
+| | |
+| :--- | :--- |
+| Linux, x86-64 | GCC y Clang. Probado. |
+| Windows, x86-64 | MinGW (GCC). Probado. |
+| macOS | No soportado: su enlazador no tiene `--wrap`, y el asignador no se ha construido ahi. |
+| Otras arquitecturas | Las primitivas de memoria caen al camino generico; nada mas depende de la arquitectura. |
+
+C++17 para la libreria; la interfaz en C es C99.
+
+## Limitaciones
+
+- **No ha habido ninguna version.** Los nombres y la disposicion pueden cambiar.
+- **La libreria dinamica no puede reemplazar `operator new` de forma fiable**
+  -- ver arriba.
+- **macOS no esta soportado.**
+- **Un informe necesita informacion de depuracion para poner nombres.** Sin
+  ella un sitio sale como el desplazamiento donde empieza su funcion, lo que
+  agrupa los sitios de una misma funcion pero no los nombra.
+- **El asignador no le devuelve memoria al sistema.** Los trozos liberados se
+  reusan, no se desmapean, asi que el pico de memoria es el pico que el
+  programa alcanzo.
+- Donde pierde contra un buen asignador del sistema, y por que, lo reproduce
+  `bench_vs_malloc`, que imprime los casos que pierde igual
+  que los que gana.
 
 ## Licencia
 
-**MIT** -- ver `LICENSE`.  Usala, distribuyela, cambiala, vendela; solo hay que
-conservar el aviso de copyright.
-
-Forma parte de la familia de VestaVM, pero con una licencia mas permisiva que la
-del compilador, que es GPLv2.  Es deliberado: una biblioteca de proposito
-general con licencia copyleft no es reutilizable de verdad, porque arrastraria a
-la misma licencia a todo programa que la enlace.  Y en la otra direccion no hay
-friccion ninguna: codigo MIT entra en un proyecto GPLv2 sin problema, que es
-justo lo que hace VestaVM con esto.
+**MIT** -- ver `LICENSE`. Usalo, distribuyelo, cambialo, vendelo; solo conserva
+el aviso de copyright.

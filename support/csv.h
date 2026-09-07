@@ -115,10 +115,39 @@ inline std::string stamp(const char *fmt) {
  */
 class Report {
   public:
+    /// Las columnas de `_data` de los bancos de memoria, que fueron los
+    /// primeros en escribir CSV y de los que sale el formato.
+    static const char *default_columns() {
+        return "run_id,pass,section,label,bytes,"
+               "c_ns,cpp_ns,libc_ns,gain,vs_libc,"
+               "ratio_spread,time_spread,gain_verdict,libc_verdict";
+    }
+
     /**
      * @param bench Nombre corto de la tanda, que encabeza los ficheros.
      */
-    explicit Report(const char *bench) : bench_(bench) {
+    explicit Report(const char *bench) : Report(bench, default_columns()) {}
+
+    /**
+     * @brief Como el anterior, pero eligiendo las columnas de `_data`.
+     *
+     * POR QUE HACE FALTA.  Las columnas de arriba describen una tabla de TRES
+     * implementaciones de la misma operacion, que es la forma de los bancos de
+     * copiar y rellenar.  El del asignador compara DOS cosas y tiene columnas
+     * que aquellos no tienen, asi que reutilizar su cabecera obligaria a
+     * escribir un tiempo del asignador bajo un titulo que dice `libc_ns`.  Un
+     * CSV cuyas columnas mienten es peor que no tenerlo: el numero se lee bien
+     * y se atribuye mal.
+     *
+     * Las dos primeras columnas las pone esta clase (`run_id` y `pass`), asi
+     * que la cadena tiene que empezar por ellas; es lo que permite concatenar
+     * tandas y que sigan distinguiendose.
+     *
+     * @param bench   Nombre corto de la tanda.
+     * @param columns Cabecera COMPLETA de `_data`, empezando por
+     *                `run_id,pass`.
+     */
+    Report(const char *bench, const char *columns) : bench_(bench) {
         /* Se puede desviar a otro directorio sin tocar el codigo: en una
          * maquina de integracion los resultados no van al directorio de
          * trabajo. */
@@ -146,12 +175,7 @@ class Report {
                                 "started_at\n");
 
         data_ = std::fopen((prefix_ + "_data.csv").c_str(), "w");
-        if (data_ != nullptr)
-            std::fprintf(data_,
-                         "run_id,pass,section,label,bytes,"
-                         "c_ns,cpp_ns,libc_ns,gain,vs_libc,"
-                         "ratio_spread,time_spread,gain_verdict,"
-                         "libc_verdict\n");
+        if (data_ != nullptr) std::fprintf(data_, "%s\n", columns);
     }
 
     ~Report() {
@@ -203,6 +227,30 @@ class Report {
                      run_id_.c_str(), pass_.c_str(), section, label, bytes,
                      c_ns, cpp_ns, libc_ns, gain, vs_libc, ratio_spread,
                      time_spread, gain_verdict, libc_verdict);
+    }
+
+    /**
+     * @brief Una fila cuyas columnas las eligio quien construyo el informe.
+     *
+     * Pone las dos que son de esta clase -- la tanda y la pasada -- y deja el
+     * resto tal cual llega.  Va con el constructor de dos argumentos: quien
+     * elige la cabecera es quien tiene que formar la fila que la cumple.
+     *
+     * @param rest Los campos que siguen a `run_id,pass`, ya formados y
+     *             separados por comas.  El texto va entrecomillado por el que
+     *             llama, que es quien sabe cual lleva espacios.
+     *
+     * @code
+     * csv::Report out("alloc", "run_id,pass,size,ours_ns,system_ns");
+     * char line[128];
+     * std::snprintf(line, sizeof(line), "%zu,%.4f,%.4f", n, ours, sys);
+     * out.raw(line);
+     * @endcode
+     */
+    void raw(const char *rest) {
+        if (data_ == nullptr) return;
+        std::fprintf(data_, "\"%s\",\"%s\",%s\n", run_id_.c_str(),
+                     pass_.c_str(), rest);
     }
 
   private:

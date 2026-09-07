@@ -13,7 +13,7 @@
  * rompe, el asignador que va encima reparte bloques de un hilo a otro y el
  * fallo aparece lejisimos de aqui.
  */
-#include "util/thread_slot.h"
+#include "util/os/thread_slot.h"
 
 #include <atomic>
 #include <chrono>
