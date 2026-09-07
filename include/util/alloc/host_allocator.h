@@ -1736,7 +1736,7 @@ class AllocScope {
  *               s.bytes_reserved / (1024.0 * 1024.0));
  *
  *   // Y cuanto de eso sigue sin declarar su proposito, que es lo que queda
- *   // por migrar (ver `doc/PLAN_RESERVAS.md`).
+ *   // por migrar.
  *   const uint64_t sin_declarar = s.by_tag[util::AllocTag{}.raw()];
  * @endcode
  *

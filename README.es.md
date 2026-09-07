@@ -145,15 +145,18 @@ que el ~1,4x de Linux es la medida honesta de lo que este diseno aporta frente a
 un buen asignador. Nosotros vamos igual en los dos -- alrededor de 1,3 ns -- y
 ese es el numero a vigilar.
 
-**La ultima fila es una derrota de verdad y se deja puesta.** Un `calloc` grande
-que el llamante apenas lee gana aplazando: el sistema mapea paginas que el
-nucleo ya tiene a cero y solo paga las que se tocan, mientras que este asignador
-pone el cero por adelantado porque su region se compromete una vez y se
-reutiliza, asi que un bloque reciclado lleva los bytes del inquilino anterior.
-La fila de encima es la MISMA peticion con el llamante leyendola entera, donde
-pagar por adelantado gana 5,4x. Ningun umbral por TAMANO puede decidir entre las
-dos -- el tamano es identico; lo que cambia es lo que hace el llamante. Ver
-`doc/PLAN_RESERVAS.md`.
+**La ultima fila es el unico caso todavia abierto: trabajo sin hacer, no un
+precio que se acepte.** Un `calloc` grande que el llamante apenas lee gana hoy
+aplazando: el sistema mapea paginas que el nucleo ya tiene a cero y solo paga
+las que toca, mientras que este asignador pone el cero por adelantado porque su
+region se compromete una vez y se reutiliza, asi que un bloque reciclado lleva
+los bytes del inquilino anterior. La fila de encima es la MISMA peticion leida
+entera, donde pagar por adelantado gana 5,4x -- el tamano es identico en las
+dos, asi que ningun umbral por TAMANO puede decidir entre ellas; lo que cambia
+es lo que el llamante hace despues. Lo que lo cierra no es adivinar mejor, sino
+un tramo grande que no se comprometa entero por adelantado, que es como se gana
+la misma propiedad que el sistema tiene gratis. Hasta que eso este, la fila
+queda tal como se midio.
 
 Cada fila es la media de la mitad limpia de once repeticiones intercaladas, y el
 banco mide primero su propio suelo -- el mismo asignador en todas las columnas,

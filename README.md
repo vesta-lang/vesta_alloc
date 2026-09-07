@@ -143,14 +143,17 @@ msvcrt takes about 12 ns to hand back a small block and glibc's `tcache` takes
 is the honest measure of what this design buys over a good allocator. We are the
 same speed on both — around 1.3 ns — and that is the number to watch.
 
-**The last row is a real loss and is left in.** A large `calloc` whose caller
-barely reads it wins by deferring: the system maps pages the kernel already
-holds zeroed and pays only for the ones touched, while this allocator zeroes up
-front because its region is committed once and reused, so a recycled block
-carries the previous tenant's bytes. The row above is the same request with the
-caller reading all of it, where paying up front wins 5.4x. No threshold on
-*size* can choose between them — the size is identical; only the caller's
-behaviour differs. See `doc/PLAN_RESERVAS.md`.
+**The last row is the one case still open — unfinished work, not a trade-off
+being accepted.** A large `calloc` whose caller barely reads it currently wins
+by deferring: the system maps pages the kernel already holds zeroed and pays
+only for the ones it touches, while this allocator zeroes up front because its
+region is committed once and reused, so a recycled block carries the previous
+tenant's bytes. The row above is the same request read in full, where paying up
+front wins 5.4x — the size is identical in both, so no threshold on *size* can
+decide between them; only what the caller does next differs. What closes it is
+not a better guess but a large span that is not committed in full up front,
+which earns the same property the system gets for free. Until that is built the
+row stands as measured.
 
 Every row is the mean of the clean half of eleven interleaved repeats, and the
 benchmark measures its own floor first — the same allocator in every column,

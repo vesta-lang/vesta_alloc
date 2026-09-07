@@ -818,8 +818,8 @@ ThreadCache *cache() noexcept {
 // =========================================================================
 //
 // Un tramo son N trozos seguidos que forman UNA reserva.  Medido, el 90% de las
-// grandes son de 64 KiB o menos y la cola llega a 16 MiB (ver
-// `doc/PLAN_RESERVAS.md`), asi que no compensa ni tratarlas como clases -- la
+// grandes son de 64 KiB o menos y la cola llega a 16 MiB, asi que no compensa
+// ni tratarlas como clases -- la
 // fragmentacion se come la ganancia -- ni pedir cada una al sistema, que seria
 // una llamada por reserva.
 //
@@ -2233,7 +2233,8 @@ void *host_alloc_slow(size_t n) noexcept {
     if (c != nullptr && g_measure) record_size(c, n);
     if (n > kMaxSmall) {
         /* Grande: la sirve un TRAMO de trozos de la region.  Ya no se le pide
-         * al asignador del sistema; ver `doc/PLAN_RESERVAS.md`. */
+         * al asignador del sistema: una llamada por reserva costaba ~1,13 us
+         * por par, contra los ~4 ns que cuesta aqui. */
         void *p = alloc_span(c, n);
         if (p != nullptr) return p;
         /* La region no dio.  Antes se cedia al sistema; ahora nulo, y el

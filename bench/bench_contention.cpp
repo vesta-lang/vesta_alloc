@@ -23,7 +23,7 @@
  * and the workload got 7-8% faster.  None of that is visible from one thread.
  *
  * THE SHAPE OF THE WORK comes from the numbers measured on a real compilation
- * of 144k lines (`doc/PLAN_RESERVAS.md`):
+ * of 144k lines:
  *
  *     small allocations          62,450,230
  *     freed by another thread     1,535,616   (2.5%)
