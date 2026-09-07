@@ -2073,21 +2073,45 @@ class SingleOwnerAllocator {
      *
      * \~
      */
+    /* RAMIFICA UNA VEZ Y DELEGA CON LA CABECERA EN LA MANO, por el mismo motivo
+     * que @c PerThreadAllocator::free, donde esta contado: ceder a `host_free`
+     * lo que no es nuestro le hacia repetir la pregunta de la region y la
+     * lectura de la cabecera que aqui ya se habian hecho.  Perfilado, esta
+     * funcion era la mas cara de las tres vias de liberar -- 0,141 s contra
+     * 0,074 de `host_free` --, que es justo al reves de lo que una via
+     * especializada deberia salir. */
     [[gnu::always_inline]] void free(void *p) noexcept {
         if (p == nullptr) return;
-        if (cache_ != nullptr) {
-            ChunkHeader *h = nullptr;
-            if (in_region(p))
-                h = chunk_of(p);
-            else if (in_big_region(p))
-                h = big_chunk_of(p);
-            if (h != nullptr && h->magic == kChunkMagic &&
+
+        /* Una rama por region, cada una acabando en el camino exacto con la
+         * cabecera ya en la mano; las otras dos formas que se probaron salieron
+         * peores, y estan contadas en @c PerThreadAllocator::free. */
+        if (in_region(p)) {
+            ChunkHeader *h = chunk_of(p);
+            if (__builtin_expect(h->magic != kChunkMagic, 0)) {
+                detail::host_free_not_small(p, h); // un tramo, o algo roto
+                return;
+            }
+            if (cache_ != nullptr && h->owner == cache_->id) {
+                detail::push_block(cache_, p, h->cls);
+                return;
+            }
+            detail::host_free_remote(p, h);
+            return;
+        }
+
+        if (in_big_region(p)) {
+            ChunkHeader *h = big_chunk_of(p);
+            if (cache_ != nullptr && h->magic == kChunkMagic &&
                 h->owner == cache_->id) {
                 detail::push_block(cache_, p, h->cls);
                 return;
             }
+            detail::host_free_big(p);
+            return;
         }
-        host_free(p); // de otro dueno, o un tramo: por el camino de siempre
+
+        detail::no_foreign_free(p); // no es nuestro; ver `host_free`
     }
 
     /**
@@ -2283,6 +2307,14 @@ class PerThreadAllocator {
      * \~
      */
     [[gnu::always_inline]] static void *alloc(size_t n) noexcept {
+        /* THE SIZE FIRST, and the order is the point.  A span goes down the
+         * general path whatever this thread's cache says, so reading the slot
+         * before knowing the size was reading it to throw it away -- and then
+         * `host_alloc` read its own.  Same single jump as ever: with `n == 0`
+         * the subtraction wraps to the largest unsigned, which also falls
+         * outside, so the size is validated without a second comparison. */
+        if (__builtin_expect(n - 1 >= kMaxSmall, 0))
+            return host_alloc(n); // spans: general path
         detail::ThreadCache *c = detail::per_thread_cache();
         /* One unsigned comparison for "not registered yet" and "already had its
          * exit notice"; see @c detail::kDyingCache. */
@@ -2293,7 +2325,6 @@ class PerThreadAllocator {
             c = detail::per_thread_cache_slow();
             if (c == nullptr) return host_alloc(n); // pool exhausted
         }
-        if (n - 1 >= kMaxSmall) return host_alloc(n); // spans: general path
         if (detail::g_measure) detail::record_size(c, n);
         const uint32_t k = class_of(n);
         void *p = detail::pop_block(c, k);
@@ -2329,22 +2360,69 @@ class PerThreadAllocator {
      * \~spanish el bloque a devolver, o nullptr.
      * \~
      */
+    /**
+     * @brief Frees a block, from this thread or any other.
+     *
+     * IT USED TO HAND WHAT IT DID NOT OWN TO `host_free`, AND THAT WAS WORK
+     * DONE TWICE.  This function already asks which region the pointer is in
+     * and already reads the chunk header; `host_free` then asked both again
+     * from scratch.  Every span went through that -- a span's header carries
+     * `kSpanMagic`, so the test here never matches -- and it showed: profiled,
+     * the header read cost 0.071 s here and another 0.066 s inside `host_free`,
+     * about a tenth of all the CPU this library spent.  It is also why the two
+     * specialised policies came out SLOWER than the general one at 64 KiB and
+     * 1 MiB, which is backwards from the point of specialising.
+     *
+     * Now it branches once and calls the exact path with the header already in
+     * hand.  Nothing is re-derived, and each of the four outcomes -- ours, a
+     * span, another thread's, not ours at all -- goes where it belongs.
+     */
     [[gnu::always_inline]] static void free(void *p) noexcept {
         if (p == nullptr) return;
         detail::ThreadCache *c = detail::per_thread_cache();
-        if (detail::have_cache(c)) {
-            ChunkHeader *h = nullptr;
-            if (in_region(p))
-                h = chunk_of(p);
-            else if (in_big_region(p))
-                h = big_chunk_of(p);
-            if (h != nullptr && h->magic == kChunkMagic &&
+
+        /* ONE BRANCH PER REGION, each ending in the exact path with the header
+         * already in hand.  Two other shapes were written and measured against
+         * this one, both worse -- normalising to the general column, which this
+         * change does not touch, so it doubles as a control inside each run:
+         *
+         *   per-thread / general      64 B    64 KiB    1 MiB
+         *   before                    1.029    1.257    1.195
+         *   this                      1.007    1.063    1.008
+         *   header resolved once      1.035    1.132    1.124
+         *
+         * The last one reads better on paper -- one copy of the test instead of
+         * one per region -- and is slower, which is why it is not here. */
+        if (in_region(p)) {
+            ChunkHeader *h = chunk_of(p);
+            if (__builtin_expect(h->magic != kChunkMagic, 0)) {
+                // A span, or something that should not be here.  Both cold.
+                detail::host_free_not_small(p, h);
+                return;
+            }
+            if (detail::have_cache(c) && h->owner == c->id) {
+                detail::push_block(c, p, h->cls);
+                return;
+            }
+            detail::host_free_remote(p, h);
+            return;
+        }
+
+        if (in_big_region(p)) {
+            ChunkHeader *h = big_chunk_of(p);
+            if (detail::have_cache(c) && h->magic == kChunkMagic &&
                 h->owner == c->id) {
                 detail::push_block(c, p, h->cls);
                 return;
             }
+            detail::host_free_big(p);
+            return;
         }
-        host_free(p); // another owner, or a span: the usual path
+
+        /* NOT OURS, and that cannot happen: if nothing falls back to the system
+         * when allocating, there are no system blocks to release.  Same
+         * reasoning as `host_free`. */
+        detail::no_foreign_free(p);
     }
 };
 

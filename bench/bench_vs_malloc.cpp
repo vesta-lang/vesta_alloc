@@ -702,9 +702,23 @@ void memory_over_aligned() {
 /// Fewer iterations as the blocks get bigger, or the large cases dominate the
 /// wall time without adding information.
 int rounds_for(size_t size) {
-    if (size <= 1024) return 300000;
-    if (size <= 65536) return 40000;
-    return 4000;
+    /* Scaled by `VESTA_BENCH_WORK`, read once.  A plain run is sized so the
+     * whole table finishes in a sensible time, which is far too little for a
+     * PROFILER: the fast path is a fraction of a millisecond per sample, and a
+     * sampler cannot say anything about code it caught twice.  Raising this is
+     * how the same benchmark becomes a profiling target without becoming a
+     * second program that measures something slightly different. */
+    static const double scale = [] {
+        const char *w = std::getenv("VESTA_BENCH_WORK");
+        if (w == nullptr || w[0] == '\0') return 1.0;
+        const double v = std::atof(w);
+        return v > 0.0 ? v : 1.0;
+    }();
+    const double base = size <= 1024 ? 300000.0
+                        : size <= 65536 ? 40000.0
+                                        : 4000.0;
+    const double n = base * scale;
+    return n < 1.0 ? 1 : int(n);
 }
 
 /**
@@ -745,23 +759,61 @@ void calibrate() {
                 report::reset());
 }
 
+/**
+ * @brief Whether a section was asked for.
+ *
+ * WHY THIS EXISTS, and it came out of a profile that could not answer anything.
+ * The `calloc` sections zero megabytes, so they dominate the run: under a
+ * profiler the three hottest functions in the whole binary were all the zeroing
+ * path, and the small-allocation rows -- the ones worth looking at when a fast
+ * path changes -- were a rounding error in the samples.  A profiler cannot tell
+ * you about code it barely sampled.
+ *
+ * So the sections can be picked: `VESTA_BENCH_ONLY=hot`, or a comma-separated
+ * list.  Unset means all of them, which is what a plain run should still do.
+ *
+ * @code
+ * VESTA_BENCH_ONLY=hot ./vesta_alloc_bench_vs_malloc   # just the fast path
+ * VESTA_BENCH_ONLY=calloc,grow ./vesta_alloc_bench_vs_malloc
+ * @endcode
+ *
+ * @param name The section's short name, as it appears in the variable.
+ */
+bool section_wanted(const char *name) {
+    const char *want = std::getenv("VESTA_BENCH_ONLY");
+    if (want == nullptr || want[0] == '\0') return true;
+    const size_t n = std::strlen(name);
+    for (const char *p = want; *p != '\0';) {
+        const char *end = p;
+        while (*end != '\0' && *end != ',') ++end;
+        if (size_t(end - p) == n && std::strncmp(p, name, n) == 0) return true;
+        p = (*end == ',') ? end + 1 : end;
+    }
+    return false;
+}
+
 /// Every table, once per pass.  Extracted so that a hybrid machine can measure
 /// them on each kind of core: there is no single "speed of this machine" to
 /// report on a part with two.
 void run_sections() {
+    if (section_wanted("hot")) {
     header("allocate and free immediately (hot)");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         row("hot", s, measure(HotCase{s, rounds_for(s)}, AllColumns{}));
     }
+    }
 
+    if (section_wanted("burst")) {
     header("allocate a batch, free the batch (burst)");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s) / 512 + 1;
         row("burst", s, measure(BurstCase{s, n}, AllColumns{}));
     }
+    }
 
+    if (section_wanted("churn")) {
     header("live set with random replacement (churn)");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
@@ -775,7 +827,9 @@ void run_sections() {
         row("churn", s,
             measure(ChurnCase{s, rounds_for(s) * 8}, AllColumns{}));
     }
+    }
 
+    if (section_wanted("calloc")) {
     header("zeroed (calloc), and the caller reads ALL of it");
     for (int i = 0; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
@@ -801,12 +855,15 @@ void run_sections() {
         row("calloc", s,
             measure(ZeroedCase{s, rounds_for(s), 64}, AllColumns{}));
     }
+    }
 
+    if (section_wanted("grow")) {
     header("grow from 64 bytes by doubling (realloc)");
     for (int i = 2; i < kSizeCount; ++i) {
         const size_t s = kSizes[i];
         const int n = rounds_for(s) / 8 + 1;
         row("grow to", s, measure(GrowCase{s, n}, AllColumns{}));
+    }
     }
 }
 
