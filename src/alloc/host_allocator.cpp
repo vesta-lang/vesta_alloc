@@ -1723,6 +1723,11 @@ uint32_t g_direct_n = 0;
  */
 std::atomic<uint64_t> g_by_fill[kAllocFillSlots];
 
+/// Executable blocks served from our own reservation, and times the region
+/// could not place one close enough and the system had to be asked.
+std::atomic<uint64_t> g_exec_allocs{0};
+std::atomic<uint64_t> g_exec_far{0};
+
 /// How many were served this way, and how many the table had no room for.
 std::atomic<uint64_t> g_direct_allocs{0};
 std::atomic<uint64_t> g_direct_refused{0};
@@ -2583,6 +2588,86 @@ uint64_t host_direct_allocs() noexcept {
 
 uint64_t host_direct_refused() noexcept {
     return g_direct_refused.load(std::memory_order_relaxed);
+}
+
+void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
+                       size_t window, bool *placed,
+                       OsNearScan *scan) noexcept {
+    if (placed != nullptr) *placed = false;
+    if (scan != nullptr) *scan = OsNearScan{0, 0};
+    if (bytes == 0) return nullptr;
+
+    /* DESDE LA MISMA RESERVA DONDE VIVE EL DATO, que es lo unico que funciona
+     * cuando el ancla cae dentro de una reserva mayor que la ventana.
+     *
+     * Pedirle al sistema un rango PEGADO se probo y esta medido: con el ancla
+     * en la region de clases grandes -- 16 GiB -- el recorrido ve 22 regiones y
+     * el hueco mayor es CERO, porque la ventana de +-2 GB cabe entera dentro de
+     * esa reserva.  No es mala suerte del mapa: es geometria, y ninguna forma
+     * de pedir mejor lo arregla.
+     *
+     * Aqui se toma por la MISMA via que las clases grandes -- el cursor de
+     * `take_big_chunks`, que solo avanza -- y lo unico que cambia son los
+     * permisos con que se comprometen las paginas.  El reparto de datos no se
+     * entera: hay un cliente mas, no un mecanismo nuevo.  Y la cercania sale
+     * sola mientras la region no haya repartido mas que la ventana, porque el
+     * cursor va justo detras de todo lo ya entregado. */
+    if (anchor != nullptr && in_big_region(anchor)) {
+        const size_t chunks =
+            (bytes + kBigChunkBytes - 1) / kBigChunkBytes;
+        const uintptr_t addr = take_big_chunks(chunks);
+        if (addr != 0) {
+            const size_t got = chunks * kBigChunkBytes;
+            if (os_commit(reinterpret_cast<void *>(addr), got, prot)) {
+                /* Y se comprueba la distancia de verdad, no se da por hecha: el
+                 * cursor pudo haberse alejado mas que la ventana, y entonces
+                 * esto no sirve para lo que se pidio aunque la memoria sea
+                 * buena.  Decirlo es lo que permite que quien llama lo sepa. */
+                const uintptr_t a = reinterpret_cast<uintptr_t>(anchor);
+                const uintptr_t dist = addr > a ? (addr - a) : (a - addr);
+                if (dist <= window) {
+                    g_exec_allocs.fetch_add(1, std::memory_order_relaxed);
+                    if (placed != nullptr) *placed = true;
+                    return reinterpret_cast<void *>(addr);
+                }
+                /* Demasiado lejos.  Las paginas se descomprometen -- el rango
+                 * no vuelve, igual que el de un tramo que no cabe en el banco
+                 * -- y se cae al camino de fuera, que al menos puede acertar. */
+                os_decommit(reinterpret_cast<void *>(addr), got);
+            }
+        }
+        g_exec_far.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /* El ancla no es nuestra, o la region no dio: se le pide al sistema cerca,
+     * que es lo mejor que se puede hacer sin una reserva que lo contenga. */
+    void *p = os_alloc_near(bytes, prot, anchor, window, scan);
+    if (p != nullptr && placed != nullptr && anchor != nullptr) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(anchor);
+        const uintptr_t g = reinterpret_cast<uintptr_t>(p);
+        *placed = (g > a ? g - a : a - g) <= window;
+    }
+    return p;
+}
+
+void host_free_pages(void *p, size_t bytes) noexcept {
+    if (p == nullptr) return;
+    /* Si salio de la region, sus paginas se descomprometen y el RANGO se queda
+     * -- el cursor no retrocede --.  Si vino de fuera, se suelta entero.  Los
+     * dos casos se distinguen por donde cae, sin leer el bloque. */
+    if (in_big_region(p))
+        os_decommit(p, (bytes + kBigChunkBytes - 1) / kBigChunkBytes *
+                           kBigChunkBytes);
+    else
+        os_free(p, bytes);
+}
+
+uint64_t host_exec_allocs() noexcept {
+    return g_exec_allocs.load(std::memory_order_relaxed);
+}
+
+uint64_t host_exec_far() noexcept {
+    return g_exec_far.load(std::memory_order_relaxed);
 }
 
 uint64_t host_new_calls() noexcept {

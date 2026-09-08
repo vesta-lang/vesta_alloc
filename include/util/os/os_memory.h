@@ -218,6 +218,12 @@ constexpr bool has_prot(OsProt set, OsProt bit) {
 /// \~
 inline constexpr OsProt kOsReadWrite = OsProt::Read | OsProt::Write;
 
+/// \~english What generated code is written into and then run from.
+/// \~spanish Donde se escribe codigo generado y desde donde se ejecuta luego.
+/// \~
+inline constexpr OsProt kOsReadWriteExec =
+    OsProt::Read | OsProt::Write | OsProt::Exec;
+
 /**
  * @brief
  * \~english Books and HANDS OVER in one go, with the permissions asked for.
@@ -278,6 +284,125 @@ inline constexpr OsProt kOsReadWrite = OsProt::Read | OsProt::Write;
  * \~
  */
 void *os_alloc(size_t bytes, OsProt prot) noexcept;
+
+/**
+ * @brief
+ * \~english The same, but CLOSE to an address that already exists.
+ * \~spanish Lo mismo, pero CERCA de una direccion que ya existe.
+ * \~
+ *
+ * \~english
+ * WHY DISTANCE IS A REQUIREMENT AND NOT A TASTE.  Generated code reaches its
+ * own data with 32-bit displacements relative to the instruction pointer, and
+ * that covers +-2 GB.  Past that the displacement does not fit and the
+ * reference cannot be emitted -- so where a block LANDS decides whether the
+ * code that will live in it works at all.  Letting the system choose is fine
+ * until something big is reserved in between, and then the answer is arbitrary:
+ * measured, 16 GiB away from a datum sitting eight bytes from the anchor.
+ *
+ * IT IS ASKED FOR, not guessed.  The window is walked region by region looking
+ * for free space, instead of probing addresses and hoping.  Probing was tried
+ * -- `base +- 2^k`, thirty points of a two-gigabyte window -- and one large
+ * reservation across the middle is enough for all thirty to be taken.
+ *
+ * @param bytes  how many, rounded up to a page.
+ * @param prot   the permissions the block is handed over with.
+ * @param anchor the address to stay close to; nullptr means anywhere.  NOT
+ *               called `near`: `windows.h` still defines that as an empty
+ *               macro, left over from sixteen-bit pointers, so a parameter with
+ *               that name vanishes and what fails is the line that uses it.
+ * @param window how far from @p near is close enough, in bytes.
+ * @return the base of the block, or nullptr if there was no room in the window
+ *         -- which is NOT the same as being out of memory, and the caller has
+ *         to tell the two apart: one is a placement problem and the other is
+ *         not.
+ *
+ * @par Threads
+ * Safe.  Two threads asking at once get different blocks; the walk can see a
+ * region that another thread takes first, and then this simply carries on.
+ *
+ * \~spanish
+ * POR QUE LA DISTANCIA ES UNA EXIGENCIA Y NO UN GUSTO.  El codigo generado
+ * alcanza sus propios datos con desplazamientos de 32 bits relativos al puntero
+ * de instruccion, y eso cubre +-2 GB.  Mas alla el desplazamiento no cabe y la
+ * referencia no se puede emitir -- asi que donde CAE un bloque decide si el
+ * codigo que vivira en el funciona siquiera --.  Dejar elegir al sistema vale
+ * hasta que se reserva algo grande en medio, y entonces la respuesta es
+ * arbitraria: medido, a 16 GiB de un dato que estaba a ocho bytes del ancla.
+ *
+ * SE PIDE, no se adivina.  La ventana se recorre region por region buscando
+ * hueco, en vez de probar direcciones a ver si suena la flauta.  Probar ya se
+ * intento -- `base +- 2^k`, treinta puntos de una ventana de dos gigas -- y
+ * basta una reserva grande por en medio para que los treinta esten ocupados.
+ *
+ * @param bytes  cuantos, redondeados a pagina.
+ * @param prot   los permisos con los que se entrega el bloque.
+ * @param anchor la direccion de la que no hay que alejarse; nulo es en
+ *               cualquier sitio.  NO se llama `near`: `windows.h` todavia
+ *               define eso como una macro vacia, herencia de los punteros de
+ *               dieciseis bits, asi que un parametro con ese nombre desaparece
+ *               y lo que falla es la linea que lo usa.
+ * @param window a que distancia de @p near sigue valiendo, en bytes.
+ * @return la base del bloque, o nullptr si no habia sitio en la ventana -- que
+ *         NO es lo mismo que quedarse sin memoria, y quien llama tiene que
+ *         distinguirlos: uno es un problema de colocacion y el otro no.
+ *
+ * @par Hilos
+ * Segura.  Dos hilos que pidan a la vez reciben bloques distintos; el recorrido
+ * puede ver una region que otro hilo toma antes, y entonces sigue buscando.
+ *
+ * \~
+ *
+ * \~english
+ * @code
+ *   // Code that has to reach `data` with a 32-bit displacement.
+ *   void *code = util::os_alloc_near(1u << 20, util::kOsReadWriteExec, data,
+ *                                    (1u << 31) - (128u << 20));
+ * @endcode
+ *
+ * \~spanish
+ * @code
+ *   // Codigo que tiene que alcanzar `data` con un desplazamiento de 32 bits.
+ *   void *code = util::os_alloc_near(1u << 20, util::kOsReadWriteExec, data,
+ *                                    (1u << 31) - (128u << 20));
+ * @endcode
+ *
+ * \~
+ */
+/**
+ * @brief
+ * \~english What the walk SAW, for whoever has to explain a bad placement.
+ * \~spanish Lo que VIO el recorrido, para quien tenga que explicar una mala
+ *          colocacion.
+ * \~
+ *
+ * \~english
+ * "There was no room" and "I never looked" read identically from outside and
+ * lead to different fixes, so they are told apart here.  Zero regions means the
+ * walk did not run -- no anchor was given.  Regions but no room means the
+ * window really is full, which is what a large reservation across it looks
+ * like.
+ *
+ * \~spanish
+ * "No habia sitio" y "no llegue a mirar" se leen igual desde fuera y llevan a
+ * arreglos distintos, asi que aqui se separan.  Cero regiones significa que el
+ * recorrido no corrio -- no se dio ancla --.  Regiones pero sin sitio significa
+ * que la ventana esta llena de verdad, que es lo que parece una reserva grande
+ * cruzada por en medio.
+ *
+ * \~
+ */
+struct OsNearScan {
+    /// \~english how many regions the walk looked at
+    /// \~spanish cuantas regiones miro el recorrido  \~
+    size_t regions;
+    /// \~english the largest free run it saw inside the window
+    /// \~spanish el hueco libre mayor que vio dentro de la ventana  \~
+    size_t largest_free;
+};
+
+void *os_alloc_near(size_t bytes, OsProt prot, const void *anchor,
+                    size_t window, OsNearScan *scan = nullptr) noexcept;
 
 /**
  * @brief

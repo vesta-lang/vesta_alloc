@@ -14,6 +14,46 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Anadido
 
+- **Paginas con PERMISOS y colocadas donde hagan falta: `host_alloc_pages`.**
+  Por debajo esto siempre fue un repartidor de arenas; lo unico que estaba fijo
+  eran los permisos con que se comprometen sus paginas y que caian donde
+  cayeran.  Ahora las dos cosas se piden, y `util::ScratchArena` tambien las
+  acepta -- es la misma arena, no una nueva.
+
+  PARA QUE.  El codigo generado alcanza sus datos con desplazamientos de 32
+  bits, que cubren +-2 GB; mas alla la referencia no se puede ni emitir.  Asi
+  que donde CAE un bloque decide si el codigo que vivira en el funciona.  El JIT
+  lo pedia al sistema y acababa **a 16.405 MiB de un dato que estaba a ocho
+  bytes de su ancla**, con un "rel32 fuera de rango" que no era un aviso:
+  devolvia cero, y ese cero acababa siendo el punto de entrada de un hilo.
+
+  Y PEDIRLO PEGADO NO BASTA, que era lo primero que se probo: con el ancla
+  dentro de la region de clases grandes, el recorrido ve 22 regiones y el hueco
+  mayor es **CERO** -- la ventana de +-2 GB cabe entera dentro de esos 16 GiB --.
+  Es geometria, no mala suerte.  Lo que vale es servir desde DENTRO: los trozos
+  salen del mismo cursor que usan las clases grandes y solo cambian los
+  permisos, asi que el reparto de datos no se entera -- hay un cliente mas, no
+  un mecanismo nuevo -- y la cercania sale sola, porque ese cursor va justo
+  detras de todo lo ya entregado.  Medido: de 16.405 MiB a **5 MiB**.
+
+  NO SE FIA DE QUE SALGA BIEN: comprueba la distancia de verdad antes de
+  devolver, y si el cursor se alejo mas que la ventana descompromete y cae a
+  `os_alloc_near`.  `host_exec_far()` cuenta esas veces, porque fallar aqui es
+  mudo por naturaleza -- el bloque vuelve igual y lo que se rompe es un
+  desplazamiento, mucho despues y en otro sitio.
+
+- **`os_alloc_near`: reservar CERCA de una direccion que ya existe.**  Recorre
+  la ventana region por region y se queda con el hueco MAS CERCANO.  Antes esto
+  vivia dentro del generador de codigo, probaba `base +- 2^k` -- treinta puntos
+  sueltos, que una reserva grande por en medio deja todos ocupados -- y al
+  cambiarlo por un recorrido se quedaba en el primer hueco, o sea en el borde de
+  la ventana: 1.920 MiB, sin margen para los datos que no son el ancla exacta.
+  Eligiendo el mas cercano: **1,8 MiB**.
+
+  El parametro se llama `anchor` y no `near` porque `windows.h` todavia define
+  `near` como una macro vacia, herencia de los punteros de dieciseis bits: un
+  parametro con ese nombre desaparece y lo que falla es la linea que lo usa.
+
 - **`malloc` es este asignador tambien DENTRO del runtime de C.**  El
   renombrado al enlazar alcanza toda llamada del enlace y ahi se acaba: lo que
   la libreria de C reserva por dentro y devuelve -- `strdup`, `getline`,
@@ -465,6 +505,47 @@ invita a creer que ampara.
 ## [Unreleased]
 
 ### Added
+
+- **Pages with PERMISSIONS, placed where they are needed: `host_alloc_pages`.**
+  Underneath, this was always an arena dealer; the only fixed things were the
+  permissions its pages are committed with and that they landed wherever.  Both
+  are now asked for, and `util::ScratchArena` takes them too -- it is the same
+  arena, not a new one.
+
+  WHAT FOR.  Generated code reaches its data with 32-bit displacements, which
+  cover +-2 GB; past that the reference cannot even be emitted.  So where a
+  block LANDS decides whether the code that will live in it works.  The JIT
+  asked the system and ended up **16,405 MiB from a datum eight bytes off its
+  anchor**, with a "rel32 out of range" that was not a warning: it returned
+  zero, and that zero became a thread's entry point.
+
+  AND ASKING FOR IT NEXT DOOR IS NOT ENOUGH, which was the first thing tried:
+  with the anchor inside the big-class region, the walk sees 22 regions and the
+  largest free run is **ZERO** -- the +-2 GB window fits entirely inside those
+  16 GiB.  That is geometry, not bad luck.  What works is serving from INSIDE:
+  the chunks come off the very cursor the big classes use and only the
+  permissions differ, so the data path does not notice -- one more client, not a
+  new mechanism -- and closeness follows on its own, because that cursor runs
+  just behind everything already handed out.  Measured: from 16,405 MiB to
+  **5 MiB**.
+
+  IT DOES NOT ASSUME IT WORKED: it checks the real distance before returning,
+  and if the cursor has run past the window it decommits and falls back to
+  `os_alloc_near`.  `host_exec_far()` counts those, because failing here is
+  silent by nature -- the block still comes back and what breaks is a
+  displacement, much later and somewhere else.
+
+- **`os_alloc_near`: reserving CLOSE to an address that already exists.**  It
+  walks the window region by region and takes the NEAREST free run.  This used
+  to live inside the code generator, probing `base +- 2^k` -- thirty scattered
+  points, all taken as soon as one large reservation lies across the middle --
+  and when that became a walk it stopped at the first hole, which is the EDGE of
+  the window: 1,920 MiB, with no margin for data that is not the exact anchor.
+  Taking the nearest instead: **1.8 MiB**.
+
+  The parameter is called `anchor` and not `near` because `windows.h` still
+  defines `near` as an empty macro, left over from sixteen-bit pointers: a
+  parameter with that name vanishes and what fails is the line that uses it.
 
 - **`malloc` is this allocator INSIDE the C runtime too.**  Link-time renaming
   reaches every call in the link and stops there: what the C library allocates

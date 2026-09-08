@@ -14,6 +14,7 @@
  * arena no reaprovechara sus bloques, pediria memoria sin parar y el programa
  * se comeria la maquina en vez de ir mas rapido.
  */
+#include "util/alloc/host_allocator.h" // el dato al que el codigo tiene que llegar
 #include "util/alloc/scratch_arena.h"
 #include "util/mem/vesta_memset.h"
 
@@ -123,6 +124,61 @@ int main() {
         std::printf("  general: %.2f ns/op   arena: %.2f ns/op   (%.1fx)\n",
                     gen, arena, gen / arena);
         check(arena < gen, "la arena gana al asignador general");
+    }
+
+    /* --- una arena con PERMISOS y COLOCADA -------------------------------
+     *
+     * Es la misma arena; lo que cambia es con que se comprometen sus bloques y
+     * donde caen.  Las dos cosas fallan de la misma forma incomoda: no al
+     * pedirlas, sino despues -- los permisos al saltar al codigo, y la
+     * colocacion al emitir un desplazamiento que ya no cabe --, asi que se
+     * comprueban aqui ejecutando de verdad y midiendo la distancia de verdad. */
+    {
+        /* Un dato del asignador general, que es a lo que el codigo generado
+         * tiene que llegar.  El ancla es eso, no una direccion cualquiera. */
+        void *const dato = util::host_alloc(64u << 10);
+        check(dato != nullptr, "arena con permisos: hay un dato al que llegar");
+
+        // La ventana del rel32, con margen para datos que no sean el ancla.
+        const size_t ventana = (size_t(1) << 31) - (128u << 20);
+        util::ScratchArena codigo(util::kOsReadWriteExec, dato, ventana);
+
+        auto *p = static_cast<unsigned char *>(codigo.allocate(4096, 16));
+        check(p != nullptr, "arena con permisos: sirve un bloque");
+        if (p != nullptr) {
+            /* EJECUTABLE DE VERDAD.  Un `ret` y se llama: si los permisos no
+             * llegaron a la pagina esto no devuelve un valor raro, revienta --
+             * que es justo por lo que no vale con mirar un flag. */
+            *p = 0xC3;
+            reinterpret_cast<void (*)()>(p)();
+            check(true, "arena con permisos: y el bloque se EJECUTA");
+
+            const intptr_t d = reinterpret_cast<intptr_t>(p) -
+                               reinterpret_cast<intptr_t>(dato);
+            const size_t dist = size_t(d < 0 ? -d : d);
+            std::printf("  el bloque cayo a %.1f MiB del dato (ventana %.0f "
+                        "MiB), colocado=%d\n",
+                        double(dist) / (1024.0 * 1024.0),
+                        double(ventana) / (1024.0 * 1024.0),
+                        codigo.placed() ? 1 : 0);
+            /* Si dijo que lo coloco, TIENE que estar dentro.  Al reves no se
+             * exige: sin sitio en la ventana la arena sigue sirviendo, y eso es
+             * lo correcto -- convertir un problema de colocacion en uno de
+             * falta de memoria se depura mucho peor. */
+            if (codigo.placed())
+                check(dist <= ventana,
+                      "arena colocada: el bloque cae DENTRO de la ventana");
+        }
+        util::host_free(dato);
+    }
+
+    /* Y que la arena de siempre no ha cambiado: sin permisos ni ancla, se
+     * comporta igual y `placed` no acusa a nadie. */
+    {
+        util::ScratchArena normal;
+        void *p = normal.allocate(128, 8);
+        check(p != nullptr && normal.placed(),
+              "la arena de siempre sigue igual y no dice haber fallado nada");
     }
 
     std::printf("  memoria pedida por la arena: %.1f KB\n",

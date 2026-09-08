@@ -409,6 +409,63 @@ int main() {
               "cuanto queda");
     }
 
+    /* 8. Paginas EJECUTABLES cerca de un dato nuestro.
+     *
+     * Es lo que necesita un generador de codigo: alcanza sus datos con
+     * desplazamientos de 32 bits, que cubren +-2 GB, asi que donde CAE el
+     * codigo decide si funciona.  Y pedirle al sistema un rango pegado al dato
+     * no vale cuando el dato esta dentro de una reserva mayor que esa ventana
+     * -- medido: el recorrido ve 22 regiones y el hueco mayor es CERO, porque
+     * +-2 GB cabe entero dentro de la region grande --.  Por eso se sirve desde
+     * DENTRO, y eso es lo que se comprueba aqui.
+     *
+     * Las dos mitades fallan tarde y lejos si no se miran: unos permisos que no
+     * llegaron a la pagina no fallan al reservarla sino al saltar a ella, y una
+     * mala colocacion no falla nunca -- solo deja de caber un desplazamiento,
+     * mucho despues. */
+    {
+        /* Un dato de la region GRANDE, que es donde caen los globales de un
+         * modulo -- medido con el JIT --.  El tamano se DERIVA de las clases:
+         * la region grande sirve de `kBigClassMin` hasta `kMaxSmall`, y por
+         * encima de eso ya es un tramo de la pequena.  Escrito a mano, este
+         * test dejaria de probar lo que dice en cuanto se moviera una de las
+         * dos constantes, y sin avisar. */
+        void *const dato = util::host_alloc(util::kMaxSmall);
+        check(dato != nullptr && util::in_big_region(dato),
+              "codigo: hay un dato en la region grande al que llegar");
+
+        const size_t ventana = (size_t(1) << 31) - (128u << 20);
+        bool colocado = false;
+        const uint64_t antes = util::host_exec_allocs();
+        auto *code = static_cast<unsigned char *>(util::host_alloc_pages(
+            1u << 20, util::kOsReadWriteExec, dato, ventana, &colocado));
+
+        check(code != nullptr, "codigo: se sirven paginas ejecutables");
+        check(util::host_exec_allocs() > antes,
+              "codigo: y salen de NUESTRA reserva, no del sistema");
+        check(colocado, "codigo: colocadas dentro de la ventana pedida");
+
+        if (code != nullptr) {
+            const intptr_t d = reinterpret_cast<intptr_t>(code) -
+                               reinterpret_cast<intptr_t>(dato);
+            const size_t dist = size_t(d < 0 ? -d : d);
+            std::printf("  el codigo cayo a %.1f MiB del dato (ventana %.0f "
+                        "MiB)\n",
+                        double(dist) / (1024.0 * 1024.0),
+                        double(ventana) / (1024.0 * 1024.0));
+            check(dist <= ventana,
+                  "codigo: y la distancia lo confirma, no solo la bandera");
+
+            /* EJECUTABLE DE VERDAD: un `ret` y se llama.  Si los permisos no
+             * llegaron, esto no devuelve un valor raro: revienta. */
+            *code = 0xC3;
+            reinterpret_cast<void (*)()>(code)();
+            check(true, "codigo: y las paginas se EJECUTAN");
+        }
+        util::host_free_pages(code, 1u << 20);
+        util::host_free(dato);
+    }
+
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);
     return failures == 0 ? 0 : 1;
 }

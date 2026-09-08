@@ -20,6 +20,10 @@
  */
 #include "util/alloc/scratch_arena.h"
 
+/* `host_alloc_pages`: con ancla, los bloques se le piden al asignador, que es
+ * quien puede servir DENTRO de la reserva donde vive el dato. */
+#include "util/alloc/host_allocator.h"
+
 #include "util/os/os_memory.h" // apalabrar y entregar, sin arrastrar nada
 #include "util/os/thread_slot.h"
 
@@ -38,8 +42,13 @@ constexpr size_t kMaxBlock = 4 * 1024 * 1024;
 
 /// Arenas preparadas de antemano, una por hilo.  Es memoria estatica: no hay
 /// inicializador dinamico que pueda colgarse (ver `thread_slot.h`).
-constexpr uint32_t kMaxThreads = 64;
-ScratchArena g_arenas[kMaxThreads];
+///
+/// El nombre lleva `Arena` a proposito: el asignador tiene su propio
+/// `kMaxThreads` -- cuantos duenos puede nombrar -- y son dos cifras distintas
+/// que no tienen por que coincidir.  Llamarlas igual las hacia ambiguas al
+/// incluirlo, y peor: invitaba a creer que una gobierna a la otra.
+constexpr uint32_t kMaxArenaThreads = 64;
+ScratchArena g_arenas[kMaxArenaThreads];
 std::atomic<uint32_t> g_next_arena{0};
 ThreadSlot g_arena_slot;
 
@@ -55,10 +64,10 @@ ThreadSlot g_arena_slot;
  * @par Hilos
  * Segura.  Cada llamada devuelve un bloque distinto.
  */
-void *system_block(size_t bytes) noexcept {
+void *system_block(size_t bytes, OsProt prot) noexcept {
     void *p = os_reserve(bytes);
     if (p == nullptr) return nullptr;
-    if (!os_commit(p, bytes)) {
+    if (!os_commit(p, bytes, prot)) {
         os_release(p, bytes);
         return nullptr;
     }
@@ -77,7 +86,27 @@ ScratchArena::Block *ScratchArena::add_block(size_t least) noexcept {
     while (size < least + sizeof(Block))
         size *= 2;
 
-    void *mem = system_block(size);
+    /* SI LA ARENA PIDIO SITIO, se pide.  `os_alloc_near` recorre la ventana
+     * buscando el hueco mas cercano; si no hay, contesta nulo -- que NO es
+     * quedarse sin memoria -- y entonces se cae al camino de siempre, donde
+     * elige el sistema.  La arena sigue sirviendo; lo que cambia es que
+     * `placed()` pasa a decir que no, y quien necesitaba la cercania puede
+     * enterarse en vez de fallar mucho despues y en otro sitio. */
+    /* CON ANCLA, SE LE PIDE AL ASIGNADOR, que es el unico que puede servir
+     * DENTRO de la reserva donde vive el dato.  Pedirle al sistema un rango
+     * pegado no vale cuando el ancla esta dentro de una reserva mayor que la
+     * ventana -- medido: 22 regiones y hueco mayor cero, porque +-2 GB cabe
+     * entero dentro de los 16 GiB de la region grande --, y ahi la unica salida
+     * es servir desde dentro.  `host_alloc_pages` hace eso, y cae al sistema
+     * solo cuando el ancla no es suya. */
+    void *mem = nullptr;
+    if (anchor_ != nullptr) {
+        mem = host_alloc_pages(size, prot_, anchor_, window_, &placed_, &scan_);
+    }
+    if (mem == nullptr) {
+        mem = system_block(size, prot_);
+        if (anchor_ != nullptr) placed_ = false;
+    }
     if (mem == nullptr) return nullptr;
 
     Block *b = static_cast<Block *>(mem);
@@ -139,14 +168,14 @@ ScratchArena &scratch_arena() noexcept {
 
     const uint32_t id = g_next_arena.fetch_add(1, std::memory_order_acq_rel);
     ScratchArena *a;
-    if (id < kMaxThreads) {
+    if (id < kMaxArenaThreads) {
         a = &g_arenas[id];
     } else {
         /* Mas hilos de los previstos.  Se le da una arena propia igualmente --
          * compartir una entre dos hilos seria una carrera -- y se acepta que
          * esa memoria no se devuelva: pasa como mucho una vez por hilo extra.
          */
-        void *mem = system_block(sizeof(ScratchArena));
+        void *mem = system_block(sizeof(ScratchArena), kOsReadWrite);
         if (mem == nullptr) return g_arenas[0]; // sin memoria ni para esto
         a = new (mem) ScratchArena();
     }

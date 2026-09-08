@@ -64,6 +64,14 @@ LONG __stdcall NtQueryInformationProcess(HANDLE ProcessHandle,
                                          PVOID ProcessInformation,
                                          ULONG ProcessInformationLength,
                                          PULONG ReturnLength);
+/* Que hay en una direccion.  La usa `os_alloc_near` para recorrer el mapa
+ * buscando hueco, que es lo unico que permite colocar un bloque CERCA de otro
+ * en vez de dejarlo al azar del sistema. */
+LONG __stdcall NtQueryVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
+                                    ULONG MemoryInformationClass,
+                                    PVOID MemoryInformation,
+                                    SIZE_T MemoryInformationLength,
+                                    PSIZE_T ReturnLength);
 }
 
 /// Lo que devuelve `NtQuerySystemInformation` con la clase 0.  Se escribe aqui
@@ -293,6 +301,90 @@ void *os_alloc(size_t bytes, OsProt prot) noexcept {
                                    kWinProt[prot_index(prot)]) >= 0
                ? base
                : nullptr;
+}
+
+void *os_alloc_near(size_t bytes, OsProt prot, const void *anchor,
+                    size_t window, OsNearScan *scan) noexcept {
+    if (scan != nullptr) *scan = OsNearScan{0, 0};
+    if (bytes == 0) return nullptr;
+    if (anchor == nullptr) return os_alloc(bytes, prot);
+
+    /* Al grano de RESERVA, que en Windows es de 64 KiB y no la pagina: una
+     * reserva solo puede empezar ahi, y pedir en medio la redondea hacia abajo
+     * -- o sea que se acabaria mirando una direccion y reservando otra. */
+    const uintptr_t grain = os_reserve_granularity();
+    const uintptr_t base = reinterpret_cast<uintptr_t>(anchor) & ~(grain - 1);
+    const uintptr_t low = (base > window) ? (base - window) : grain;
+    const uintptr_t high =
+        (base + window < base) ? ~uintptr_t(0) : (base + window);
+    const size_t want = round_up(bytes, os_page_size());
+
+    /* SE RECORREN LAS REGIONES, no se prueban direcciones.  Probar `base +- 2^k`
+     * -- treinta puntos de la ventana -- es lo que habia antes en quien llama, y
+     * basta una reserva grande por en medio para que los treinta esten
+     * ocupados; entonces se caia a la eleccion del sistema y el bloque acababa
+     * a 16 GiB.  Preguntar cuesta una consulta por region y solo al reservar. */
+    /* SE BUSCA EL HUECO MAS CERCANO, no el primero.  Recorrer de un extremo al
+     * otro y quedarse con el primero que quepa deja el bloque en el BORDE de la
+     * ventana -- medido: a 1.920 MiB de un ancla que tenia hueco mucho mas
+     * cerca --, y ahi el margen es cero: el desplazamiento se mide contra CADA
+     * dato, no contra el ancla, asi que cualquiera un poco mas alla ya no
+     * alcanza.  Se recorre entera y se elige por distancia. */
+    uintptr_t best = 0;
+    uintptr_t best_dist = ~uintptr_t(0);
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uintptr_t probe = low; probe < high;) {
+        if (NtQueryVirtualMemory(VESTA_NT_SELF, reinterpret_cast<PVOID>(probe),
+                                 0 /* MemoryBasicInformation */, &mbi,
+                                 sizeof(mbi), nullptr) < 0)
+            break;
+        const uintptr_t region_begin =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t region_end = region_begin + mbi.RegionSize;
+        if (scan != nullptr) ++scan->regions;
+        if (mbi.State == MEM_FREE) {
+            const uintptr_t from = (region_begin < probe) ? probe : region_begin;
+            const uintptr_t first = (from + grain - 1) & ~(grain - 1);
+            if (scan != nullptr && first < high && region_end > first) {
+                const size_t free_here = size_t(region_end - first);
+                if (free_here > scan->largest_free)
+                    scan->largest_free = free_here;
+            }
+            if (first < high && region_end > first &&
+                (region_end - first) >= want) {
+                /* Dentro de la region, el sitio mas cercano al ancla: pegado al
+                 * principio si la region esta por encima, pegado al final si
+                 * esta por debajo, y el propio ancla si lo contiene. */
+                uintptr_t at = first;
+                if (base > first) {
+                    const uintptr_t last = (region_end - want) & ~(grain - 1);
+                    at = (base < last) ? (base & ~(grain - 1)) : last;
+                    if (at < first) at = first;
+                }
+                const uintptr_t dist = at > base ? (at - base) : (base - at);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = at;
+                }
+            }
+        }
+        /* Avanzar SIEMPRE, aunque la consulta devuelva una region rara: con un
+         * tamano cero esto se queda dando vueltas. */
+        probe = (region_end > probe) ? region_end : (probe + grain);
+    }
+    if (best != 0) {
+        PVOID p = reinterpret_cast<PVOID>(best);
+        SIZE_T size = want;
+        /* Puede fallar aunque la region dijera libre: entre la consulta y esto,
+         * otro hilo pudo tomarla.  Entonces se cede al sistema en vez de
+         * insistir -- es raro, y un bucle de reintento aqui es una espera sin
+         * cota --, y quien llama comprueba la distancia igualmente. */
+        if (NtAllocateVirtualMemory(VESTA_NT_SELF, &p, 0, &size,
+                                    MEM_COMMIT | MEM_RESERVE,
+                                    kWinProt[prot_index(prot)]) >= 0)
+            return p;
+    }
+    return nullptr; // no habia sitio EN LA VENTANA; no es quedarse sin memoria
 }
 
 void os_free(void *addr, size_t bytes) noexcept {
@@ -526,6 +618,57 @@ void *os_alloc(size_t bytes, OsProt prot) noexcept {
     return sys_mmap(nullptr, round_up(bytes, os_page_size()),
                     kPosixProt[prot_index(prot)],
                     MAP_PRIVATE | MAP_ANONYMOUS);
+}
+
+void *os_alloc_near(size_t bytes, OsProt prot, const void *anchor,
+                    size_t window, OsNearScan *scan) noexcept {
+    /* AQUI NO SE RECORRE NADA, asi que no hay regiones que contar: se le pide
+     * al nucleo y se mira donde cayo.  Se deja en cero en vez de inventar una
+     * cifra -- un informe que dice "vio 0 regiones" en ELF esta diciendo la
+     * verdad: el camino es otro, y quien lo lea tiene que saberlo. */
+    if (scan != nullptr) *scan = OsNearScan{0, 0};
+    if (bytes == 0) return nullptr;
+    if (anchor == nullptr) return os_alloc(bytes, prot);
+
+    const size_t page = os_page_size();
+    const size_t want = round_up(bytes, page);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(anchor) & ~(page - 1);
+
+    /* AQUI SE PIDE, no se recorre el mapa.  `mmap` acepta una direccion
+     * preferida SIN `MAP_FIXED`: si esa esta ocupada el nucleo elige otra por su
+     * cuenta y no pisa nada, asi que se prueba y se mira DONDE cayo.  Es la
+     * diferencia con Windows, donde una reserva en la direccion pedida o sale o
+     * falla, y por eso alli hay que preguntar primero.
+     *
+     * `MAP_FIXED` haria justo lo que no se quiere: entregar la direccion
+     * pisando lo que hubiera, que en un proceso vivo es corromper a otro.
+     *
+     * Se avanza a saltos de un dieciseisavo de la ventana a los dos lados, para
+     * no depender de que el primer intento acierte y sin recorrer pagina a
+     * pagina una ventana de gigas. */
+    const size_t step = (window / 16) < page ? page : (window / 16);
+    for (size_t off = 0; off <= window; off += step) {
+        for (int sign = 0; sign < 2; ++sign) {
+            const uintptr_t at = sign == 0 ? (base + off)
+                                           : (base > off ? base - off : 0);
+            if (at == 0) continue;
+            void *p = sys_mmap(reinterpret_cast<void *>(at), want,
+                               kPosixProt[prot_index(prot)],
+                               MAP_PRIVATE | MAP_ANONYMOUS);
+            if (p == nullptr) continue;
+            /* Lo que decide es DONDE cayo, no que la llamada saliera bien: sin
+             * `MAP_FIXED` el nucleo puede haberlo puesto en cualquier sitio, y
+             * un bloque lejos no sirve para lo que se pidio.  Si no vale se
+             * suelta y se sigue; quedarselo seria contestar que si a una
+             * pregunta que era sobre la distancia. */
+            const uintptr_t got = reinterpret_cast<uintptr_t>(p);
+            const uintptr_t dist = got > base ? (got - base) : (base - got);
+            if (dist <= window) return p;
+            sys_munmap(p, want);
+            if (off == 0) break; // el cero es el mismo sitio por los dos lados
+        }
+    }
+    return nullptr; // no habia sitio EN LA VENTANA; no es quedarse sin memoria
 }
 
 void os_free(void *addr, size_t bytes) noexcept {

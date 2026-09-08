@@ -87,6 +87,11 @@
 #ifndef VESTA_UTIL_SCRATCH_ARENA_H
 #define VESTA_UTIL_SCRATCH_ARENA_H
 
+/* Los permisos y la colocacion de sus bloques son parte de la arena, asi que su
+ * vocabulario viene de aqui: `OsProt` y `kOsReadWrite`.  Es la misma capa de la
+ * que ya salian los bloques. */
+#include "util/os/os_memory.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -169,6 +174,152 @@ class ScratchArena {
         /// \~spanish cuanto de el estaba en uso en ese momento  \~
         size_t used;
     };
+
+    /// \~english The ordinary arena: readable and writable, wherever it lands.
+    /// \~spanish La arena de siempre: se lee y se escribe, y cae donde caiga.
+    /// \~
+    ScratchArena() noexcept = default;
+
+    /**
+     * @brief
+     * \~english An arena with the PERMISSIONS asked for, placed CLOSE to an
+     *          address.
+     * \~spanish Una arena con los PERMISOS que se pidan, colocada CERCA de una
+     *          direccion.
+     * \~
+     *
+     * \~english
+     * IT IS THE SAME ARENA, and that is the point: reserving a range and
+     * handing pieces out of it does not change because the pages are executable
+     * or because they have to land somewhere specific.  Only two things it
+     * already did implicitly become parameters.
+     *
+     * WHAT PLACEMENT IS FOR.  Generated code reaches its data with 32-bit
+     * displacements, which cover +-2 GB; past that the reference cannot be
+     * emitted at all.  So an arena that will hold code has to be able to say
+     * "near this datum" -- letting the system choose is fine until something
+     * large is reserved in between, and then the answer is arbitrary: measured,
+     * 16 GiB from a datum eight bytes off the anchor.
+     *
+     * If there is no room within @p window the arena is still usable: its
+     * blocks then land wherever the system puts them, and @c placed says so.
+     * Refusing to hand out memory would turn a placement problem into an
+     * out-of-memory one, which is a worse thing to debug.
+     *
+     * \~spanish
+     * ES LA MISMA ARENA, y esa es la idea: apalabrar un rango e ir repartiendo
+     * trozos no cambia porque las paginas sean ejecutables ni porque tengan que
+     * caer en un sitio concreto.  Solo se vuelven parametros dos cosas que ya
+     * hacia de forma implicita.
+     *
+     * PARA QUE SIRVE LA COLOCACION.  El codigo generado alcanza sus datos con
+     * desplazamientos de 32 bits, que cubren +-2 GB; mas alla la referencia no
+     * se puede ni emitir.  Asi que una arena que vaya a guardar codigo tiene
+     * que poder decir "cerca de este dato" -- dejar elegir al sistema vale
+     * hasta que se reserva algo grande por en medio, y entonces la respuesta es
+     * arbitraria: medido, a 16 GiB de un dato que estaba a ocho bytes del
+     * ancla.
+     *
+     * Si no hay sitio dentro de @p window la arena sigue sirviendo: sus bloques
+     * caen donde el sistema quiera y @c placed lo dice.  Negarse a dar memoria
+     * convertiria un problema de colocacion en uno de falta de memoria, que se
+     * depura mucho peor.
+     *
+     * \~
+     * @param prot
+     * \~english the permissions its blocks are committed with.
+     * \~spanish los permisos con los que se comprometen sus bloques.
+     * \~
+     * @param anchor
+     * \~english the address to stay close to, or nullptr for anywhere.
+     * \~spanish la direccion de la que no alejarse, o nulo para cualquier
+     *           sitio.
+     * \~
+     * @param window
+     * \~english how far from @p anchor still counts as close.
+     * \~spanish a que distancia de @p anchor sigue valiendo.
+     * \~
+     *
+     * \~english
+     * @code
+     *   // An arena for generated code that has to reach the module's globals.
+     *   util::ScratchArena code(util::kOsReadWriteExec, globals,
+     *                           (size_t(1) << 31) - (128u << 20));
+     *   auto *p = static_cast<uint8_t *>(code.allocate(n, 16));
+     * @endcode
+     *
+     * \~spanish
+     * @code
+     *   // Una arena de codigo generado que tiene que alcanzar los globales.
+     *   util::ScratchArena codigo(util::kOsReadWriteExec, globales,
+     *                             (size_t(1) << 31) - (128u << 20));
+     *   auto *p = static_cast<uint8_t *>(codigo.allocate(n, 16));
+     * @endcode
+     *
+     * \~
+     */
+    ScratchArena(OsProt prot, const void *anchor, size_t window) noexcept
+        : prot_(prot), anchor_(anchor), window_(window) {}
+
+    /**
+     * @brief
+     * \~english Whether its blocks really landed where they were asked to.
+     * \~spanish Si sus bloques cayeron de verdad donde se pidio.
+     * \~
+     *
+     * \~english
+     * FALSE IS NOT A FAILURE, it is the answer to a different question: the
+     * arena works either way, but code living in it may not reach its data.
+     * Asking is the only way to tell "I did not ask for the area" from "I asked
+     * and there was none" -- they look identical from the outside and they are
+     * different problems.
+     *
+     * True as well for an arena that never asked for a place: it landed
+     * wherever it was going to, which is exactly what it wanted.
+     *
+     * \~spanish
+     * FALSO NO ES UN FALLO, es la respuesta a otra pregunta: la arena sirve
+     * igual, pero el codigo que viva en ella puede no alcanzar sus datos.
+     * Preguntarlo es la unica forma de distinguir "no pedi la zona" de "pedi y
+     * no habia" -- desde fuera se ven igual y son arreglos distintos.
+     *
+     * Cierto tambien para una arena que no pidio sitio: cayo donde iba a caer,
+     * que es justo lo que queria.
+     *
+     * \~
+     * @return
+     * \~english true while every block is within the window.
+     * \~spanish cierto mientras todos los bloques esten dentro de la ventana.
+     * \~
+     */
+    bool placed() const noexcept { return placed_; }
+
+    /**
+     * @brief
+     * \~english What the last placement attempt SAW, when it could not place.
+     * \~spanish Lo que VIO el ultimo intento de colocacion, cuando no pudo.
+     * \~
+     *
+     * \~english
+     * `placed() == false` says it did not fit; this says why, and the two
+     * answers lead to different fixes: no regions at all means nothing was
+     * asked for, while regions with no room means the window really is full --
+     * which is what a large reservation lying across it looks like from here.
+     *
+     * \~spanish
+     * `placed() == false` dice que no cupo; esto dice por que, y las dos
+     * respuestas llevan a arreglos distintos: cero regiones significa que no se
+     * llego a pedir, y regiones sin sitio significa que la ventana esta llena
+     * de verdad -- que es como se ve desde aqui una reserva grande cruzada por
+     * en medio.
+     *
+     * \~
+     * @return
+     * \~english the regions walked and the largest free run seen.
+     * \~spanish las regiones recorridas y el hueco libre mayor visto.
+     * \~
+     */
+    const OsNearScan &last_scan() const noexcept { return scan_; }
 
     /**
      * @brief
@@ -347,6 +498,28 @@ class ScratchArena {
     Block *head_ = nullptr;
     Block *current_ = nullptr;
     size_t reserved_ = 0;
+    /// \~english what its blocks are committed with; the ordinary arena reads
+    ///           and writes.
+    /// \~spanish con que se comprometen sus bloques; la arena de siempre lee y
+    ///           escribe.
+    /// \~
+    OsProt prot_ = kOsReadWrite;
+    /// \~english the address not to stray from, or null for anywhere
+    /// \~spanish la direccion de la que no alejarse, o nulo para cualquier sitio
+    /// \~
+    const void *anchor_ = nullptr;
+    /// \~english how far from @c anchor_ still counts as close
+    /// \~spanish a que distancia de @c anchor_ sigue valiendo  \~
+    size_t window_ = 0;
+    /// \~english false as soon as ONE block lands outside the window; see
+    ///           @c placed.
+    /// \~spanish falso en cuanto UN bloque cae fuera de la ventana; ver
+    ///           @c placed.
+    /// \~
+    bool placed_ = true;
+    /// \~english what the last attempt saw; see @c last_scan.
+    /// \~spanish lo que vio el ultimo intento; ver @c last_scan.  \~
+    OsNearScan scan_{0, 0};
 };
 
 /**

@@ -202,6 +202,9 @@
 #include "util/alloc/host_allocator_c.h" // ahi se declara `HostAllocStats`, para C
 #include "util/alloc/host_allocator_layout.h"
 #include "util/alloc/size_buckets.h"
+/* `OsProt` y `OsNearScan`: los necesita `host_alloc_pages`, que entrega paginas
+ * con permisos y dice si pudo colocarlas donde se le pidio. */
+#include "util/os/os_memory.h"
 #include "util/os/thread_slot.h"
 
 #include <cstddef>
@@ -2941,6 +2944,169 @@ uint64_t host_direct_allocs() noexcept;
  * \~
  */
 uint64_t host_fill_allocs(AllocFill f) noexcept;
+
+/**
+ * @brief
+ * \~english Pages that can be EXECUTED, close to a datum that already exists.
+ * \~spanish Paginas que se pueden EJECUTAR, cerca de un dato que ya existe.
+ * \~
+ *
+ * \~english
+ * WHY THE ALLOCATOR AND NOT THE SYSTEM.  Generated code reaches its data with
+ * 32-bit displacements relative to the instruction pointer, which cover +-2 GB;
+ * past that the reference cannot be emitted at all.  So where the code LANDS
+ * decides whether it works -- and asking the system for a range NEXT TO the
+ * datum does not work when the datum lives inside a reservation bigger than
+ * that window: measured, with the anchor in the big-class region the walk sees
+ * 22 regions and the largest free run is ZERO, because +-2 GB fits entirely
+ * inside those 16 GiB.  That is geometry, not bad luck.
+ *
+ * What does work is serving it from INSIDE that same reservation, which is
+ * what this does: the chunks come off the very cursor the big classes use, and
+ * the only thing that differs is the permissions the pages are committed with.
+ * The data path does not change -- there is one more client, not a new
+ * mechanism -- and closeness follows on its own, because that cursor runs just
+ * behind everything already handed out.
+ *
+ * IT IS A PAIR with @c host_free_pages, like the aligned entries: what comes out
+ * of here does NOT go to @c host_free.  A block from the region has no chunk
+ * header, so the ordinary free would read whatever is in its first bytes as
+ * one.
+ *
+ * @param bytes  how many, rounded up to the region's chunk.
+ * @param anchor the datum the code must reach; nullptr asks the system.
+ * @param window how far from @p anchor still reaches -- the caller knows what
+ *               its displacements cover, so it says.
+ * @return the block, or nullptr.  A block that came back is NOT a promise that
+ *         it is within the window: the region may have run past it, and
+ *         @c host_exec_far counts the times that happened.
+ *
+ * @par Threads
+ * Safe.  The cursor is atomic and two threads asking at once get different
+ * chunks.
+ *
+ * \~spanish
+ * POR QUE EL ASIGNADOR Y NO EL SISTEMA.  El codigo generado alcanza sus datos
+ * con desplazamientos de 32 bits relativos al puntero de instruccion, que
+ * cubren +-2 GB; mas alla la referencia no se puede ni emitir.  Asi que donde
+ * CAE el codigo decide si funciona -- y pedirle al sistema un rango PEGADO al
+ * dato no vale cuando el dato vive dentro de una reserva mayor que esa ventana:
+ * medido, con el ancla en la region de clases grandes el recorrido ve 22
+ * regiones y el hueco mayor es CERO, porque +-2 GB cabe entero dentro de esos
+ * 16 GiB.  Eso es geometria, no mala suerte.
+ *
+ * Lo que si vale es servirlo desde DENTRO de esa misma reserva, que es lo que
+ * hace esto: los trozos salen del mismo cursor que usan las clases grandes, y
+ * lo unico que cambia son los permisos con que se comprometen las paginas.  El
+ * camino de datos no se entera -- hay un cliente mas, no un mecanismo nuevo --
+ * y la cercania sale sola, porque ese cursor va justo detras de todo lo ya
+ * entregado.
+ *
+ * VA EN PAREJA con @c host_free_pages, como las entradas alineadas: lo que sale
+ * de aqui NO se suelta con @c host_free.  Un bloque de la region no lleva
+ * cabecera de trozo, asi que el free normal leeria como tal lo que hubiera en
+ * sus primeros bytes.
+ *
+ * @param bytes  cuantos, redondeados al trozo de la region.
+ * @param anchor el dato que el codigo tiene que alcanzar; nulo se lo pide al
+ *               sistema.
+ * @param window a que distancia de @p anchor todavia se alcanza -- quien llama
+ *               sabe lo que cubren sus desplazamientos, asi que lo dice.
+ * @return el bloque, o nulo.  Que vuelva un bloque NO promete que este dentro
+ *         de la ventana: la region puede haberse alejado, y
+ *         @c host_exec_far cuenta las veces que paso.
+ *
+ * @par Hilos
+ * Segura.  El cursor es atomico y dos hilos que pidan a la vez reciben trozos
+ * distintos.
+ *
+ * \~
+ *
+ * \~english
+ * @code
+ *   bool placed = false;
+ *   void *code = util::host_alloc_pages(1u << 20, util::kOsReadWriteExec,
+ *                                       globals,
+ *                                       (size_t(1) << 31) - (128u << 20),
+ *                                       &placed);
+ *   ...
+ *   util::host_free_pages(code, 1u << 20);   // NOT host_free
+ * @endcode
+ *
+ * \~spanish
+ * @code
+ *   bool colocado = false;
+ *   void *codigo = util::host_alloc_pages(1u << 20, util::kOsReadWriteExec,
+ *                                         globales,
+ *                                         (size_t(1) << 31) - (128u << 20),
+ *                                         &colocado);
+ *   ...
+ *   util::host_free_pages(codigo, 1u << 20);   // NO host_free
+ * @endcode
+ *
+ * \~
+ * @see host_free_pages, host_exec_far
+ */
+void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
+                       size_t window, bool *placed = nullptr,
+                       OsNearScan *scan = nullptr) noexcept;
+
+/**
+ * @brief
+ * \~english Returns what @c host_alloc_pages handed out.
+ * \~spanish Devuelve lo que entrego @c host_alloc_pages.
+ * \~
+ * @param bytes
+ * \~english the same size it was asked for.
+ * \~spanish el mismo tamano con que se pidio.
+ * \~
+ * @param p
+ * \~english the block, or nullptr, which does nothing.
+ * \~spanish el bloque, o nulo, que no hace nada.
+ * \~
+ */
+void host_free_pages(void *p, size_t bytes) noexcept;
+
+/**
+ * @brief
+ * \~english How many executable blocks came out of our own reservation.
+ * \~spanish Cuantos bloques ejecutables salieron de nuestra propia reserva.
+ * \~
+ * @return
+ * \~english how many, since the process started.
+ * \~spanish cuantos, desde que arranco el proceso.
+ * \~
+ */
+uint64_t host_exec_allocs() noexcept;
+
+/**
+ * @brief
+ * \~english Times the region could NOT place executable pages close enough.
+ * \~spanish Veces que la region NO pudo colocar paginas ejecutables lo bastante
+ *          cerca.
+ * \~
+ *
+ * \~english
+ * IT HAS TO BE ASKABLE, because failing here is silent by nature: the block
+ * still comes back and the program still runs -- what breaks is a displacement
+ * that no longer fits, much later and somewhere else.  Non-zero means the
+ * region handed out more than the window before the code was asked for, and
+ * whoever needs the closeness has to know.
+ *
+ * \~spanish
+ * TIENE QUE PODER PREGUNTARSE, porque fallar aqui es mudo por naturaleza: el
+ * bloque vuelve igual y el programa sigue -- lo que se rompe es un
+ * desplazamiento que ya no cabe, mucho despues y en otro sitio --.  Distinto de
+ * cero significa que la region repartio mas que la ventana antes de que se
+ * pidiera el codigo, y quien necesite la cercania tiene que enterarse.
+ *
+ * \~
+ * @return
+ * \~english how many times it fell back to asking the system.
+ * \~spanish cuantas veces hubo que caer a pedirselo al sistema.
+ * \~
+ */
+uint64_t host_exec_far() noexcept;
 
 /**
  * @brief
