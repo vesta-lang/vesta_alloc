@@ -72,6 +72,10 @@
 #ifndef VESTA_UTIL_ALLOC_TAG_H
 #define VESTA_UTIL_ALLOC_TAG_H
 
+/* Los VALORES viven en la cabecera de C, y aqui solo se les pone nombre
+ * fuerte: asi los dos lenguajes no pueden separarse.  Ver `alloc_tag_c.h`. */
+#include "util/alloc/alloc_tag_c.h"
+
 #include <cstdint>
 
 namespace util {
@@ -84,14 +88,14 @@ namespace util {
  */
 enum class AllocUse : uint8_t {
     /// \~english nobody said  \~spanish nadie lo dijo  \~
-    Unknown = 0,
+    Unknown = VestaUse_Unknown,
     /// \~english dies inside the operation that asked for it
     /// \~spanish muere dentro de la operacion que lo pidio  \~
-    Instant,
+    Instant = VestaUse_Instant,
     /// \~english lives as long as one phase  \~spanish vive lo que dure una fase  \~
-    Medium,
+    Medium = VestaUse_Medium,
     /// \~english lives as long as the process  \~spanish vive lo que dure el proceso  \~
-    Long
+    Long = VestaUse_Long
 };
 
 /**
@@ -102,13 +106,80 @@ enum class AllocUse : uint8_t {
  */
 enum class AllocShape : uint8_t {
     /// \~english nobody said  \~spanish nadie lo dijo  \~
-    Unknown = 0,
+    Unknown = VestaShape_Unknown,
     /// \~english asked for once and that is it  \~spanish se pide una vez y ya  \~
-    Fixed,
+    Fixed = VestaShape_Fixed,
     /// \~english a container that will grow and abandon this buffer
     /// \~spanish un contenedor que se hara mayor y abandonara este buffer  \~
-    Growing
+    Growing = VestaShape_Growing
 };
+
+/**
+ * @brief
+ * \~english How much of the block the caller is going to touch.
+ * \~spanish Cuanto del bloque va a tocar el llamante.
+ * \~
+ *
+ * \~english
+ * A THIRD AXIS, AND APART FROM THE OTHER TWO ON PURPOSE.  It does not go into
+ * @c AllocTag: those two are packed into four bits so the byte can index the
+ * counter table directly, and a third axis would take that table from 16 slots
+ * to 64 -- 384 KiB more of static memory across every cache, and a change to
+ * the layout of the structure the fast path lives in, which has already cost a
+ * measurement once.  It is counted on its own instead.
+ *
+ * WHAT IT DECIDES, and it is the one thing the allocator cannot work out for
+ * itself.  Handing back a big zeroed block has two ways to be right and they
+ * are opposites: keep the block and CLEAR it, whose cost is flat in what gets
+ * read because the whole thing is written; or ask the system for a fresh one,
+ * which arrives already zero and costs a page fault for every page the caller
+ * actually touches.  Measured across sizes and fractions, they cross at a
+ * FRACTION -- somewhere between 1/16 and 1/4 -- and NOT at a size: the same
+ * 8 MiB request wins one way read sparsely and the other way read whole.  So no
+ * threshold on size can choose, and the only one who knows is the caller.
+ *
+ * Zero is "nobody said", and it keeps today's behaviour: a default that looks
+ * like knowledge does not fail, it lies.
+ *
+ * \~spanish
+ * UN TERCER EJE, Y APARTE DE LOS OTROS DOS A PROPOSITO.  No entra en
+ * @c AllocTag: esos dos van empaquetados en cuatro bits para que el byte indexe
+ * directamente la tabla de contadores, y un tercer eje la llevaria de 16 a 64
+ * ranuras -- 384 KiB mas de memoria estatica entre todos los caches, y un
+ * cambio en el layout de la estructura donde vive el camino rapido, que ya
+ * costo una medicion una vez --.  Se cuenta por separado.
+ *
+ * QUE DECIDE, que es lo unico que el asignador no puede averiguar solo.
+ * Entregar un bloque grande a cero tiene dos formas de estar bien y son
+ * opuestas: quedarse el bloque y LIMPIARLO, cuyo coste es plano en lo que se
+ * lea porque se escribe entero; o pedirle uno fresco al sistema, que llega ya a
+ * cero y cuesta un fallo de pagina por cada pagina que el llamante toque de
+ * verdad.  Medido a lo largo de tamanos y fracciones, se cruzan en una
+ * FRACCION -- entre 1/16 y 1/4 -- y NO en un tamano: la misma peticion de
+ * 8 MiB gana de una forma leida a trozos y de la otra leida entera.  Asi que
+ * ningun umbral por tamano puede elegir, y el unico que lo sabe es quien llama.
+ *
+ * El cero es "nadie lo dijo", y deja el comportamiento de hoy: un valor por
+ * defecto que parece saber no falla, miente.
+ *
+ * \~
+ */
+enum class AllocFill : uint8_t {
+    /// \~english nobody said  \~spanish nadie lo dijo  \~
+    Unknown = VestaFill_Unknown,
+    /// \~english a small part of it gets touched
+    /// \~spanish se toca una parte pequena  \~
+    Sparse = VestaFill_Sparse,
+    /// \~english a good part of it  \~spanish buena parte de el  \~
+    Dense = VestaFill_Dense,
+    /// \~english all of it  \~spanish entero  \~
+    All = VestaFill_All
+};
+
+/// \~english How many values @c AllocFill takes.  The size of its counters.
+/// \~spanish Cuantos valores toma @c AllocFill.  Tamano de sus contadores.
+/// \~
+inline constexpr uint32_t kAllocFillSlots = VESTA_ALLOC_FILL_SLOTS;
 
 /**
  * @brief

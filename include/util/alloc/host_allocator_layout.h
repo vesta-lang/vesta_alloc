@@ -300,7 +300,15 @@ inline constexpr uint32_t kClasses = sizeof(kSizes) / sizeof(kSizes[0]);
  * instead of a store INTO the block, which is a line the caller may not have
  * touched in a while.
  *
- * EIGHT, so the array is exactly one cache line.  Bigger buys a longer run
+ * EIGHT, so the ARRAY is exactly one cache line -- which is not the same as
+ * the array starting ON one, and it does not: where it starts depends on
+ * everything declared ahead of it.  That was worth worrying about and turned
+ * out not to be: profiled with hardware counters on twelve threads,
+ * `SPLIT_LOADS` and `SPLIT_STORES` are exactly zero and so is every `XSNP_*`
+ * event, aligned or not.  Nothing crosses a line, because each slot is
+ * eight-byte aligned and no single access straddles anything.
+ *
+ * Bigger buys a longer run
  * between refills and costs the same line count in every cache -- and there are
  * `kTotalCaches` of them, so this is not free memory.  One class at a time and
  * not one batch per class for the same reason: per class it would be
@@ -322,7 +330,15 @@ inline constexpr uint32_t kClasses = sizeof(kSizes) / sizeof(kSizes[0]);
  * almacen DENTRO del bloque, que es una linea que el llamante puede llevar rato
  * sin tocar.
  *
- * OCHO, para que el array sea exactamente una linea de cache.  Mas grande
+ * OCHO, para que el ARRAY sea exactamente una linea de cache -- que no es lo
+ * mismo que el array EMPIECE en una, y no empieza: donde arranca depende de
+ * todo lo declarado por delante.  Eso preocupaba y resulto no ser nada:
+ * perfilado con contadores hardware sobre doce hilos, `SPLIT_LOADS` y
+ * `SPLIT_STORES` salen exactamente a cero, y todos los eventos `XSNP_*`
+ * tambien, alineado o no.  Nada cruza una linea, porque cada ranura esta
+ * alineada a ocho y ningun acceso suelto se parte.
+ *
+ * Mas grande
  * compra una tirada mas larga entre recargas y cuesta las mismas lineas en cada
  * cache -- y hay `kTotalCaches` de ellos, asi que esta memoria no es gratis --.
  * Una clase cada vez y no un lote por clase por lo mismo: por clase serian
@@ -1540,6 +1556,75 @@ static_assert(sizeof(ChunkHeader) == kAlign,
  */
 inline constexpr size_t kMaxSpanBytes =
     size_t(kMaxSpanChunks) * kChunkBytes - sizeof(ChunkHeader);
+
+/**
+ * \~english
+ * @brief The smallest block a declared-sparse @c calloc is worth asking the
+ *        system for.
+ *
+ * When the caller has said it will touch little -- @c AllocFill::Sparse -- a
+ * fresh reservation beats clearing: it arrives zeroed from the kernel and costs
+ * a page fault only for the pages actually touched.  But asking is a system
+ * call, and below some size clearing the block is simply cheaper than asking
+ * for one.  That size, measured (us per allocate-touch-free round):
+ *
+ *     size      read 1/256   read 1/64   read 1/16
+ *              region  sys  region  sys  region  sys
+ *      64 KiB   0.78  2.29   0.78  2.23   0.78  2.30
+ *     128 KiB   1.56  2.34   1.56  2.33   1.55  3.29
+ *     256 KiB   3.08  2.33   3.08  2.38   3.08  5.40
+ *       1 MiB  12.29  6.09  12.27  9.27  12.40 22.59
+ *       4 MiB  79.95  9.86  79.58 23.68  80.19 56.60
+ *       8 MiB 164.28 14.24 161.80 32.09 163.40 93.21
+ *
+ * The system stops losing at 256 KiB, which is where a fill costs about what
+ * the call does.  From 4 MiB up it wins even at 1/16, by 1.42x to 11.53x.
+ *
+ * SO "SPARSE" MEANS LESS THAN ABOUT ONE PART IN SIXTY-FOUR, and the table is
+ * the definition: a caller that declares it and then reads 1/16 of a 1 MiB
+ * block loses 1.82x.  That is what an assertion is -- see @c AllocFill -- and
+ * it costs speed, never correctness.
+ *
+ * There is a second reason not to lower it further: these blocks are placed on
+ * free from a fixed table of @c kDirectSlots entries, so they cannot become the
+ * common case.
+ *
+ * \~spanish
+ * @brief El bloque mas pequeno por el que compensa ir al sistema en un
+ *        @c calloc declarado disperso.
+ *
+ * Cuando el llamante ha dicho que va a tocar poco -- @c AllocFill::Sparse --
+ * una reserva fresca le gana a limpiar: llega a cero del nucleo y solo cuesta
+ * un fallo de pagina por las paginas que se toquen de verdad.  Pero pedirla es
+ * una llamada al sistema, y por debajo de cierto tamano limpiar el bloque sale
+ * mas barato que pedir uno.  Ese tamano, medido (us por vuelta de reservar,
+ * tocar y soltar):
+ *
+ *     tamano    leido 1/256  leido 1/64  leido 1/16
+ *              region  sist  region sist  region sist
+ *      64 KiB   0,78  2,29   0,78  2,23   0,78  2,30
+ *     128 KiB   1,56  2,34   1,56  2,33   1,55  3,29
+ *     256 KiB   3,08  2,33   3,08  2,38   3,08  5,40
+ *       1 MiB  12,29  6,09  12,27  9,27  12,40 22,59
+ *       4 MiB  79,95  9,86  79,58 23,68  80,19 56,60
+ *       8 MiB 164,28 14,24 161,80 32,09 163,40 93,21
+ *
+ * El sistema deja de perder en 256 KiB, que es donde un relleno cuesta mas o
+ * menos lo que la llamada.  De 4 MiB para arriba gana incluso a 1/16, de 1,42x
+ * a 11,53x.
+ *
+ * O SEA QUE "DISPERSO" SIGNIFICA MENOS DE UNA PARTE ENTRE SESENTA Y CUATRO, y
+ * la tabla es la definicion: quien lo declare y luego lea 1/16 de un bloque de
+ * 1 MiB pierde 1,82x.  Eso es lo que es una afirmacion -- ver @c AllocFill --
+ * y cuesta velocidad, nunca correccion.
+ *
+ * Y hay una segunda razon para no bajarlo mas: estos bloques se situan al
+ * soltarlos con una tabla fija de @c kDirectSlots entradas, asi que no pueden
+ * ser el caso comun.
+ *
+ * \~
+ */
+inline constexpr size_t kSparseDirectMin = size_t(256) << 10;
 
 namespace detail {
 

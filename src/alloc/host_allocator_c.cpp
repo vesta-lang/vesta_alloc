@@ -74,6 +74,24 @@ void vesta_host_pop_tag(unsigned previous) {
     if (c != nullptr) c->tag = static_cast<uint8_t>(previous & 0xF);
 }
 
+unsigned vesta_host_push_fill(unsigned fill) {
+    util::detail::ThreadCache *c = util::detail::ensure_cache();
+    if (!util::detail::have_cache(c)) return 0;
+    const unsigned previous = c->fill;
+    /* Se recorta igual que la etiqueta: un numero fuera de rango cae en otra
+     * casilla, y lo peor que puede pasar es que el asignador elija el camino
+     * que habria elegido sin que nadie dijera nada.  Nunca cambia el
+     * resultado. */
+    c->fill = static_cast<uint8_t>(fill & (VESTA_ALLOC_FILL_SLOTS - 1));
+    return previous;
+}
+
+void vesta_host_pop_fill(unsigned previous) {
+    util::detail::ThreadCache *c = util::detail::current_cache();
+    if (util::detail::have_cache(c))
+        c->fill = static_cast<uint8_t>(previous & (VESTA_ALLOC_FILL_SLOTS - 1));
+}
+
 void vesta_host_stats(VestaHostAllocStats *out) {
     if (out == nullptr) return;
     /* Asignacion directa y no una copia campo a campo: los dos lenguajes

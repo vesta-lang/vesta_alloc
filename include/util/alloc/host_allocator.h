@@ -267,6 +267,9 @@ using HostAllocStats = ::VestaHostAllocStats;
 
 static_assert(AllocTag::kSlots == VESTA_ALLOC_TAG_SLOTS,
               "las etiquetas de C y las de C++ tienen que ser las mismas");
+static_assert(kAllocFillSlots == VESTA_ALLOC_FILL_SLOTS,
+              "el eje de cuanto se toca de C y el de C++ tienen que ser el "
+              "mismo");
 static_assert(kSizeBuckets == VESTA_ALLOC_SIZE_BUCKETS,
               "el reparto de tamanos de C y el de C++ tienen que ser el mismo");
 
@@ -314,6 +317,33 @@ struct alignas(64) ThreadCache {
      * \~
      */
     uint8_t tag;
+    /**
+     * @brief
+     * \~english How much of what it asks for this thread is going to touch.
+     * \~spanish Cuanto de lo que pide va a tocar este hilo.
+     * \~
+     *
+     * \~english
+     * An @c AllocFill, and it sits HERE because it is free here: @c tag left
+     * the structure with padding behind it, so this byte costs no size and
+     * moves nothing -- checked with @c sizeof, which did not change.  That
+     * matters more than it sounds: the last time anything was added at the
+     * front of this structure, an unrelated row went from 4.19 to 11.18 ns.
+     *
+     * Zero is "nobody said".  @c AllocScope moves it; never by hand.
+     *
+     * \~spanish
+     * Un @c AllocFill, y esta AQUI porque aqui sale gratis: @c tag dejaba
+     * relleno detras, asi que este byte no cuesta tamano y no mueve nada --
+     * comprobado con @c sizeof, que no cambio --.  Importa mas de lo que
+     * parece: la ultima vez que se anadio algo al principio de esta
+     * estructura, una fila que no tenia nada que ver paso de 4,19 a 11,18 ns.
+     *
+     * Cero es "nadie lo dijo".  La mueve @c AllocScope, nunca a mano.
+     *
+     * \~
+     */
+    uint8_t fill;
     /**
      * @brief
      * \~english The BIG chunk this thread is spending, per class.
@@ -463,6 +493,66 @@ static_assert(__is_trivially_constructible(HostAllocStats),
 static_assert(__is_trivially_constructible(ThreadCache),
               "ThreadCache must be constructible without running code: see the "
               "note above, this has been broken once already");
+
+/**
+ * @brief
+ * \~english The size of this structure is MEASURED.  It cannot change quietly.
+ * \~spanish El tamano de esta estructura esta MEDIDO.  No puede cambiar en
+ *          silencio.
+ * \~
+ *
+ * \~english
+ * A CHECK AND NOT A COMMENT, because it already drifted once without a word: a
+ * counter added to @c HostAllocStats -- which sits ahead of the hot batch --
+ * grew this by 64 bytes and pushed the batch 32 along.  There are
+ * @c kTotalCaches of these, so those 64 bytes are 64 KiB of static memory.
+ *
+ * WHAT IT IS NOT PROTECTING, because it was measured and it is not there:
+ * cache-line effects.  The batch straddles two lines and the obvious worry was
+ * split accesses or false sharing between threads.  Profiled with hardware
+ * counters on twelve threads, three interleaved runs of each layout:
+ * @c SPLIT_LOADS and @c SPLIT_STORES came out at exactly zero, every
+ * @c XSNP_* event at zero, and @c L3 Bound at 0.0-0.1% -- there is nothing
+ * there.  Aligning the array to 64 was also tried and changed none of it.  So
+ * the line the batch starts on is FREE to move; what is not free is this
+ * structure growing without anyone noticing.
+ *
+ * IF THIS FAILS: check what was added and whether it belongs in the per-thread
+ * cache at all.  A counter touched once per big allocation does not -- it goes
+ * in a global, like @c g_by_fill.  Then measure and update the number.
+ *
+ * \~spanish
+ * UNA COMPROBACION Y NO UN COMENTARIO, porque ya se movio una vez sin decir
+ * nada: un contador anadido a @c HostAllocStats -- que va por delante del lote
+ * caliente -- engordo esto 64 bytes y empujo el lote otros 32.  Hay
+ * @c kTotalCaches de estas, asi que esos 64 bytes son 64 KiB de memoria
+ * estatica.
+ *
+ * LO QUE NO PROTEGE, porque se midio y no esta ahi: los efectos de linea de
+ * cache.  El lote cruza dos lineas y lo que se temia eran accesos partidos o
+ * comparticion falsa entre hilos.  Perfilado con contadores hardware sobre doce
+ * hilos, tres corridas intercaladas de cada disposicion: @c SPLIT_LOADS y
+ * @c SPLIT_STORES salieron exactamente a cero, todos los eventos @c XSNP_* a
+ * cero, y @c L3 Bound al 0,0-0,1% -- ahi no hay nada.  Alinear el array a 64
+ * tambien se probo y no cambio ninguno.  Asi que la linea donde empieza el lote
+ * PUEDE moverse; lo que no puede es que esta estructura crezca sin que nadie se
+ * entere.
+ *
+ * SI ESTO FALLA: mira que se ha anadido y si tiene sitio en el cache por hilo.
+ * Un contador que se toca una vez por reserva grande no lo tiene -- va en un
+ * global, como @c g_by_fill --.  Luego mide y actualiza el numero.
+ *
+ * \~
+ */
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
+/* La cifra es de 64 bits, que es donde se midio.  En 32 los punteros miden la
+ * mitad y el tamano es otro; comprobarlo ahi con este numero seria romper el
+ * build por una medida que no se ha hecho, que es peor que no comprobar. */
+static_assert(sizeof(ThreadCache) == 1216,
+              "ThreadCache changed size: there are kTotalCaches of these, so "
+              "every 64 bytes is 64 KiB of static memory.  See the note above "
+              "before updating this number");
+#endif
 
 /// \~english The per-thread slot where the pointer to the cache lives.  See
 ///           `util/os/thread_slot.h`.
@@ -1812,28 +1902,91 @@ class AllocScope {
      * \~spanish como se cuenta todo lo que se reserve dentro del ambito.
      * \~
      */
-    explicit AllocScope(AllocTag t) noexcept
-        : c_(detail::current_cache()), prev_(0) {
-        if (__builtin_expect(c_ == nullptr, 0)) c_ = detail::ensure_cache();
-        /* A thread past its exit notice gets no cache and no tag: asking for
-         * one would take an owner id that can never be given back.  See
-         * @c kDyingCache.  `c_` is left null so the destructor has nothing to
-         * put back either. */
-        if (__builtin_expect(detail::have_cache(c_), 1)) {
-            prev_ = c_->tag;
-            c_->tag = t.raw();
-        } else {
-            c_ = nullptr;
-        }
-    }
+    explicit AllocScope(AllocTag t) noexcept { open(t.raw(), kKeepFill); }
+
     /**
      * @brief
-     * \~english Puts back the tag that was in place before.
-     * \~spanish Vuelve a poner la etiqueta que habia antes.
+     * \~english The two purpose axes, without the double braces.
+     * \~spanish Los dos ejes de proposito, sin las llaves dobles.
+     * \~
+     * @param u
+     * \~english how long it lives.  \~spanish cuanto vive.  \~
+     * @param s
+     * \~english whether it grows.  \~spanish si crece.  \~
+     */
+    AllocScope(AllocUse u, AllocShape s) noexcept {
+        open(AllocTag{u, s}.raw(), kKeepFill);
+    }
+
+    /**
+     * @brief
+     * \~english ALL THREE axes at once, which is how a phase declares itself.
+     * \~spanish LOS TRES ejes de una vez, que es como se declara una fase.
+     * \~
+     * @param u
+     * \~english how long it lives.  \~spanish cuanto vive.  \~
+     * @param s
+     * \~english whether it grows.  \~spanish si crece.  \~
+     * @param f
+     * \~english how much of it gets touched.  \~spanish cuanto se toca de ello.
+     * \~
+     */
+    AllocScope(AllocUse u, AllocShape s, AllocFill f) noexcept {
+        open(AllocTag{u, s}.raw(), static_cast<uint8_t>(f));
+    }
+
+    /// \~english The tag as one value, plus how much gets touched.
+    /// \~spanish La etiqueta como un valor, mas cuanto se toca.  \~
+    AllocScope(AllocTag t, AllocFill f) noexcept {
+        open(t.raw(), static_cast<uint8_t>(f));
+    }
+
+    /**
+     * @brief
+     * \~english Only how much gets touched, leaving the purpose as it was.
+     * \~spanish Solo cuanto se toca, dejando el proposito como estaba.
+     * \~
+     *
+     * \~english
+     * For a phase already inside another that declared the purpose: what
+     * changes is what this bit of it does with the memory, not what it is for.
+     *
+     * \~spanish
+     * Para un tramo que ya esta dentro de otro que declaro el proposito: lo que
+     * cambia es lo que ESTE trozo hace con la memoria, no para que es.
+     *
+     * \~
+     * @param f
+     * \~english how much of it gets touched.  \~spanish cuanto se toca de ello.
+     * \~
+     */
+    explicit AllocScope(AllocFill f) noexcept {
+        open(kKeepTag, static_cast<uint8_t>(f));
+    }
+
+    /**
+     * @brief
+     * \~english Puts back what was in place before, on both axes.
+     * \~spanish Vuelve a poner lo que habia antes, en los dos ejes.
+     * \~
+     *
+     * \~english
+     * BOTH ARE ALWAYS RESTORED, even the one this scope did not set: it saved
+     * what was there and puts the same thing back, so nothing changes and there
+     * is no "did I touch this one" flag to get wrong.
+     *
+     * \~spanish
+     * SE RESTAURAN SIEMPRE LOS DOS, incluso el que este ambito no puso: guardo
+     * lo que hubiera y devuelve lo mismo, asi que no cambia nada y no hay
+     * ninguna marca de "toque este" que se pueda equivocar.
+     *
      * \~
      */
     ~AllocScope() noexcept {
-        if (c_ != nullptr) c_->tag = prev_;
+        if (c_ != nullptr) {
+            c_->tag = prev_;
+            c_->fill = prev_fill_;
+        }
     }
 
     AllocScope(const AllocScope &) = delete;
@@ -1854,10 +2007,74 @@ class AllocScope {
         return detail::have_cache(c) ? AllocTag::from_raw(c->tag) : AllocTag{};
     }
 
+    /**
+     * @brief
+     * \~english How much this thread is declaring it will touch.
+     * \~spanish Cuanto esta declarando este hilo que va a tocar.
+     * \~
+     * @return
+     * \~english what is in place, or "unknown" while the thread has no cache.
+     * \~spanish lo que este puesto, o "no se" mientras el hilo no tenga cache.
+     * \~
+     */
+    static AllocFill current_fill() noexcept {
+        const detail::ThreadCache *c = detail::current_cache();
+        return detail::have_cache(c) ? static_cast<AllocFill>(c->fill)
+                                     : AllocFill::Unknown;
+    }
+
   private:
-    detail::ThreadCache *c_;
-    uint8_t prev_;
+    /// \~english "leave this axis as it is"  \~spanish "deja este eje como esta"
+    /// \~
+    static constexpr uint8_t kKeepTag = 0xFF;
+    static constexpr uint8_t kKeepFill = 0xFF;
+
+    /**
+     * @brief
+     * \~english The one place a scope is opened, whichever constructor was
+     *          used.
+     * \~spanish El unico sitio donde se abre un ambito, sea cual sea el
+     *          constructor.
+     * \~
+     *
+     * \~english
+     * WRITTEN ONCE on purpose: five constructors each doing this by hand is
+     * five chances for one of them to forget the dying-thread case, and that
+     * one does not fail where it is written.
+     *
+     * A thread past its exit notice gets no cache: asking for one would take an
+     * owner id that can never be given back -- see @c kDyingCache.  @c c_ is
+     * left null so the destructor has nothing to put back either.
+     *
+     * \~spanish
+     * ESCRITO UNA VEZ a proposito: cinco constructores haciendo esto a mano son
+     * cinco ocasiones de que uno se olvide del caso del hilo que se muere, y
+     * ese no falla donde esta escrito.
+     *
+     * Un hilo pasado su aviso de fin no tiene cache: pedirla tomaria un
+     * identificador que ya no puede volver -- ver @c kDyingCache --.  @c c_ se
+     * queda nulo para que el destructor tampoco tenga nada que devolver.
+     *
+     * \~
+     */
+    void open(uint8_t tag, uint8_t fill) noexcept {
+        c_ = detail::current_cache();
+        if (__builtin_expect(c_ == nullptr, 0)) c_ = detail::ensure_cache();
+        if (__builtin_expect(!detail::have_cache(c_), 0)) {
+            c_ = nullptr;
+            return;
+        }
+        prev_ = c_->tag;
+        prev_fill_ = c_->fill;
+        if (tag != kKeepTag) c_->tag = tag;
+        if (fill != kKeepFill) c_->fill = fill;
+    }
+
+    detail::ThreadCache *c_ = nullptr;
+    uint8_t prev_ = 0;
+    uint8_t prev_fill_ = 0;
 };
+
 
 /**
  * @brief
@@ -2669,6 +2886,61 @@ uint64_t host_per_thread_exhausted() noexcept;
  * \~
  */
 uint64_t host_direct_allocs() noexcept;
+
+/**
+ * @brief
+ * \~english How many big zeroed blocks were served under each declaration of
+ *          how much would be touched.
+ * \~spanish Cuantos bloques grandes a cero se sirvieron bajo cada declaracion
+ *          de cuanto se iba a tocar.
+ * \~
+ *
+ * \~english
+ * IT HAS TO BE ASKABLE, because what @c AllocFill carries is an ASSERTION the
+ * allocator then acts on -- it changes which of two opposite mechanisms serves
+ * the block.  An assertion nobody can look at is folklore: this says how many
+ * took each branch, and what came in as @c AllocFill::Unknown is exactly what
+ * has not been declared yet.
+ *
+ * It is a global count and not part of @c HostAllocStats on purpose: that
+ * structure sits inside the per-thread cache ahead of the hot batch, so a
+ * counter added to it moves the hot path -- see the note where it is defined.
+ *
+ * \~spanish
+ * TIENE QUE PODER PREGUNTARSE, porque lo que lleva @c AllocFill es una
+ * AFIRMACION sobre la que el asignador actua -- cambia cual de dos mecanismos
+ * opuestos sirve el bloque --.  Una afirmacion que nadie puede mirar es
+ * folclore: esto dice cuantas fueron por cada rama, y lo que entre como
+ * @c AllocFill::Unknown es exactamente lo que todavia no declara nada.
+ *
+ * Es una cuenta global y no parte de @c HostAllocStats a proposito: esa
+ * estructura vive dentro del cache por hilo por delante del lote caliente, asi
+ * que un contador ahi mueve el camino rapido -- ver la nota donde se define.
+ *
+ * \~
+ * @param f
+ * \~english which declaration to ask about.
+ * \~spanish por cual declaracion se pregunta.
+ * \~
+ * @return
+ * \~english how many were served under it since the process started.
+ * \~spanish cuantos se sirvieron bajo ella desde que arranco el proceso.
+ * \~
+ *
+ * \~english
+ * @code
+ *   const uint64_t undeclared = util::host_fill_allocs(util::AllocFill::Unknown);
+ * @endcode
+ *
+ * \~spanish
+ * @code
+ *   const uint64_t sin_declarar =
+ *       util::host_fill_allocs(util::AllocFill::Unknown);
+ * @endcode
+ *
+ * \~
+ */
+uint64_t host_fill_allocs(AllocFill f) noexcept;
 
 /**
  * @brief

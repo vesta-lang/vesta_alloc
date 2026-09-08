@@ -363,12 +363,16 @@ size_t vesta_host_usable_size(const void *p);
  *
  * \~
  * @param use
- * \~english 0 unknown, 1 instant, 2 medium, 3 long.
- * \~spanish 0 no se, 1 instantaneo, 2 medio, 3 largo.
+ * \~english a `VestaAllocUse`: @c VestaUse_Unknown, @c VestaUse_Instant,
+ *           @c VestaUse_Medium or @c VestaUse_Long.
+ * \~spanish un `VestaAllocUse`: @c VestaUse_Unknown, @c VestaUse_Instant,
+ *           @c VestaUse_Medium o @c VestaUse_Long.
  * \~
  * @param shape
- * \~english 0 unknown, 1 fixed, 2 growing.
- * \~spanish 0 no se, 1 fijo, 2 creciente.
+ * \~english a `VestaAllocShape`: @c VestaShape_Unknown, @c VestaShape_Fixed or
+ *           @c VestaShape_Growing.
+ * \~spanish un `VestaAllocShape`: @c VestaShape_Unknown, @c VestaShape_Fixed o
+ *           @c VestaShape_Growing.
  * \~
  * @return
  * \~english the tag that was in place, to put it back afterwards.
@@ -378,7 +382,8 @@ size_t vesta_host_usable_size(const void *p);
  * \~english
  * @code
  *   // What the decompression allocates counts as instant and fixed.
- *   const unsigned before = vesta_host_push_tag(1, 1);
+ *   const unsigned before =
+ *       vesta_host_push_tag(VestaUse_Instant, VestaShape_Fixed);
  *   decompress(...);
  *   vesta_host_pop_tag(before);
  * @endcode
@@ -386,7 +391,8 @@ size_t vesta_host_usable_size(const void *p);
  * \~spanish
  * @code
  *   // Lo que reserve la descompresion se cuenta como instantaneo y fijo.
- *   const unsigned antes = vesta_host_push_tag(1, 1);
+ *   const unsigned antes =
+ *       vesta_host_push_tag(VestaUse_Instant, VestaShape_Fixed);
  *   descomprimir(...);
  *   vesta_host_pop_tag(antes);
  * @endcode
@@ -416,6 +422,96 @@ unsigned vesta_host_push_tag(unsigned use, unsigned shape);
  * \~
  */
 void vesta_host_pop_tag(unsigned previous);
+
+/**
+ * @brief
+ * \~english Declares how much of what is allocated next will be TOUCHED.
+ * \~spanish Declara cuanto se va a TOCAR de lo que se reserve a continuacion.
+ * \~
+ *
+ * \~english
+ * The C side of `util::AllocFillScope`, and the same deal as
+ * @c vesta_host_push_tag: there are no destructors in C, so putting it back is
+ * the caller's job -- and it has to be done, because one left in place taints
+ * everything that thread allocates afterwards.
+ *
+ * WHAT IT BUYS.  A big zeroed block has two opposite right answers -- keep it
+ * and clear it, or ask the system for a fresh one that arrives zeroed -- and
+ * they cross at a FRACTION of the block, not at a size, so the allocator cannot
+ * choose on its own.  Declaring sparse on a block that really is read sparsely
+ * is worth 1.14x to 2.37x against the C runtime on the sizes measured;
+ * declaring it on one that is read whole costs about as much the other way.
+ * It is an assertion, and it only ever costs speed.
+ *
+ * @par Threads
+ * **Safe from any thread**, and it affects ONLY the caller.  If the work is
+ * handed to other threads, what was declared does not travel on its own.
+ *
+ * \~spanish
+ * El lado en C de `util::AllocFillScope`, y el mismo trato que
+ * @c vesta_host_push_tag: en C no hay destructores, asi que devolverlo es cosa
+ * del que llama -- y hay que hacerlo, porque uno que se queda puesto contamina
+ * todo lo que ese hilo reserve despues.
+ *
+ * QUE COMPRA.  Un bloque grande a cero tiene dos respuestas correctas y
+ * opuestas -- quedarselo y limpiarlo, o pedirle uno fresco al sistema que llega
+ * ya a cero -- y se cruzan en una FRACCION del bloque, no en un tamano, asi que
+ * el asignador no puede elegir solo.  Declarar disperso en un bloque que de
+ * verdad se lee a trozos vale de 1,14x a 2,37x contra la libreria de C en los
+ * tamanos medidos; declararlo en uno que se lee entero cuesta mas o menos lo
+ * mismo en el otro sentido.  Es una afirmacion, y solo cuesta velocidad.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo**, y afecta SOLO al que llama.  Si el trabajo
+ * se reparte a otros hilos, lo declarado no viaja solo.
+ *
+ * \~
+ * @param fill
+ * \~english a `VestaAllocFill`: @c VestaFill_Unknown, @c VestaFill_Sparse,
+ *           @c VestaFill_Dense or @c VestaFill_All.  Out of range is trimmed
+ *           rather than refused: the worst that happens is the allocator picks
+ *           the path it would have picked with nothing said.
+ * \~spanish un `VestaAllocFill`: @c VestaFill_Unknown, @c VestaFill_Sparse,
+ *           @c VestaFill_Dense o @c VestaFill_All.  Fuera de rango se recorta en
+ *           vez de rechazarse: lo peor que pasa es que el asignador elija el
+ *           camino que habria elegido sin que nadie dijera nada.
+ * \~
+ * @return
+ * \~english what was in place, to put it back afterwards.
+ * \~spanish lo que habia puesto, para devolverlo despues.
+ * \~
+ *
+ * \~english
+ * @code
+ *   // The hash table will only ever touch the buckets it hashes to.
+ *   const unsigned before = vesta_host_push_fill(VestaFill_Sparse);
+ *   void *table = vesta_host_calloc(1, 8u << 20);
+ *   vesta_host_pop_fill(before);
+ * @endcode
+ *
+ * \~spanish
+ * @code
+ *   // La tabla hash solo tocara los cubos donde caiga.
+ *   const unsigned antes = vesta_host_push_fill(VestaFill_Sparse);
+ *   void *tabla = vesta_host_calloc(1, 8u << 20);
+ *   vesta_host_pop_fill(antes);
+ * @endcode
+ *
+ * \~
+ */
+unsigned vesta_host_push_fill(unsigned fill);
+
+/**
+ * @brief
+ * \~english Puts back what @c vesta_host_push_fill returned.
+ * \~spanish Vuelve a poner lo que devolvio @c vesta_host_push_fill.
+ * \~
+ * @param previous
+ * \~english what that call returned.
+ * \~spanish lo que devolvio aquella llamada.
+ * \~
+ */
+void vesta_host_pop_fill(unsigned previous);
 
 /* ---------------------------------------------------------------------------
  *  Los contadores  --  The counters

@@ -74,6 +74,53 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Cambiado
 
+- **El llamante puede decir CUANTO va a tocar de lo que pide, y con eso se
+  cierran las dos filas que se perdian.**  Un `calloc` grande tiene dos
+  respuestas correctas y opuestas -- quedarse el bloque y limpiarlo, cuyo coste
+  es plano en lo que se lea porque se escribe entero, o pedirle uno fresco al
+  sistema, que llega ya a cero y cuesta un fallo de pagina por cada pagina que
+  se toque --.  Se cruzan en una FRACCION del bloque, entre 1/16 y 1/4, y NO en
+  un tamano: la misma peticion de 8 MiB gana de una forma leida a trozos y de
+  la otra leida entera.  Ningun umbral por tamano puede elegir; el unico que lo
+  sabe es quien llama.
+
+  `AllocFill` es ese eje y `AllocScope` lo declara.  Medido contra msvcrt sobre
+  siete tamanos por tres fracciones, **las 21 filas se ganan**, incluidas las
+  dos que estaban abiertas: `calloc` de 1 MiB leido 1/64 pasa a 1,40x a favor y
+  el de 8 MiB a 1,36x, donde perdia 3,3x.  Por debajo de `kSparseDirectMin`
+  (256 KiB, medido) no se aplica: ahi la llamada al sistema cuesta mas que la
+  limpieza que ahorra.
+
+  ES UNA AFIRMACION, no un hecho, igual que la etiqueta de proposito: declarar
+  disperso un bloque que luego se lee entero cuesta velocidad y nunca
+  correccion, y `host_fill_allocs` dice cuantas fueron por cada rama para poder
+  contrastarlo.
+
+  Y VA APARTE DE `AllocTag`, con su cuenta aparte, por una razon que se midio:
+  los dos ejes de proposito van empaquetados en cuatro bits para que el byte
+  indexe la tabla de contadores, y un tercero ahi la llevaria de 16 ranuras a
+  64.  Meter el contador en `HostAllocStats` -- que vive en el cache por hilo
+  POR DELANTE del lote caliente -- engordaba la estructura de 1216 a 1280 bytes
+  y empujaba el lote 32: solo +0,01 ns, por debajo del suelo del 2% del propio
+  banco, pero 64 KiB de estatico y, peor, dejaba el camino caliente atado a los
+  contadores.  Con el contador en un global, `host_alloc` y `host_free` salen
+  **instruccion por instruccion como estaban**.
+
+  Lo que se temia y NO esta ahi, perfilado con contadores hardware sobre doce
+  hilos, tres corridas intercaladas de cada disposicion: `SPLIT_LOADS` y
+  `SPLIT_STORES` a cero exacto, todos los `XSNP_*` a cero -- ninguna linea viaja
+  entre nucleos, o sea cero comparticion falsa -- y `L3 Bound` al 0,0-0,1%.  Un
+  `static_assert` sobre el tamano impide que la estructura vuelva a crecer sin
+  que nadie lo mire; se comprobo reproduciendo el fallo.
+
+- **Los tres ejes se pueden NOMBRAR desde C**, que antes no: `vesta_host_push_tag`
+  tomaba enteros pelados y el significado vivia en un comentario.  Los valores
+  viven ahora en `util/alloc/alloc_tag_c.h` y **solo ahi**; el `enum class` de
+  C++ se define en terminos de ellos, asi que los dos lenguajes no pueden
+  separarse.  Importa porque los numeros VIAJAN: indexan tablas de contadores,
+  cruzan la frontera de C y acaban en el CSV de un informe, y dos listas que hoy
+  coinciden y manana no, no fallarian -- contarian en la casilla equivocada.
+
 - **`vesta_memset` deja de pasar por las caches cuando el bloque no cabe en
   ellas.**  Escribir por la cache lee cada linea antes de sobreescribirla --
   para hacer suyo un valor que nadie va a mirar -- y desaloja lo que hubiera
@@ -478,6 +525,53 @@ invita a creer que ampara.
   leaves out is always counted.
 
 ### Changed
+
+- **The caller can say HOW MUCH of what it asks for it will touch, and that
+  closes the two rows that were losing.**  A big `calloc` has two opposite right
+  answers -- keep the block and clear it, whose cost is flat in what gets read
+  because the whole thing is written, or ask the system for a fresh one, which
+  arrives already zero and costs a page fault per page actually touched.  They
+  cross at a FRACTION of the block, between 1/16 and 1/4, and NOT at a size: the
+  same 8 MiB request wins one way read sparsely and the other read whole.  No
+  threshold on size can choose; the only one who knows is the caller.
+
+  `AllocFill` is that axis and `AllocScope` declares it.  Measured against
+  msvcrt across seven sizes by three fractions, **all 21 rows win**, including
+  the two that were open: `calloc` of 1 MiB read 1/64 goes to 1.40x in our
+  favour and the 8 MiB one to 1.36x, where it was losing 3.3x.  Below
+  `kSparseDirectMin` (256 KiB, measured) it does not apply: there the system
+  call costs more than the clearing it saves.
+
+  IT IS AN ASSERTION, not a fact, exactly like the purpose tag: declaring sparse
+  on a block that is then read whole costs speed and never correctness, and
+  `host_fill_allocs` says how many went down each branch so the claim can be
+  checked.
+
+  AND IT SITS APART from `AllocTag`, with its own count, for a measured reason:
+  the two purpose axes are packed into four bits so the byte can index the
+  counter table, and a third one there would take it from 16 slots to 64.
+  Putting the counter in `HostAllocStats` -- which lives in the per-thread cache
+  AHEAD of the hot batch -- grew the structure from 1216 to 1280 bytes and
+  pushed the batch 32 along: only +0.01 ns, under the benchmark's own 2% floor,
+  but 64 KiB of static memory and, worse, it tied the hot path to the counters.
+  With the counter in a global, `host_alloc` and `host_free` come out
+  **instruction for instruction as they were**.
+
+  What was feared and is NOT there, profiled with hardware counters on twelve
+  threads, three interleaved runs of each layout: `SPLIT_LOADS` and
+  `SPLIT_STORES` at exactly zero, every `XSNP_*` event at zero -- no line
+  travels between cores, so no false sharing -- and `L3 Bound` at 0.0-0.1%.  A
+  `static_assert` on the size stops the structure growing again without anyone
+  looking; it was checked by reproducing the failure.
+
+- **The three axes can be NAMED from C**, which they could not before:
+  `vesta_host_push_tag` took bare integers and the meaning lived in a doc
+  comment.  The values now live in `util/alloc/alloc_tag_c.h` and **only**
+  there; the C++ `enum class` is defined in terms of them, so the two languages
+  cannot drift apart.  It matters because the numbers TRAVEL: they index counter
+  tables, cross the C boundary and end up in a report's CSV, and two lists that
+  agree today and not tomorrow would not fail -- they would count in the wrong
+  bucket.
 
 - **`vesta_memset` stops going through the caches when the block does not fit
   in them.**  Writing through the cache reads every line before overwriting it

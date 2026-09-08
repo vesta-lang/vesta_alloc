@@ -42,6 +42,10 @@
 #ifndef VESTA_UTIL_ALLOC_SITES_C_H
 #define VESTA_UTIL_ALLOC_SITES_C_H
 
+/* Las etiquetas -- sus valores y cuantas ranuras ocupan -- viven en su propia
+ * cabecera, que comparten C y C++.  Aqui se usan; no se redefinen. */
+#include "util/alloc/alloc_tag_c.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,22 +70,6 @@
  * \~
  */
 #define VESTA_ALLOC_SIZE_BUCKETS 12
-
-/**
- * @brief
- * \~english How many distinct purpose tags there are (4 uses x 4 shapes).
- * \~spanish Cuantas etiquetas de proposito distintas hay (4 usos x 4 formas).
- * \~
- *
- * \~english
- * The same treatment and the same check as the one above.
- *
- * \~spanish
- * Mismo trato y misma comprobacion que la de arriba.
- *
- * \~
- */
-#define VESTA_ALLOC_TAG_SLOTS 16
 
 #ifdef __cplusplus
 extern "C" {

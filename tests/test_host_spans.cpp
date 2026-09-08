@@ -357,6 +357,58 @@ int main() {
         util::host_free(justo);
     }
 
+    /* 7. Declarar cuanto se va a tocar CAMBIA el camino, y no cambia el
+     *    resultado.
+     *
+     * Es la unica pieza de informacion que el asignador no puede sacar solo:
+     * un bloque grande a cero se sirve de dos formas opuestas -- guardado y
+     * limpiado, o pedido fresco al sistema -- y se cruzan en una FRACCION del
+     * bloque, no en un tamano.  Lo que se comprueba aqui es lo que tiene que
+     * ser cierto pase lo que pase: que el bloque sale a cero por las dos ramas,
+     * que se suelta bien por las dos, y que la afirmacion queda CONTADA para
+     * poder contrastarla despues. */
+    {
+        const size_t n = util::kSparseDirectMin * 4;
+        const uint64_t sparse_before =
+            util::host_fill_allocs(util::AllocFill::Sparse);
+        const uint64_t unknown_before =
+            util::host_fill_allocs(util::AllocFill::Unknown);
+        const uint64_t direct_before = util::host_direct_allocs();
+
+        unsigned char *p = nullptr;
+        {
+            util::AllocScope f{util::AllocFill::Sparse};
+            check(util::AllocScope::current_fill() == util::AllocFill::Sparse,
+                  "fill: lo declarado es lo que se lee mientras dura el ambito");
+            p = static_cast<unsigned char *>(util::host_alloc_zeroed(n));
+        }
+        check(util::AllocScope::current_fill() == util::AllocFill::Unknown,
+              "fill: y al salir del ambito vuelve a \"no se\"");
+        check(util::host_direct_allocs() > direct_before,
+              "fill: declarado disperso, lo sirve el SISTEMA");
+
+        bool ceros = p != nullptr;
+        for (size_t i = 0; ceros && i < n; i += 4096)
+            if (p[i] != 0) ceros = false;
+        check(ceros, "fill: y sale a cero igual, que es lo que no puede cambiar");
+        check(write_and_verify(p, n, 0x11), "fill: escribible entero");
+        util::host_free(p);
+
+        /* La misma peticion sin declarar nada: por el camino de siempre.  Sin
+         * esta mitad, la de arriba pasaria igual si el eje no hiciera nada. */
+        const uint64_t direct_mid = util::host_direct_allocs();
+        void *q = util::host_alloc_zeroed(n);
+        check(q != nullptr && util::host_direct_allocs() == direct_mid,
+              "fill: sin declarar nada, la sirve la REGION");
+        util::host_free(q);
+
+        check(util::host_fill_allocs(util::AllocFill::Sparse) > sparse_before,
+              "fill: la afirmacion queda contada, para poder contrastarla");
+        check(util::host_fill_allocs(util::AllocFill::Unknown) > unknown_before,
+              "fill: y lo que no declara nada tambien, que es lo que dice "
+              "cuanto queda");
+    }
+
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);
     return failures == 0 ? 0 : 1;
 }

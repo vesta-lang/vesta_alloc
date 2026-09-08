@@ -1706,6 +1706,23 @@ DirectLockWord g_direct_lock;
 DirectBlock g_direct[kDirectSlots];
 uint32_t g_direct_n = 0;
 
+/**
+ * @brief Big zeroed blocks, by what the caller SAID it would touch.
+ *
+ * A GLOBAL AND NOT A FIELD OF `HostAllocStats`, and it was measured before it
+ * was moved: that structure lives inside `ThreadCache` AHEAD of the hot batch,
+ * so a counter added to it pushes the batch along -- 1216 bytes to 1280, and
+ * the batch from +1136 to +1168.  The cost of that came out at +0.01 ns, under
+ * the benchmark's own 2.0% floor, so it was not the speed that decided it: it
+ * is that the hot path should not move every time a counter is added, and that
+ * the same counter costs 64 KiB across the whole cache table.
+ *
+ * A shared atomic is free HERE because it is touched once per big zeroed
+ * allocation, on a path that already costs microseconds -- which is also why it
+ * does not belong in the per-thread structure built for the hot path.
+ */
+std::atomic<uint64_t> g_by_fill[kAllocFillSlots];
+
 /// How many were served this way, and how many the table had no room for.
 std::atomic<uint64_t> g_direct_allocs{0};
 std::atomic<uint64_t> g_direct_refused{0};
@@ -2555,6 +2572,11 @@ uint64_t host_per_thread_exhausted() noexcept {
     return g_no_per_thread_id.load(std::memory_order_relaxed);
 }
 
+uint64_t host_fill_allocs(AllocFill f) noexcept {
+    return g_by_fill[unsigned(f) & (kAllocFillSlots - 1)].load(
+        std::memory_order_relaxed);
+}
+
 uint64_t host_direct_allocs() noexcept {
     return g_direct_allocs.load(std::memory_order_relaxed);
 }
@@ -2852,6 +2874,29 @@ void *host_alloc_zeroed(size_t n) noexcept {
         /* `have_cache` y no un nulo: un hilo pasado su aviso de fin lleva la
          * marca, y `ensure_cache` no se la quita -- ni debe. */
         if (detail::have_cache(c)) {
+            g_by_fill[c->fill & (kAllocFillSlots - 1)].fetch_add(
+                1, std::memory_order_relaxed);
+
+            /* LO QUE EL LLAMANTE DIJO QUE VA A TOCAR, que es lo unico que
+             * decide bien aqui.  Un bloque que se lee a trozos sale mucho mas
+             * barato pedido fresco al sistema -- llega ya a cero, y solo se
+             * pagan las paginas que se toquen -- y uno que se lee entero sale
+             * mas barato reciclado y limpiado, porque limpiar es plano y los
+             * fallos de pagina no.  Se cruzan en una FRACCION, entre 1/16 y
+             * 1/4, no en un tamano: la misma peticion gana de las dos formas
+             * segun lo que pase despues.  Ver `AllocFill`.
+             *
+             * El tamano minimo si es una cota nuestra: por debajo de el, la
+             * llamada al sistema cuesta mas que la limpieza que ahorra, y
+             * ademas la tabla que reconoce estos bloques es pequena a
+             * proposito.  Ver `kSparseDirectMin`. */
+            if (__builtin_expect(c->fill == uint8_t(AllocFill::Sparse) &&
+                                     n >= kSparseDirectMin,
+                                 0)) {
+                if (void *p = alloc_direct(c, n)) return p; // ya viene a cero
+                // Sin sitio en la tabla o sin memoria: el camino de siempre.
+            }
+
             bool already_zero = false;
             void *p = alloc_span(c, n, &already_zero);
             if (p != nullptr) {
@@ -2934,6 +2979,27 @@ StatsDump::~StatsDump() {
                      "form returned null).  Nothing went to the system",
                      (unsigned long long)gave_up);
     std::fprintf(stderr, "\n");
+    /* Los `calloc` grandes, por lo que el llamante DIJO que iba a tocar.  Es
+     * una afirmacion sobre la que el asignador actua -- ver `AllocFill` --, y
+     * una afirmacion que nadie puede mirar es folclore: aqui se ve cuantas
+     * fueron por cada rama y cuantas no declararon nada, que es lo que dice
+     * cuanto queda por migrar. */
+    uint64_t fill_total = 0;
+    uint64_t fill_counts[kAllocFillSlots];
+    for (uint32_t g = 0; g < kAllocFillSlots; ++g) {
+        fill_counts[g] = g_by_fill[g].load(std::memory_order_relaxed);
+        fill_total += fill_counts[g];
+    }
+    if (fill_total != 0) {
+        static const char *const kFillNames[kAllocFillSlots] = {
+            "did not say", "sparse", "dense", "all of it"};
+        std::fprintf(stderr, "[allocator] big zeroed blocks, by what the "
+                             "caller said it would touch:\n");
+        for (uint32_t g = 0; g < kAllocFillSlots; ++g)
+            std::fprintf(stderr, "    %-20s %12llu  %5.1f%%\n", kFillNames[g],
+                         (unsigned long long)fill_counts[g],
+                         100.0 * double(fill_counts[g]) / double(fill_total));
+    }
     /* Lo que sirvio el sistema por su cuenta.  Se enseña porque es una via
      * DISTINTA -- esos bloques no salen de la region ni aparecen en lo
      * comprometido de arriba --, y con ella la vez que la tabla se quedo corta,

@@ -24,6 +24,7 @@
 
 #include "dwarf/dwarf_internal.h"
 
+#include "util/alloc/host_allocator.h" // AllocScope: esto declara lo que reserva
 #include "util/os/os_memory.h" // donde esta CARGADO el modulo
 #include "util/symbols/self_image.h"
 
@@ -174,6 +175,17 @@ const CuWalk *cu_walk(const Store &st, uint64_t cu_off) {
 /// Resuelve de verdad, recorriendo los DIEs.  El memo lo pone su envoltorio.
 unsigned resolve_frames_uncached(const Store *st, uint64_t addr, SelfFrame *out,
                                  unsigned max) {
+    /* DECLARADO EN LA ENTRADA, que es lo unico que cubre a los `std::vector` y
+     * `std::string` de dentro: ellos no pueden declarar nada por si mismos.
+     * Recorrer los DIEs y leer el programa de lineas es trabajo de UNA
+     * resolucion y muere con ella; lo poco que sobrevive lo copia el memo de
+     * `Store`, que se construye bajo su propia declaracion.
+     *
+     * Y hace falta porque esto corre cuando alguien pide el informe de
+     * reservas: sin declarar, la resolucion se cuenta a si misma en la lista
+     * que esta resolviendo. */
+    const AllocScope resolving(AllocUse::Instant, AllocShape::Growing);
+
     const uint64_t cu_off = find_cu(*st, addr);
     if (cu_off == ~uint64_t(0)) return 0;
 

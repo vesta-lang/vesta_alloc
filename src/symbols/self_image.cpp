@@ -19,6 +19,8 @@
 
 #include "self_image_internal.h"
 
+#include "util/alloc/host_allocator.h" // AllocScope: esto declara lo que reserva
+
 #include <cstdio>
 #include <cstring>
 
@@ -38,6 +40,10 @@ using image_detail::open_self;
 using image_detail::read_at;
 
 std::string self_image_path() {
+    /* La cadena se devuelve y el llamante la suelta enseguida; el sitio que la
+     * pide corre dentro del informe de reservas, asi que sin declararla se
+     * cuenta a si misma.  Ver `AllocScope`. */
+    const AllocScope path(AllocUse::Instant, AllocShape::Growing);
 #if defined(_WIN32)
     char buf[MAX_PATH * 2];
     const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
