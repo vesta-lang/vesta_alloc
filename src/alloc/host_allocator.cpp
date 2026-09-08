@@ -227,7 +227,7 @@ struct SharedLock {
  *
  * UNA LINEA DE CACHE ENTERA POR DUENO, y esto es lo unico de aqui que hay que
  * respetar al tocarlo.  Era un array de dos dimensiones a secas, y con 36
- * clases la fila de un dueno medía 288 bytes -- CUATRO LINEAS Y MEDIA --, asi
+ * clases la fila de un dueno media 288 bytes -- CUATRO LINEAS Y MEDIA --, asi
  * que la mitad de los duenos compartia linea con el siguiente.
  *
  * Y esta es justo la estructura que escriben OTROS hilos: cada liberacion ajena
@@ -1723,9 +1723,10 @@ uint32_t g_direct_n = 0;
  */
 std::atomic<uint64_t> g_by_fill[kAllocFillSlots];
 
-/// Executable blocks served from our own reservation, and times the region
-/// could not place one close enough and the system had to be asked.
-std::atomic<uint64_t> g_exec_allocs{0};
+/// Blocks served from our own reservation as PAGES -- code and the data code
+/// has to reach, together -- and times the region could not place one close
+/// enough to its anchor and the system had to be asked.
+std::atomic<uint64_t> g_region_pages{0};
 std::atomic<uint64_t> g_exec_far{0};
 
 /// How many were served this way, and how many the table had no room for.
@@ -2590,6 +2591,40 @@ uint64_t host_direct_refused() noexcept {
     return g_direct_refused.load(std::memory_order_relaxed);
 }
 
+/**
+ * @brief Trozos de la region grande, comprometidos con @p prot.
+ *
+ * El unico sitio donde se toca el cursor para esto, y por eso esta aparte: las
+ * DOS entradas publicas -- la que persigue un ancla y la que no tiene ninguna
+ * -- tienen que servir del mismo cursor, o dejarian de ser vecinos, que es
+ * justamente lo que se compra aqui.
+ *
+ * @return la direccion, o cero si la region no dio o las paginas no se pudieron
+ *         comprometer.  Devuelve tambien @p got, que es lo que hay que
+ *         descomprometer si luego no sirve.
+ */
+static uintptr_t region_pages(size_t bytes, OsProt prot, size_t *got) noexcept {
+    const size_t chunks = (bytes + kBigChunkBytes - 1) / kBigChunkBytes;
+    const uintptr_t addr = take_big_chunks(chunks);
+    if (addr == 0) return 0;
+    const size_t n = chunks * kBigChunkBytes;
+    if (!os_commit(reinterpret_cast<void *>(addr), n, prot)) return 0;
+    if (got != nullptr) *got = n;
+    return addr;
+}
+
+void *host_alloc_pages_in_region(size_t bytes, OsProt prot) noexcept {
+    if (bytes == 0) return nullptr;
+    size_t got = 0;
+    const uintptr_t addr = region_pages(bytes, prot, &got);
+    if (addr == 0) return nullptr;
+    /* Se cuenta con las mismas paginas que las del codigo, y a proposito: son
+     * el mismo cursor y el mismo reparto, asi que separarlas en el informe
+     * diria que hay dos mecanismos donde hay uno. */
+    g_region_pages.fetch_add(1, std::memory_order_relaxed);
+    return reinterpret_cast<void *>(addr);
+}
+
 void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
                        size_t window, bool *placed,
                        OsNearScan *scan) noexcept {
@@ -2613,28 +2648,24 @@ void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
      * sola mientras la region no haya repartido mas que la ventana, porque el
      * cursor va justo detras de todo lo ya entregado. */
     if (anchor != nullptr && in_big_region(anchor)) {
-        const size_t chunks =
-            (bytes + kBigChunkBytes - 1) / kBigChunkBytes;
-        const uintptr_t addr = take_big_chunks(chunks);
+        size_t got = 0;
+        const uintptr_t addr = region_pages(bytes, prot, &got);
         if (addr != 0) {
-            const size_t got = chunks * kBigChunkBytes;
-            if (os_commit(reinterpret_cast<void *>(addr), got, prot)) {
-                /* Y se comprueba la distancia de verdad, no se da por hecha: el
-                 * cursor pudo haberse alejado mas que la ventana, y entonces
-                 * esto no sirve para lo que se pidio aunque la memoria sea
-                 * buena.  Decirlo es lo que permite que quien llama lo sepa. */
-                const uintptr_t a = reinterpret_cast<uintptr_t>(anchor);
-                const uintptr_t dist = addr > a ? (addr - a) : (a - addr);
-                if (dist <= window) {
-                    g_exec_allocs.fetch_add(1, std::memory_order_relaxed);
-                    if (placed != nullptr) *placed = true;
-                    return reinterpret_cast<void *>(addr);
-                }
-                /* Demasiado lejos.  Las paginas se descomprometen -- el rango
-                 * no vuelve, igual que el de un tramo que no cabe en el banco
-                 * -- y se cae al camino de fuera, que al menos puede acertar. */
-                os_decommit(reinterpret_cast<void *>(addr), got);
+            /* Y se comprueba la distancia de verdad, no se da por hecha: el
+             * cursor pudo haberse alejado mas que la ventana, y entonces esto
+             * no sirve para lo que se pidio aunque la memoria sea buena.
+             * Decirlo es lo que permite que quien llama lo sepa. */
+            const uintptr_t a = reinterpret_cast<uintptr_t>(anchor);
+            const uintptr_t dist = addr > a ? (addr - a) : (a - addr);
+            if (dist <= window) {
+                g_region_pages.fetch_add(1, std::memory_order_relaxed);
+                if (placed != nullptr) *placed = true;
+                return reinterpret_cast<void *>(addr);
             }
+            /* Demasiado lejos.  Las paginas se descomprometen -- el rango no
+             * vuelve, igual que el de un tramo que no cabe en el banco -- y se
+             * cae al camino de fuera, que al menos puede acertar. */
+            os_decommit(reinterpret_cast<void *>(addr), got);
         }
         g_exec_far.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2662,8 +2693,8 @@ void host_free_pages(void *p, size_t bytes) noexcept {
         os_free(p, bytes);
 }
 
-uint64_t host_exec_allocs() noexcept {
-    return g_exec_allocs.load(std::memory_order_relaxed);
+uint64_t host_region_pages() noexcept {
+    return g_region_pages.load(std::memory_order_relaxed);
 }
 
 uint64_t host_exec_far() noexcept {
@@ -3128,12 +3159,12 @@ StatsDump::~StatsDump() {
      * que se rompe es un desplazamiento de 32 bits que ya no cabe, mucho
      * despues y en otro sitio.  Un contador que nadie enseña no sirve de nada,
      * que es justamente para lo que existe este informe. */
-    const uint64_t exec = g_exec_allocs.load(std::memory_order_relaxed);
+    const uint64_t exec = g_region_pages.load(std::memory_order_relaxed);
     const uint64_t exec_far = g_exec_far.load(std::memory_order_relaxed);
     if (exec != 0 || exec_far != 0) {
         std::fprintf(stderr,
-                     "[allocator] executable pages served from our own "
-                     "reservation: %llu",
+                     "[allocator] pages served from our own reservation "
+                     "(code, and the data it must reach): %llu",
                      (unsigned long long)exec);
         if (exec_far != 0)
             std::fprintf(stderr,

@@ -436,12 +436,12 @@ int main() {
 
         const size_t ventana = (size_t(1) << 31) - (128u << 20);
         bool colocado = false;
-        const uint64_t antes = util::host_exec_allocs();
+        const uint64_t antes = util::host_region_pages();
         auto *code = static_cast<unsigned char *>(util::host_alloc_pages(
             1u << 20, util::kOsReadWriteExec, dato, ventana, &colocado));
 
         check(code != nullptr, "codigo: se sirven paginas ejecutables");
-        check(util::host_exec_allocs() > antes,
+        check(util::host_region_pages() > antes,
               "codigo: y salen de NUESTRA reserva, no del sistema");
         check(colocado, "codigo: colocadas dentro de la ventana pedida");
 
@@ -464,6 +464,47 @@ int main() {
         }
         util::host_free_pages(code, 1u << 20);
         util::host_free(dato);
+    }
+
+    /* LA OTRA MITAD: poner el DATO donde el codigo va a alcanzarlo.
+     *
+     * Perseguir con `host_alloc_pages` solo funciona si el dato esta en un
+     * sitio alcanzable de entrada.  Un dato normal NO lo esta cuando cae en la
+     * region de clases pequenas -- 256 GiB, con los dos bordes mas lejos de lo
+     * que cubre un rel32 --, y eso pasaba SIEMPRE en Linux y nunca en Windows,
+     * que es lo que lo tuvo escondido.  Aqui se comprueba la propiedad que
+     * quita la pregunta: saliendo los dos del mismo cursor son vecinos. */
+    {
+        const size_t ventana = (size_t(1) << 31) - (128u << 20);
+        const uint64_t antes = util::host_region_pages();
+        void *const dato = util::host_alloc_pages_in_region(4096,
+                                                            util::kOsReadWrite);
+        check(dato != nullptr, "vecinos: la region sirve paginas de DATOS");
+        check(util::host_region_pages() > antes,
+              "vecinos: y se cuentan con las del codigo, que son lo mismo");
+        check(dato != nullptr && util::in_big_region(dato),
+              "vecinos: el dato queda DENTRO de nuestra reserva");
+
+        /* Escribirlo, para que quede claro que son paginas de lectura y
+         * escritura y no solo una direccion. */
+        if (dato != nullptr) *static_cast<unsigned char *>(dato) = 0x42;
+
+        bool colocado = false;
+        auto *code = static_cast<unsigned char *>(util::host_alloc_pages(
+            1u << 20, util::kOsReadWriteExec, dato, ventana, &colocado));
+        check(code != nullptr && colocado,
+              "vecinos: y el codigo cae a su lado SIN buscarlo");
+        if (code != nullptr && dato != nullptr) {
+            const intptr_t d = reinterpret_cast<intptr_t>(code) -
+                               reinterpret_cast<intptr_t>(dato);
+            const size_t dist = size_t(d < 0 ? -d : d);
+            std::printf("  dato y codigo del mismo cursor: %.1f MiB\n",
+                        double(dist) / (1024.0 * 1024.0));
+            check(dist <= ventana,
+                  "vecinos: la distancia lo confirma, no solo la bandera");
+        }
+        util::host_free_pages(code, 1u << 20);
+        util::host_free_pages(dato, 4096);
     }
 
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);

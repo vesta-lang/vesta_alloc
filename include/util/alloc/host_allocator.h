@@ -3053,8 +3053,118 @@ void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
 
 /**
  * @brief
- * \~english Returns what @c host_alloc_pages handed out.
- * \~spanish Devuelve lo que entrego @c host_alloc_pages.
+ * \~english Pages from OUR OWN reservation, with no anchor to chase.
+ * \~spanish Paginas de NUESTRA PROPIA reserva, sin ancla que perseguir.
+ * \~
+ *
+ * \~english
+ * THE OTHER HALF OF @c host_alloc_pages, and the one that removes the question
+ * instead of answering it.  That one takes a datum that already exists and
+ * tries to put code within reach of it; this one puts the DATUM where code will
+ * be able to reach it, before there is any code.
+ *
+ * It matters because chasing only works when the datum is somewhere reachable
+ * to begin with.  A datum in the small-class region is not: that reservation is
+ * 256 GiB, so a datum well inside it has both edges further away than any
+ * 32-bit displacement covers, and no way of asking better finds a hole that is
+ * not there.  Coming out of the same cursor as the code makes them neighbours
+ * BY CONSTRUCTION, on every system, with nothing to verify afterwards.
+ *
+ * IT IS A PAIR with @c host_free_pages, for the same reason as its sibling: a
+ * block from the region carries no chunk header, so @c host_free would read
+ * whatever is in its first bytes as one.
+ *
+ * WHAT IT COSTS, and it is worth knowing before calling this in a loop: the
+ * request is rounded up to a whole chunk of @c kBigChunkBytes -- one MiB -- and
+ * the cursor it comes off ONLY ADVANCES.  Handing the block back releases the
+ * pages but not the range, so every call spends a MiB of the region's address
+ * space for the life of the process.  With 16 GiB reserved that is 16,384
+ * calls, which is plenty for one per loaded module and is NOT plenty for
+ * something asked per request.  When the region runs out this answers nullptr
+ * -- loudly, in the sense that the caller finds out -- instead of quietly
+ * handing back something that does not have the property being asked for.
+ *
+ * @param bytes how many, rounded up to the region's chunk.
+ * @param prot  the permissions the pages are committed with.  Data asks for
+ *              read-write; only code asks for execute.
+ * @return the block, or nullptr when the region could not serve it.  Nullptr is
+ *         not fatal here: the caller can fall back to ordinary memory and lose
+ *         the closeness, not the program.
+ *
+ * @par Threads
+ * Safe.  The cursor is atomic and two threads asking at once get different
+ * chunks.
+ *
+ * \~spanish
+ * LA OTRA MITAD de @c host_alloc_pages, y la que quita la pregunta en vez de
+ * contestarla.  Aquella coge un dato que YA existe e intenta poner codigo a su
+ * alcance; esta pone el DATO donde el codigo va a poder alcanzarlo, antes de
+ * que haya codigo.
+ *
+ * Importa porque perseguir solo funciona si el dato esta en un sitio
+ * alcanzable de entrada.  Un dato en la region de clases pequenas no lo esta:
+ * esa reserva mide 256 GiB, asi que un dato bien adentro tiene los dos bordes
+ * mas lejos de lo que cubre ningun desplazamiento de 32 bits, y ninguna forma
+ * de pedir mejor encuentra un hueco que no existe.  Saliendo del mismo cursor
+ * que el codigo son vecinos POR CONSTRUCCION, en todos los sistemas y sin nada
+ * que comprobar despues.
+ *
+ * VA EN PAREJA con @c host_free_pages, por lo mismo que su hermana: un bloque
+ * de la region no lleva cabecera de trozo, asi que @c host_free leeria como tal
+ * lo que hubiera en sus primeros bytes.
+ *
+ * LO QUE CUESTA, y conviene saberlo antes de llamar a esto en un bucle: lo
+ * pedido se redondea a un trozo entero de @c kBigChunkBytes -- un MiB -- y el
+ * cursor del que sale SOLO AVANZA.  Devolver el bloque suelta las paginas pero
+ * no el rango, asi que cada llamada gasta un MiB del espacio de direcciones de
+ * la region para lo que queda de proceso.  Con 16 GiB apalabrados son 16.384
+ * llamadas, que sobran para una por modulo cargado y NO sobran para algo que se
+ * pida por peticion.  Cuando la region se agota esto contesta nulo -- ruidoso
+ * en el sentido de que quien llama se entera -- en vez de devolver callando
+ * algo que no tiene la propiedad que se estaba pidiendo.
+ *
+ * @param bytes cuantos, redondeados al trozo de la region.
+ * @param prot  los permisos con que se comprometen las paginas.  Un dato pide
+ *              lectura y escritura; solo el codigo pide ejecucion.
+ * @return el bloque, o nulo cuando la region no pudo servirlo.  Nulo aqui no es
+ *         fatal: quien llama puede caer a memoria normal y perder la cercania,
+ *         no el programa.
+ *
+ * @par Hilos
+ * Segura.  El cursor es atomico y dos hilos que pidan a la vez reciben trozos
+ * distintos.
+ *
+ * \~
+ * @see host_alloc_pages, host_free_pages
+ */
+void *host_alloc_pages_in_region(size_t bytes, OsProt prot) noexcept;
+
+/**
+ * @brief
+ * \~english Returns what either of the two page entries handed out.
+ * \~spanish Devuelve lo que entrego cualquiera de las dos entradas de paginas.
+ * \~
+ *
+ * \~english
+ * THE PAGES COME BACK, THE RANGE DOES NOT, and that is the part that surprises:
+ * when the block came out of our own reservation this releases the memory --
+ * the pages stop existing and touching them faults -- but the cursor does not
+ * step back, so those addresses are spent for the life of the process.  It is
+ * the same rule as a span that did not fit the bank, and it is what makes the
+ * cursor free of locks and of order.  A block that came from the system is
+ * released whole, addresses included.  The two cases are told apart by where
+ * the block falls, without reading it.
+ *
+ * \~spanish
+ * LAS PAGINAS VUELVEN, EL RANGO NO, y esa es la parte que sorprende: cuando el
+ * bloque salio de nuestra propia reserva esto suelta la memoria -- las paginas
+ * dejan de existir y tocarlas falla -- pero el cursor no retrocede, asi que
+ * esas direcciones quedan gastadas para lo que queda de proceso.  Es la misma
+ * regla que la de un tramo que no cupo en el banco, y es lo que hace que ese
+ * cursor no necesite cerrojos ni orden.  Un bloque que vino del sistema se
+ * suelta entero, direcciones incluidas.  Los dos casos se distinguen por donde
+ * cae el bloque, sin leerlo.
+ *
  * \~
  * @param bytes
  * \~english the same size it was asked for.
@@ -3069,15 +3179,27 @@ void host_free_pages(void *p, size_t bytes) noexcept;
 
 /**
  * @brief
- * \~english How many executable blocks came out of our own reservation.
- * \~spanish Cuantos bloques ejecutables salieron de nuestra propia reserva.
+ * \~english How many blocks came out of our own reservation as PAGES.
+ * \~spanish Cuantos bloques salieron de nuestra propia reserva como PAGINAS.
+ * \~
+ *
+ * \~english
+ * Code and the data code has to reach, counted together on purpose: they come
+ * off the same cursor and are the same mechanism, so splitting them in the
+ * report would claim there are two.
+ *
+ * \~spanish
+ * El codigo y los datos que el codigo tiene que alcanzar, contados juntos a
+ * proposito: salen del mismo cursor y son el mismo mecanismo, asi que
+ * separarlos en el informe diria que hay dos.
+ *
  * \~
  * @return
  * \~english how many, since the process started.
  * \~spanish cuantos, desde que arranco el proceso.
  * \~
  */
-uint64_t host_exec_allocs() noexcept;
+uint64_t host_region_pages() noexcept;
 
 /**
  * @brief

@@ -14,6 +14,38 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Anadido
 
+- **`host_alloc_pages_in_region`: la otra mitad, la que quita la pregunta en
+  vez de contestarla.**  `host_alloc_pages` coge un dato que YA existe e intenta
+  poner codigo a su alcance.  Esta pone el DATO donde el codigo va a poder
+  alcanzarlo, antes de que haya codigo.
+
+  POR QUE HACIA FALTA.  Perseguir solo funciona si el dato esta en un sitio
+  alcanzable de entrada, y un dato en la region de clases PEQUENAS no lo esta:
+  esa reserva mide 256 GiB, asi que uno bien adentro tiene los dos bordes mas
+  lejos de lo que cubre un desplazamiento de 32 bits, y no hay hueco al lado que
+  encontrar.  Es la misma geometria que ya obligo a servir desde dentro para la
+  region grande, en la otra region.
+
+  Se veia siempre en Linux y nunca en Windows, que es lo que lo tenia
+  escondido: el mismo dato caia en una region en un sistema y en la otra en el
+  otro.  Con el ancla en la pequena, el barrido prueba 33 puntos de la ventana,
+  todos dentro de la reserva, y el nucleo coloca el codigo **a 16.424 MiB**.
+  Saliendo los dos del mismo cursor: **3 MiB**, el mismo numero en los dos
+  sistemas, porque ya no depende de donde cayera nada.
+
+  El contador `host_exec_allocs` pasa a llamarse `host_region_pages`, y el
+  informe con el: ahora cuenta el codigo Y los datos que el codigo tiene que
+  alcanzar.  Dejarlo con el nombre viejo habria sido un contador que dice una
+  cosa y cuenta otra.
+
+  LO QUE CUESTA, dicho aqui porque es consumo MONOTONO y esos son los que se
+  descubren tarde: lo pedido se redondea a un trozo entero de un MiB y el cursor
+  del que sale solo avanza, asi que devolver el bloque suelta las paginas pero
+  no el rango.  Con 16 GiB apalabrados son 16.384 llamadas.  Sobran para una por
+  modulo cargado -- que es el uso que tiene hoy -- y NO sobran para algo que se
+  pida por peticion.  Agotada la region, la entrada contesta nulo en vez de
+  devolver callando un bloque que no tiene la propiedad que se pedia.
+
 - **Paginas con PERMISOS y colocadas donde hagan falta: `host_alloc_pages`.**
   Por debajo esto siempre fue un repartidor de arenas; lo unico que estaba fijo
   eran los permisos con que se comprometen sus paginas y que caian donde
@@ -567,6 +599,39 @@ invita a creer que ampara.
 ## [Unreleased]
 
 ### Added
+
+- **`host_alloc_pages_in_region`: the other half, the one that removes the
+  question instead of answering it.**  `host_alloc_pages` takes a datum that
+  ALREADY exists and tries to put code within reach of it.  This one puts the
+  DATUM where code will be able to reach it, before there is any code.
+
+  WHY IT WAS NEEDED.  Chasing only works when the datum is somewhere reachable
+  to begin with, and a datum in the SMALL-class region is not: that reservation
+  is 256 GiB, so one well inside it has both edges further away than a 32-bit
+  displacement covers, and there is no hole next to it to find.  It is the same
+  geometry that already forced serving from inside for the big region, in the
+  other region.
+
+  It showed on Linux every time and on Windows never, which is what kept it
+  hidden: the same datum landed in one region on one system and in the other on
+  the other.  With the anchor in the small region the walk tries 33 points
+  across the window, all of them inside the reservation, and the kernel places
+  the code **16,424 MiB away**.  With both coming off the same cursor: **3 MiB**,
+  the same number on both systems, because it no longer depends on where
+  anything happened to land.
+
+  The counter `host_exec_allocs` is now `host_region_pages`, and the report with
+  it: it counts the code AND the data the code has to reach.  Leaving the old
+  name would have been a counter that says one thing and counts another.
+
+  WHAT IT COSTS, said here because it is MONOTONIC consumption and those are the
+  ones found out late: the request is rounded up to a whole one-MiB chunk and
+  the cursor it comes off only advances, so handing the block back releases the
+  pages but not the range.  With 16 GiB reserved that is 16,384 calls.  Plenty
+  for one per loaded module -- which is the use it has today -- and NOT plenty
+  for something asked per request.  With the region spent, the entry answers
+  nullptr instead of quietly handing back a block that does not have the
+  property being asked for.
 
 - **Pages with PERMISSIONS, placed where they are needed: `host_alloc_pages`.**
   Underneath, this was always an arena dealer; the only fixed things were the
