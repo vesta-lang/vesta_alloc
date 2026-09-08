@@ -3028,10 +3028,14 @@ StatsDump::~StatsDump() {
     std::fprintf(
         stderr,
         "[allocator] small=%llu freed=%llu freed-by-others=%llu "
-        "large=%llu chunks=%llu\n",
+        "large=%llu large-freed=%llu chunks=%llu\n",
         (unsigned long long)s.small_allocs, (unsigned long long)s.small_frees,
         (unsigned long long)s.remote_frees, (unsigned long long)s.large_allocs,
-        (unsigned long long)s.chunks);
+        /* Las devoluciones grandes se llevaban y no salian, asi que el hueco
+         * entre pedidas y devueltas -- que es lo que queda vivo -- habia que
+         * adivinarlo.  Es la misma pregunta que la linea de "ALIVE at exit"
+         * contesta para las pequenas. */
+        (unsigned long long)s.large_frees, (unsigned long long)s.chunks);
     /* CUANTA memoria se ha quedado, que es la pregunta que la cuenta de
      * reservas no contesta.  `bytes_reserved` se llevaba desde siempre y no lo
      * enseñaba nadie: sin el, para saber a donde iba mas de un giga habia que
@@ -3044,9 +3048,16 @@ StatsDump::~StatsDump() {
     const long long alive = (long long)s.small_allocs -
                             (long long)s.small_frees -
                             (long long)s.remote_frees;
+    /* ACUMULADO, no lo vivo, y hay que decirlo: `bytes_reserved` suma todo lo
+     * que se comprometio ALGUNA VEZ, y un rango reusado vuelve a contar.  Sin
+     * la palabra, un proceso que recicla mucho parece tener cientos de gigas
+     * comprometidos -- visto: 272.331 MiB con 256 GiB reservados --, y eso no
+     * es una cifra grande, es una cifra que significa otra cosa.  Lo que hay
+     * VIVO se lee en la linea de arriba y en las del sistema. */
     std::fprintf(stderr,
-                 "[allocator] committed=%.1f MiB in %zu KiB chunks | "
-                 "small blocks ALIVE at exit=%lld\n",
+                 "[allocator] committed over the run=%.1f MiB in %zu KiB "
+                 "chunks (cumulative: a reused range counts again) | small "
+                 "blocks ALIVE at exit=%lld\n",
                  (double)s.bytes_reserved / (1024.0 * 1024.0),
                  (size_t)(kChunkBytes / 1024), alive);
     /* Cuanta region se consiguio apalabrar, y cuantas veces nos rendimos.  Las
@@ -3091,11 +3102,16 @@ StatsDump::~StatsDump() {
      * que es la unica forma de que este camino se apague sin decirlo. */
     const uint64_t direct = g_direct_allocs.load(std::memory_order_relaxed);
     if (direct != 0) {
+        /* REDONDEANDO HACIA ARRIBA.  `kMaxSpanBytes` es 16 MiB menos la
+         * cabecera, asi que la division entera decia "over 15 MiB" y situaba la
+         * raya en un sitio donde no esta.  Un informe que coloca mal una
+         * frontera manda a buscar el problema al tramo equivocado. */
         std::fprintf(stderr,
-                     "[allocator] served by the SYSTEM directly: %llu  <- over "
-                     "%zu MiB, where the region can no longer recycle",
+                     "[allocator] served by the SYSTEM directly: %llu  <- from "
+                     "%zu MiB up, where the region can no longer recycle",
                      (unsigned long long)direct,
-                     (size_t)(kMaxSpanBytes / (1024 * 1024)));
+                     (size_t)((kMaxSpanBytes + (1024 * 1024) - 1) /
+                              (1024 * 1024)));
         const uint64_t refused =
             g_direct_refused.load(std::memory_order_relaxed);
         if (refused != 0)
@@ -3105,6 +3121,67 @@ StatsDump::~StatsDump() {
                          (unsigned long long)refused, kDirectSlots);
         std::fprintf(stderr, "\n");
     }
+    /* PAGINAS EJECUTABLES, y sobre todo las que NO se pudieron colocar cerca.
+     *
+     * Esa segunda cifra es la que tiene que estar aqui: fallar la colocacion es
+     * mudo por naturaleza -- el bloque vuelve igual y el programa sigue --, y lo
+     * que se rompe es un desplazamiento de 32 bits que ya no cabe, mucho
+     * despues y en otro sitio.  Un contador que nadie enseña no sirve de nada,
+     * que es justamente para lo que existe este informe. */
+    const uint64_t exec = g_exec_allocs.load(std::memory_order_relaxed);
+    const uint64_t exec_far = g_exec_far.load(std::memory_order_relaxed);
+    if (exec != 0 || exec_far != 0) {
+        std::fprintf(stderr,
+                     "[allocator] executable pages served from our own "
+                     "reservation: %llu",
+                     (unsigned long long)exec);
+        if (exec_far != 0)
+            std::fprintf(stderr,
+                         "  | %llu could NOT be placed close enough and went to "
+                         "the system: whatever needs a 32-bit displacement to "
+                         "reach them will not",
+                         (unsigned long long)exec_far);
+        std::fprintf(stderr, "\n");
+    }
+
+    /* Tramos devueltos al sistema por no caber en el banco, y lo que el banco
+     * RETIENE ahora mismo.  Las dos juntas porque contestan la misma pregunta
+     * -- a donde se fue la memoria grande -- por los dos lados. */
+    const uint64_t dropped = g_spans_dropped.load(std::memory_order_relaxed);
+    const size_t parked = g_recycle_bytes.load(std::memory_order_relaxed);
+    if (dropped != 0 || parked != 0)
+        std::fprintf(stderr,
+                     "[allocator] spans handed back to the system: %llu  | "
+                     "held in the recycler now: %.1f MiB\n",
+                     (unsigned long long)dropped,
+                     double(parked) / (1024.0 * 1024.0));
+
+    /* Liberaciones que no cuadraban.  Al detectar la primera ya se avisa, pero
+     * ese aviso sale UNA vez y el total no se veia: una es un bug y mil es otro
+     * problema, y desde fuera se leian igual. */
+    const uint64_t corrupt = g_corrupt_frees.load(std::memory_order_relaxed);
+    if (corrupt != 0)
+        std::fprintf(stderr,
+                     "[allocator] CORRUPT FREES: %llu  <- pointers that were "
+                     "not the start of a live block.  See the first one's "
+                     "message above\n",
+                     (unsigned long long)corrupt);
+
+    /* Lo que el registro de SITIOS no llego a apuntar.  Sin esto, una foto de
+     * sitios incompleta se lee igual que una completa -- y es la que se usa
+     * para decidir donde mirar.
+     *
+     * SOLO ESTA CIFRA: los desalojos los cuenta `dump_alloc_sites` unas lineas
+     * mas abajo, y ademas con lo que hace falta para interpretarlos -- que las
+     * cuentas de esos sitios pasan a ser cotas superiores --.  Repetirlo aqui
+     * seria dar el mismo dato dos veces con menos contexto. */
+    const uint64_t sites_skip = alloc_sites_skipped();
+    if (sites_skip != 0)
+        std::fprintf(stderr,
+                     "[allocator] %llu allocations were NOT recorded as a call "
+                     "site: the picture below is missing them\n",
+                     (unsigned long long)sites_skip);
+
     /* Y la otra cota que degradaba callando: quedarse sin identificador manda
      * a ese hilo a las listas compartidas, detras del unico cerrojo. */
     const uint64_t no_id = g_no_cache_id.load(std::memory_order_relaxed);
@@ -3114,6 +3191,18 @@ StatsDump::~StatsDump() {
                      "%u live owners; those threads were served from the "
                      "SHARED lists, behind the lock\n",
                      (unsigned long long)no_id, kMaxThreads - 1);
+
+    /* Y la MISMA cota en la otra politica, que degrada peor: la de por hilo no
+     * tiene respaldo compartido a proposito, asi que agotarla manda a esos
+     * hilos por el camino general -- otra vez detras del cerrojo que ese tipo
+     * existe para evitar --.  Se podia preguntar y no se enseñaba. */
+    const uint64_t no_pt = g_no_per_thread_id.load(std::memory_order_relaxed);
+    if (no_pt != 0)
+        std::fprintf(stderr,
+                     "[allocator] OUT OF PER-THREAD CACHES %llu times  <- more "
+                     "than %u at once; those threads fell back to the general "
+                     "path, which is what that policy exists to avoid\n",
+                     (unsigned long long)no_pt, kPerThreadCaches);
     /* Reparto por PROPOSITO.  Es la cifra que dice cuanto queda por migrar: lo
      * que sale como "no se" es exactamente lo que todavia no declara nada.  Se
      * imprime siempre que haya reservas, no solo lo que no sea cero, para que

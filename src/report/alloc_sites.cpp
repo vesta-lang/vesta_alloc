@@ -572,9 +572,40 @@ void dump_alloc_sites(unsigned top) noexcept {
              * se imprime al salir de un programa que puede tener cientos. */
             AllocFrame frame;
             vesta_memfill(&frame, 0, 1);
-            if (resolver(best[a].pc, &frame, 1) > 0 && frame.function != nullptr)
+            if (resolver(best[a].pc, &frame, 1) > 0 &&
+                frame.function != nullptr) {
                 std::fprintf(stderr, "  %s",
                              alloc_readable_name(frame.function));
+                /* Y DONDE, que es lo que convierte la lista en algo accionable:
+                 * un nombre dice quien reserva y `fichero:linea` dice a que ir.
+                 * El resolutor ya lo traia -- lo saca del DWARF junto con el
+                 * nombre -- y no se enseñaba, asi que habia que buscar a mano
+                 * una funcion que puede reservar en veinte sitios.
+                 *
+                 * LOS DOS ULTIMOS SEGMENTOS, no la ruta entera.  Una absoluta
+                 * de setenta caracteres -- `C:/TDM-GCC-64/lib/gcc/x86_64-w64-
+                 * mingw32/10.3.0/include/c++/bits/basic_string.h` -- se come la
+                 * linea y no distingue mejor que su final: lo que identifica el
+                 * sitio es `bits/basic_string.h:179`.  Dos y no uno porque
+                 * `basic_string.h` a secas se confunde con otros. */
+                if (frame.file != nullptr && frame.line != 0) {
+                    const char *tail = frame.file;
+                    unsigned cuts = 0;
+                    for (const char *q = frame.file; *q != '\0'; ++q)
+                        if (*q == '/' || *q == '\\') ++cuts;
+                    if (cuts >= 2) {
+                        unsigned seen = 0;
+                        for (const char *q = frame.file; *q != '\0'; ++q)
+                            if (*q == '/' || *q == '\\') {
+                                if (++seen == cuts - 1) {
+                                    tail = q + 1;
+                                    break;
+                                }
+                            }
+                    }
+                    std::fprintf(stderr, "  %s:%u", tail, frame.line);
+                }
+            }
         }
         std::fputc('\n', stderr);
     }

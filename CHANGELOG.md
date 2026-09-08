@@ -398,6 +398,37 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Corregido
 
+- **El informe llevaba contadores que no enseñaba, y tres cifras que decian otra
+  cosa.**  Auditado uno por uno lo que el asignador cuenta contra lo que sale
+  por pantalla, faltaban siete: las devoluciones grandes (`large-freed`), las
+  paginas ejecutables servidas de nuestra reserva y **las que no se pudieron
+  colocar cerca**, los tramos devueltos al sistema, lo que el reciclador retiene
+  ahora, las veces que se agotaron los caches por hilo, el total de liberaciones
+  corruptas y las reservas que no llegaron a apuntarse como sitio.
+
+  La que mas importaba es la de colocacion: fallar ahi es MUDO por naturaleza
+  -- el bloque vuelve igual y el programa sigue, y lo que se rompe es un
+  desplazamiento de 32 bits que ya no cabe, mucho despues y en otro sitio --,
+  asi que un contador que nadie enseña no sirve para nada.  Es exactamente el
+  defecto que este informe existe para evitar.
+
+  Y tres cosas que el informe decia mal:
+
+  - **`fichero:linea` no salia** en la lista de sitios, aunque el resolutor ya
+    lo traia del DWARF junto con el nombre.  Habia que buscar a mano una funcion
+    que puede reservar en veinte sitios.  Sale recortado a los dos ultimos
+    segmentos: una ruta absoluta de setenta caracteres se come la linea y no
+    distingue mejor que `bits/basic_string.h:179`.
+  - **"over 15 MiB"** era la division entera de `kMaxSpanBytes` (16 MiB menos la
+    cabecera): situaba la frontera de la via directa donde no esta, y un informe
+    que coloca mal una frontera manda a buscar al tramo equivocado.
+  - **"committed=272331.5 MiB"** con 256 GiB reservados parecia decir que el
+    proceso tenia 266 GiB vivos.  Es ACUMULADO -- un rango reusado vuelve a
+    contar --, y ahora lo dice.
+
+  Los desalojos de la tabla de sitios NO se anadieron: ya los explica
+  `dump_alloc_sites` con lo que hace falta para interpretarlos.
+
 - **`bench_operator_new` acusaba a corridas que funcionaban.**  Su bucle de
   calentamiento no pasaba el puntero por un `volatile`, y desde C++14 el
   compilador puede BORRAR un par `new`/`delete` sin usar -- GCC borraba el
@@ -886,6 +917,37 @@ invita a creer que ampara.
   header, where nobody else could use it.  One fact, one producer.
 
 ### Fixed
+
+- **The report carried counters it never showed, and three figures that said
+  something else.**  Auditing one by one what the allocator counts against what
+  reaches the screen, seven were missing: large frees (`large-freed`), the
+  executable pages served from our own reservation and **the ones that could not
+  be placed close enough**, spans handed back to the system, what the recycler
+  is holding right now, times the per-thread caches ran out, the total of
+  corrupt frees, and allocations that never made it into the call-site table.
+
+  The placement one mattered most: failing there is SILENT by nature -- the
+  block still comes back and the program still runs, and what breaks is a
+  32-bit displacement that no longer fits, much later and somewhere else -- so a
+  counter nobody shows is worth nothing.  That is exactly the defect this report
+  exists to prevent.
+
+  And three things the report got wrong:
+
+  - **`file:line` was not printed** in the site list, even though the resolver
+    already carried it from DWARF alongside the name.  One had to hunt by hand
+    through a function that may allocate in twenty places.  It now prints,
+    trimmed to the last two segments: a seventy-character absolute path eats the
+    line and tells them apart no better than `bits/basic_string.h:179`.
+  - **"over 15 MiB"** was integer division of `kMaxSpanBytes` (16 MiB minus the
+    header): it put the direct path's boundary where it is not, and a report
+    that misplaces a boundary sends you looking in the wrong range.
+  - **"committed=272331.5 MiB"** next to 256 GiB reserved read as if the process
+    held 266 GiB live.  It is CUMULATIVE -- a reused range counts again -- and
+    now it says so.
+
+  Call-site evictions were NOT added: `dump_alloc_sites` already explains them
+  with what it takes to read them.
 
 - **`bench_operator_new` accused runs that were working.**  Its warm-up loop did
   not park the pointer in a `volatile`, and since C++14 the compiler may DELETE
