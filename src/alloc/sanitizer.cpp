@@ -81,37 +81,64 @@ namespace {
 //  Knobs, all of them reachable from the environment
 // =========================================================================
 
-/// How deep a stack is walked.  Eight is what makes a leak report name the
-/// culprit instead of the helper it went through, and it is still one cache
-/// line of pointers.
+/// \~english How deep a stack is walked.  Eight is what makes a leak report
+///           name the culprit instead of the helper it went through, and it is
+///           still one cache line of pointers.
+/// \~spanish Cuanto se recorre una pila.  Ocho es lo que hace que un informe de
+///           fugas nombre al culpable en vez de al ayudante por el que paso, y
+///           sigue siendo una linea de cache de punteros.
+/// \~
 constexpr unsigned kFrames = 8;
 
-/// How many distinct stacks fit in the depot.  Overflow is COUNTED, never
-/// quietly dropped: a depot that lies because it is full is worse than a small
-/// one that says so.
+/// \~english How many distinct stacks fit in the depot.  Overflow is COUNTED,
+///           never quietly dropped: a depot that lies because it is full is
+///           worse than a small one that says so.
+/// \~spanish Cuantas pilas distintas caben en el deposito.  Pasarse se CUENTA,
+///           nunca se tira en silencio: un deposito que miente por lleno es
+///           peor que uno pequeno que lo dice.
+/// \~
 constexpr uint32_t kDepotSlots = 4096;
 
-/// The byte a released block is filled with.  A pointer built out of it is
-/// wildly unmapped on both systems, and read as a number it is recognisable at
-/// a glance in a debugger.
+/// \~english The byte a released block is filled with.  A pointer built out of
+///           it is wildly unmapped on both systems, and read as a number it is
+///           recognisable at a glance in a debugger.
+/// \~spanish El byte con el que se llena un bloque soltado.  Un puntero hecho
+///           con el cae en memoria sin mapear en los dos sistemas, y leido como
+///           numero se reconoce de un vistazo en un depurador.
+/// \~
 constexpr unsigned char kPoisonByte = 0xDD;
 
-/// The pattern written behind the caller's bytes, and how much of it.  Four
-/// bytes, so a single off-by-one is caught and no plausible memcpy reproduces
-/// it by accident.
+/// \~english The pattern written behind the caller's bytes, and how much of it.
+///           Four bytes, so a single off-by-one is caught and no plausible
+///           memcpy reproduces it by accident.
+/// \~spanish El patron que se escribe detras de los bytes del llamante, y
+///           cuanto.  Cuatro bytes, para cazar un desvio de uno y que ningun
+///           memcpy plausible lo reproduzca por casualidad.
+/// \~
 constexpr unsigned char kCanaryByte = 0xAB;
 constexpr size_t kCanaryBytes = 4;
 
-/// How much of a released block is poisoned; see @c SanPoison.
+/// \~english How much of a released block is poisoned; see @c SanPoison.
+/// \~spanish Cuanto de un bloque soltado se envenena; ver @c SanPoison.
+/// \~
 SanPoison g_poison = SanPoison::Line;
 
-/// Which edge @c SanLevel::Guard puts the block against; see @c SanGuard.
+/// \~english Which edge @c SanLevel::Guard puts the block against; see
+///           @c SanGuard.
+/// \~spanish Contra que borde pone el bloque @c SanLevel::Guard; ver
+///           @c SanGuard.
+/// \~
 SanGuard g_guard_edge = SanGuard::Overflow;
 
 /**
- * @brief What makes the process exit non-zero.  0 = nothing, 1 = proven,
- *        2 = proven and suspected.
+ * @brief
+ * \~english What makes the process exit non-zero.  0 = nothing, 1 = proven,
+ *           2 = proven and suspected.
+ * \~spanish Que hace que el proceso salga distinto de cero.  0 = nada,
+ *           1 = demostrado, 2 = demostrado y sospechado.
+ * \~
  *
+ * \~english
  * ONE IS THE DEFAULT, AND WHICH ONE IT IS MATTERS MORE THAN IT LOOKS.  A block
  * still alive at exit is SUSPECTED, never proven: memory a program keeps on
  * purpose until it dies looks exactly the same.  Failing a build on that was
@@ -121,6 +148,18 @@ SanGuard g_guard_edge = SanGuard::Overflow;
  * A checker that cries wolf gets switched off and never comes back, so a
  * suspicion is REPORTED and does not gate.  Two is there for a codebase that
  * has decided it wants zero blocks alive at exit and is willing to chase them.
+ *
+ * \~spanish
+ * UNO ES EL DEFECTO, Y CUAL SEA IMPORTA MAS DE LO QUE PARECE.  Un bloque vivo
+ * al salir es SOSPECHA, nunca prueba: la memoria que un programa se queda
+ * adrede hasta morir tiene ese mismo aspecto.  Hacer fallar un build por eso
+ * fue lo primero que hizo este modo, y se llevo por delante diez tests de la
+ * propia libreria -- todos por quedarse algo vivo a proposito.
+ *
+ * Un comprobador que grita en falso se apaga y no vuelve, asi que una sospecha
+ * se AVISA y no corta.  El dos esta para quien haya decidido que quiere cero
+ * bloques vivos al salir y este dispuesto a perseguirlos.
+ * \~
  */
 unsigned g_exit_code = 1;
 
@@ -136,13 +175,25 @@ std::atomic<uint64_t> g_no_shadow{0};  ///< rows the system would not give
 std::atomic<uint64_t> g_cross_thread{0}; ///< allocated here, released there
 
 /**
- * @brief How sure the checker is, and it travels WITH the verdict.
+ * @brief
+ * \~english How sure the checker is, and it travels WITH the verdict.
+ * \~spanish Cuanta certeza tiene el comprobador, y viaja CON el veredicto.
+ * \~
  *
+ * \~english
  * Not decoration.  "Could not prove this is right" is not "proved it is wrong"
  * -- the lesson `may_alias` already taught this codebase the hard way -- and a
  * list that mixes the two gets ignored whole.  A trampled canary is PROVEN; a
  * block still alive at exit may be a leak or may be memory the program keeps on
  * purpose, so it is SUSPECTED.
+ *
+ * \~spanish
+ * No es adorno.  "No pude demostrar que esto este bien" no es "he demostrado
+ * que esta mal" -- la leccion que `may_alias` ya le dio a este codigo a base de
+ * golpes -- y una lista que mezcla las dos cosas se ignora entera.  Un canario
+ * pisado es DEMOSTRADO; un bloque vivo al salir puede ser una fuga o puede ser
+ * memoria que el programa se queda adrede, asi que es SOSPECHA.
+ * \~
  */
 enum class Certainty { Proven, Suspected };
 
@@ -154,9 +205,13 @@ const char *certainty_word(Certainty c) noexcept {
 //  The stack depot
 // =========================================================================
 
-/// A slot is empty, being filled, or readable.  The middle state exists because
-/// a reader must never compare against half-written frames and conclude it has
-/// found a different stack.
+/// \~english A slot is empty, being filled, or readable.  The middle state
+///           exists because a reader must never compare against half-written
+///           frames and conclude it has found a different stack.
+/// \~spanish Una ranura esta vacia, llenandose, o legible.  El estado de en
+///           medio existe porque un lector no puede comparar contra marcos a
+///           medio escribir y concluir que ha encontrado otra pila.
+/// \~
 enum : uint32_t { kSlotEmpty = 0, kSlotClaiming = 1, kSlotReady = 2 };
 
 struct Stack {
@@ -169,8 +224,13 @@ struct Stack {
 Stack *g_depot = nullptr;
 
 /**
- * @brief Whether @p fp can be a frame pointer of the stack we are standing on.
+ * @brief
+ * \~english Whether @p fp can be a frame pointer of the stack we are on.
+ * \~spanish Si @p fp puede ser un puntero de marco de la pila en la que
+ *           estamos.
+ * \~
  *
+ * \~english
  * WITHOUT `-fno-omit-frame-pointer` whatever sits in that register is just a
  * number, and following it INVENTS a stack.  An invented stack is worse than
  * one true frame, because it names functions that had nothing to do with it.
@@ -179,6 +239,17 @@ Stack *g_depot = nullptr;
  *
  * Cheap and enough: it has to point up the stack from where we are, be aligned,
  * and not be further away than a stack could plausibly be.
+ *
+ * \~spanish
+ * SIN `-fno-omit-frame-pointer` lo que haya en ese registro es un numero
+ * cualquiera, y seguirlo INVENTA una pila.  Una pila inventada es peor que un
+ * marco cierto, porque nombra funciones que no tuvieron nada que ver.  Asi que
+ * cada paso se valida y el recorrido para en el primero que no: entonces el
+ * veredicto dice que trae un solo marco, que es la verdad.
+ *
+ * Barato y suficiente: tiene que apuntar pila arriba desde donde estamos, estar
+ * alineado, y no estar mas lejos de lo que una pila puede estar.
+ * \~
  */
 [[gnu::always_inline]] inline bool plausible_frame(const void *fp,
                                                    const void *below) noexcept {
@@ -190,15 +261,34 @@ Stack *g_depot = nullptr;
 }
 
 /**
- * @brief Fills @p out with the caller's stack, as deep as it can PROVE.
+ * @brief
+ * \~english Fills @p out with the caller's stack, as deep as it can PROVE.
+ * \~spanish Llena @p out con la pila del llamante, tan hondo como pueda
+ *           DEMOSTRAR.
+ * \~
  *
- * @param out    where the frames go; at least @c kFrames of them.
- * @param first  the return address the caller already holds.  It is always
- *               frame zero, and it is the WHOLE answer when there is no frame
- *               chain to follow -- which is the old one-address model, kept as
- *               a fallback and not as a degraded case.
- * @param walked set to true only if at least one frame came from the chain.
- * @return how many frames are real.
+ * @param out
+ * \~english where the frames go; at least @c kFrames of them.
+ * \~spanish donde van los marcos; al menos @c kFrames.
+ * \~
+ * @param first
+ * \~english the return address the caller already holds.  It is always frame
+ *           zero, and it is the WHOLE answer when there is no frame chain to
+ *           follow -- which is the old one-address model, kept as a fallback
+ *           and not as a degraded case.
+ * \~spanish la direccion de retorno que el llamante ya tiene.  Siempre es el
+ *           marco cero, y es la respuesta ENTERA cuando no hay cadena de
+ *           marcos que seguir -- que es el modelo viejo de una sola direccion,
+ *           conservado como respaldo y no como caso degradado.
+ * \~
+ * @param walked
+ * \~english set to true only if at least one frame came from the chain.
+ * \~spanish se pone a true solo si al menos un marco vino de la cadena.
+ * \~
+ * @return
+ * \~english how many frames are real.
+ * \~spanish cuantos marcos son de verdad.
+ * \~
  */
 unsigned walk_stack(const void **out, const void *first, const void *from,
                     bool *walked) noexcept {
@@ -235,11 +325,17 @@ unsigned walk_stack(const void **out, const void *first, const void *from,
         const void *const next = slot[0];
         const void *const ret = slot[1];
         if (ret == nullptr || !plausible_frame(next, below)) break;
-        /* THE FIRST ONE IS USUALLY THE ONE WE ALREADY HAVE.  Whether the hook
-         * ends up as its own frame depends on what the compiler inlined into
-         * what, so the chain may start at the very address the caller handed
-         * us.  Skipping it by position would be right in one build and wrong in
-         * the next; comparing is right in both. */
+        /* \~english THE FIRST ONE IS USUALLY THE ONE WE ALREADY HAVE.  Whether
+         * the hook ends up as its own frame depends on what the compiler
+         * inlined into what, so the chain may start at the very address the
+         * caller handed us.  Skipping it by position would be right in one
+         * build and wrong in the next; comparing is right in both.
+         *
+         * \~spanish EL PRIMERO SUELE SER EL QUE YA TENEMOS.  Que el gancho
+         * acabe con marco propio depende de que inlinara el compilador dentro
+         * de que, asi que la cadena puede empezar justo en la direccion que nos
+         * dio el llamante.  Saltarlo por posicion seria correcto en un build y
+         * falso en el siguiente; compararlo es correcto en los dos.  \~ */
         if (ret != out[0]) {
             out[n++] = ret;
             *walked = true;
@@ -250,9 +346,13 @@ unsigned walk_stack(const void **out, const void *first, const void *from,
     return n;
 }
 
-/// FNV-1a over the frames.  The same stack lands on the same slot every run,
-/// which is what makes the report reproducible -- and a report that changes
-/// between runs cannot gate a build.
+/// \~english FNV-1a over the frames.  The same stack lands on the same slot
+///           every run, which is what makes the report reproducible -- and a
+///           report that changes between runs cannot gate a build.
+/// \~spanish FNV-1a sobre los marcos.  La misma pila cae en la misma ranura en
+///           cada corrida, que es lo que hace el informe reproducible -- y un
+///           informe que cambia entre corridas no puede cortar un build.
+/// \~
 uint32_t hash_stack(const void *const *pc, unsigned n) noexcept {
     uint64_t h = 1469598103934665603ull;
     for (unsigned i = 0; i < n; ++i) {
@@ -274,15 +374,33 @@ bool same_stack(const Stack &s, const void *const *pc, unsigned n) noexcept {
 }
 
 /**
- * @brief Stores a stack and hands back its id, reusing the one already there.
+ * @brief
+ * \~english Stores a stack and hands back its id, reusing the one already
+ *           there.
+ * \~spanish Guarda una pila y devuelve su identificador, reusando el que ya
+ *           hubiera.
+ * \~
  *
+ * \~english
  * Open addressing, APPEND ONLY: a full depot never evicts.  Evicting would make
  * two different stacks share an id and the report would name the wrong
  * function, which is the one failure a checker cannot have.  Full is counted
  * (@c g_depot_full) and answered with zero, which the report prints as "stack
  * not available" instead of as somebody's stack.
  *
- * @return the id, or 0 when there is no stack to give.
+ * \~spanish
+ * Direccionamiento abierto y SOLO ANADIR: un deposito lleno no desaloja jamas.
+ * Desalojar haria que dos pilas distintas compartieran identificador y el
+ * informe nombraria la funcion equivocada, que es el unico fallo que un
+ * comprobador no puede tener.  Lleno se cuenta (@c g_depot_full) y se contesta
+ * con cero, que el informe imprime como "pila no disponible" en vez de como la
+ * pila de alguien.
+ * \~
+ *
+ * @return
+ * \~english the id, or 0 when there is no stack to give.
+ * \~spanish el identificador, o 0 cuando no hay pila que dar.
+ * \~
  */
 uint32_t intern_stack(const void *const *pc, unsigned n, bool walked) noexcept {
     if (g_depot == nullptr) return 0;
@@ -454,8 +572,12 @@ Life *g_life = nullptr;
 std::atomic<uint64_t> g_longest_life{0};
 
 /**
- * @brief How many blocks THIS thread has been handed, ever.
+ * @brief
+ * \~english How many blocks THIS thread has been handed, ever.
+ * \~spanish Cuantos bloques se le han entregado a ESTE hilo, en total.
+ * \~
  *
+ * \~english
  * The clock a life is measured against, and it is one the allocator already
  * keeps -- so measuring lives adds no state to anything, which was the
  * condition.  It is the SUM of the per-purpose counters and not a total of its
@@ -467,6 +589,20 @@ std::atomic<uint64_t> g_longest_life{0};
  * version did.  That one is filled in at REPORT time by adding this same table
  * up, so during the run it is zero -- and every life came out zero, with the
  * report calmly declaring every site in the program "Instant".
+ *
+ * \~spanish
+ * El reloj contra el que se mide una vida, y es uno que el asignador YA lleva
+ * -- asi que medir vidas no anade estado a nada, que era la condicion --.  Es
+ * la SUMA de los contadores por proposito y no un total propio: el total se
+ * sustituyo por esa tabla justamente para que contar por proposito no costara
+ * nada extra, y no queda ningun total corriente aparte que leer.  Dieciseis
+ * sumas, en un modo que no compite con nadie.
+ *
+ * Buscar un campo llamado `small_allocs` y usarlo es lo que hizo la primera
+ * version.  Ese se rellena al ESCRIBIR el informe, sumando esta misma tabla,
+ * asi que durante la corrida vale cero -- y todas las vidas salian cero, con el
+ * informe declarando tan tranquilo que todo sitio del programa era "Instant".
+ * \~
  */
 [[gnu::always_inline]] inline uint32_t thread_allocs(
     const detail::ThreadCache *c) noexcept {
@@ -658,8 +794,12 @@ void verdict(Certainty c, const char *headline, const void *p) noexcept {
 // =========================================================================
 
 /**
- * @brief The part of a released block the poison may touch.
+ * @brief
+ * \~english The part of a released block the poison may touch.
+ * \~spanish La parte de un bloque soltado que el veneno puede tocar.
+ * \~
  *
+ * \~english
  * IT DOES NOT START AT THE BEGINNING, and that is the allocator being right and
  * the checker adapting.  A block on a free list carries the link to the next
  * one IN ITS FIRST BYTES -- `push_block` writes it there, which is why freeing
@@ -671,8 +811,27 @@ void verdict(Certainty c, const char *headline, const void *p) noexcept {
  * allocator of the very thing it was built to do.  A checker that cries wolf
  * gets switched off and never comes back, so the link goes untouched.
  *
- * @param block the size of the block, which is what bounds this: one byte past
- *              it would be the checker corrupting the NEXT block.
+ * \~spanish
+ * NO EMPIEZA AL PRINCIPIO, y eso es el asignador teniendo razon y el
+ * comprobador adaptandose.  Un bloque en una lista de libres lleva el enlace al
+ * siguiente EN SUS PRIMEROS BYTES -- `push_block` lo escribe ahi, que es por lo
+ * que liberar sale tan barato --, asi que el asignador pisa lo que el
+ * comprobador pusiera en el desplazamiento cero, al instante siguiente de
+ * ponerlo.
+ *
+ * Envenenarlos igual es lo que hizo la primera version, y salio un torrente de
+ * "escrito despues de soltar" en cada bloque reutilizado: el comprobador
+ * acusando al asignador de justo lo que fue construido para hacer.  Un
+ * comprobador que grita en falso se apaga y no vuelve, asi que el enlace se
+ * queda sin tocar.
+ * \~
+ *
+ * @param block
+ * \~english the size of the block, which is what bounds this: one byte past it
+ *           would be the checker corrupting the NEXT block.
+ * \~spanish el tamano del bloque, que es lo que lo acota: un byte mas alla
+ *           seria el comprobador corrompiendo el bloque SIGUIENTE.
+ * \~
  */
 constexpr size_t kLinkBytes = sizeof(void *);
 
@@ -930,8 +1089,13 @@ size_t san_grow(size_t n) noexcept {
 }
 
 /**
- * @brief A block on pages of its own, flush against a page that is not mapped.
+ * @brief
+ * \~english A block on pages of its own, flush against a page that is not
+ *           mapped.
+ * \~spanish Un bloque en paginas propias, pegado a una pagina sin mapear.
+ * \~
  *
+ * \~english
  * HOW IT CATCHES THE WRITE AND NOT ITS CONSEQUENCE.  The pages are asked for
  * with one MORE at the end, and that last one is left unmapped.  The block is
  * then put at the far end of the mapped ones, so `p + req` lands on the guard:
@@ -952,6 +1116,29 @@ size_t san_grow(size_t n) noexcept {
  * pages away, so the addresses stay spent and a use-after-free keeps faulting
  * for the life of the process.  That is the point, and it is also why this is
  * nobody's default.
+ *
+ * \~spanish
+ * COMO CAZA LA ESCRITURA Y NO SU CONSECUENCIA.  Se piden las paginas con UNA
+ * mas al final, y esa ultima se deja sin mapear.  El bloque se pone al fondo de
+ * las mapeadas, asi que `p + req` cae en la guarda: una escritura un byte mas
+ * alla toca memoria que no existe y el proceso falla AHI, con la direccion de
+ * verdad y la pila de verdad, en vez de corromper al vecino en silencio y
+ * descubrirse en otro sitio una hora despues.  Sin ningun pase de compilador --
+ * la comprobacion la hace el hardware.
+ *
+ * EL HUECO, y es por lo que el canario sigue puesto.  Lo que se devuelve hay
+ * que alinearlo como cualquier otra reserva, asi que el bloque se empuja hacia
+ * ABAJO y quedan hasta quince bytes entre su final y la guarda.  Un
+ * desbordamiento tan corto cae en el hueco y la pagina no se entera.  Esos
+ * bytes llevan canario, asi que el hueco se mira al soltar el bloque -- los
+ * pequenos tarde, los grandes al instante, y ninguno en medio perdido.
+ *
+ * LO QUE CUESTA, y no es un detalle: la reserva mas pequena que hay se lleva
+ * dos paginas, y el rango NO se devuelve jamas -- soltar solo quita las
+ * paginas, asi que las direcciones quedan gastadas y un uso despues de liberar
+ * sigue fallando el resto del proceso.  Eso es lo que se compra, y es tambien
+ * por lo que esto no es el defecto de nadie.
+ * \~
  */
 void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     /* The CONFIG and not the whole set-up: a guarded block does not touch the
