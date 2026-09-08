@@ -1143,6 +1143,89 @@ ThreadCache *per_thread_cache_slow() noexcept;
  */
 [[noreturn]] void no_foreign_free(void *p) noexcept;
 
+/**
+ * @brief
+ * \~english Frees a pointer that falls outside BOTH regions.
+ * \~spanish Suelta un puntero que cae fuera de las DOS regiones.
+ * \~
+ *
+ * \~english
+ * There are exactly two things it can be, and the table says which: a block
+ * the system served on a reservation of its own -- everything above
+ * @c kMaxSpanBytes -- or something that is not ours at all, which stops the
+ * process through @c no_foreign_free.  The block is never READ to decide: a
+ * pointer that might be foreign must not be dereferenced.
+ *
+ * Out of line and cold.  It sits on the branch that used to end the program,
+ * so recognising the direct blocks costs the hot free path nothing --
+ * VERIFIED BY DISASSEMBLY: @c host_free comes out instruction for instruction
+ * as it was down the in-region path, and the three instructions this adds are
+ * all on that dead branch, which now ends in a tail call instead of a call to
+ * something that never returned.
+ *
+ * \~spanish
+ * Solo puede ser una de dos cosas, y la tabla dice cual: un bloque que el
+ * sistema sirvio en una reserva propia -- todo lo que pasa de
+ * @c kMaxSpanBytes -- o algo que no es nuestro, que para el proceso por
+ * @c no_foreign_free.  Nunca se LEE el bloque para decidirlo: un puntero que
+ * podria ser ajeno no se desreferencia.
+ *
+ * Fuera de linea y fria.  Vive en la rama que antes terminaba el programa, asi
+ * que reconocer los bloques directos no le cuesta nada al camino caliente de
+ * soltar -- COMPROBADO DESENSAMBLANDO: @c host_free sale instruccion por
+ * instruccion como estaba por el camino de dentro de la region, y las tres
+ * instrucciones que esto anade estan todas en esa rama muerta, que ahora
+ * termina en una llamada de cola en vez de en una llamada a algo que no
+ * volvia.
+ *
+ * \~
+ * @param p
+ * \~english the pointer that was handed to a free entry point.
+ * \~spanish el puntero que se le paso a una entrada de liberacion.
+ * \~
+ */
+void host_free_outside(void *p) noexcept;
+
+/**
+ * @brief
+ * \~english How big a block the system served directly is, or 0 if @p p is not
+ *          one.
+ * \~spanish Cuanto mide un bloque que sirvio el sistema directamente, o 0 si
+ *          @p p no lo es.
+ * \~
+ *
+ * \~english
+ * It counts FROM @p p, not from the start of the block, which matters when the
+ * caller was handed a pointer raised to an alignment inside it -- see
+ * @c host_alloc_aligned_freeable.  Answering with the whole size there would
+ * promise bytes that are behind the pointer.
+ *
+ * What it counts is the bytes ASKED OF THE SYSTEM, so the rounding up to a
+ * page is included: it is real memory, not slack.
+ *
+ * \~spanish
+ * Cuenta DESDE @p p, no desde el principio del bloque, que es lo que importa
+ * cuando al llamante se le entrego un puntero subido a una alineacion dentro
+ * de el -- ver @c host_alloc_aligned_freeable --.  Contestar ahi con el tamano
+ * entero prometeria bytes que estan por detras del puntero.
+ *
+ * Lo que cuenta son los bytes que se le PIDIERON AL SISTEMA, asi que el
+ * redondeo a pagina entra: es memoria de verdad, no holgura.
+ *
+ * \~
+ * @param p
+ * \~english the pointer to place; anywhere INSIDE the block will do.
+ * \~spanish el puntero que hay que situar; vale cualquiera de DENTRO del
+ *          bloque.
+ * \~
+ * @return
+ * \~english the room left from it, or 0 when it is in no block of ours.
+ * \~spanish el sitio que queda desde el, o 0 cuando no esta en ningun bloque
+ *          nuestro.
+ * \~
+ */
+size_t direct_bytes(const void *p) noexcept;
+
 } // namespace detail
 
 /**
@@ -1416,13 +1499,14 @@ ThreadCache *per_thread_cache_slow() noexcept;
             detail::host_free_big(p);
             return;
         }
-        /* NO ES NUESTRO, y eso no puede pasar: si nadie cae al sistema al
-         * reservar, no hay bloques del sistema que soltar.  Que llegue uno
-         * significa que alguien reservo por otra puerta, y devolverselo a
-         * `free` lo taparia -- el programa seguiria y las cuentas dejarian de
-         * cuadrar sin que nada lo dijera.  Ver `no_fallback`. */
+        /* FUERA DE LAS DOS REGIONES.  O es un bloque que el sistema sirvio en
+         * una reserva propia -- todo lo que pasa de `kMaxSpanBytes` -- o no es
+         * nuestro, y entonces se para el proceso: si nadie cae al sistema al
+         * reservar, un bloque ajeno aqui significa que alguien reservo por otra
+         * puerta, y devolverselo a `free` lo taparia.  Ver `no_fallback`. */
         // std::free(p);
-        detail::no_foreign_free(p);
+        detail::host_free_outside(p);
+        return;
     }
     ChunkHeader *h = chunk_of(p);
     if (h->magic != kChunkMagic) {
@@ -1627,7 +1711,13 @@ ThreadCache *per_thread_cache_slow() noexcept;
     /* A span starts at `chunk + sizeof(ChunkHeader)` and its chunk is aligned
      * to `kChunkBytes`, so rounding up lands on `chunk + align` and stays
      * inside the first chunk -- which is what makes the masking find the
-     * header.  The bytes skipped are the ones asked for above. */
+     * header.  The bytes skipped are the ones asked for above.
+     *
+     * Past `kMaxSpanBytes` there is no header to find: the block came straight
+     * from the system, and what places the raised pointer is the table, which
+     * answers for anything INSIDE the block and not only for its base.  Both
+     * ends of the promise -- `host_free` takes it, `host_usable_size` counts
+     * from it -- hold the same way on either path. */
     return (void *)(((uintptr_t)raw + align - 1u) & ~(uintptr_t)(align - 1u));
 }
 
@@ -2193,7 +2283,8 @@ class SingleOwnerAllocator {
             return;
         }
 
-        detail::no_foreign_free(p); // no es nuestro; ver `host_free`
+        // Del sistema en reserva propia, o de nadie; ver `host_free`.
+        detail::host_free_outside(p);
     }
 
     /**
@@ -2501,10 +2592,12 @@ class PerThreadAllocator {
             return;
         }
 
-        /* NOT OURS, and that cannot happen: if nothing falls back to the system
-         * when allocating, there are no system blocks to release.  Same
-         * reasoning as `host_free`. */
-        detail::no_foreign_free(p);
+        /* OUTSIDE BOTH REGIONS: either a block the system served on a
+         * reservation of its own, or nothing of ours -- and that second one
+         * cannot happen, because if nothing falls back to the system when
+         * allocating there are no foreign blocks to release.  Same reasoning
+         * as `host_free`, and the same place it is decided. */
+        detail::host_free_outside(p);
     }
 };
 
@@ -2550,6 +2643,60 @@ class PerThreadAllocator {
  * \~
  */
 uint64_t host_per_thread_exhausted() noexcept;
+
+/**
+ * @brief
+ * \~english How many allocations the system served on a reservation of their
+ *          own.
+ * \~spanish Cuantas reservas sirvio el sistema en una reserva propia.
+ * \~
+ *
+ * \~english
+ * Everything above @c kMaxSpanBytes goes that way, because past that size the
+ * region cannot recycle and its commit/decommit pair costs far more than a
+ * private reservation -- see the constant, which carries the measurement.
+ *
+ * \~spanish
+ * Todo lo que pasa de @c kMaxSpanBytes va por ahi, porque a partir de ese
+ * tamano la region no puede reciclar y su par comprometer/descomprometer sale
+ * mucho mas caro que una reserva propia -- ver la constante, que lleva la
+ * medida.
+ *
+ * \~
+ * @return
+ * \~english how many were served that way since the process started.
+ * \~spanish cuantas se sirvieron asi desde que arranco el proceso.
+ * \~
+ */
+uint64_t host_direct_allocs() noexcept;
+
+/**
+ * @brief
+ * \~english Times a block big enough had to go back to the region because the
+ *          table of direct blocks was full.
+ * \~spanish Veces que un bloque bastante grande tuvo que volver a la region
+ *          porque la tabla de bloques directos estaba llena.
+ * \~
+ *
+ * \~english
+ * IT HAS TO BE ASKABLE, for the same reason as
+ * @c host_per_thread_exhausted: falling back works, so the only symptom of a
+ * @c kDirectSlots that is too small for the program would be the slower path
+ * coming back with nothing said.
+ *
+ * \~spanish
+ * TIENE QUE PODER PREGUNTARSE, por lo mismo que
+ * @c host_per_thread_exhausted: el respaldo funciona, asi que el unico sintoma
+ * de un @c kDirectSlots que se le queda pequeno al programa seria el camino
+ * lento volviendo sin que nada lo diga.
+ *
+ * \~
+ * @return
+ * \~english how many went back to the region for want of a slot.
+ * \~spanish cuantas volvieron a la region por falta de sitio.
+ * \~
+ */
+uint64_t host_direct_refused() noexcept;
 
 /**
  * @brief

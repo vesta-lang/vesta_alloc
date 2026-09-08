@@ -1665,6 +1665,139 @@ uintptr_t take_chunks(size_t count) noexcept {
     }
 }
 
+// -------------------------------------------------------------------------
+//  Blocks the system serves on a reservation of their own
+// -------------------------------------------------------------------------
+
+/**
+ * @brief One live block that the system served directly.
+ *
+ * `bytes` is what was ASKED OF THE SYSTEM, not what the caller wanted: that is
+ * what has to be handed back -- on ELF releasing takes a length -- and it is
+ * also the honest answer to @c host_usable_size, since the rounding up to a
+ * page is memory the caller may use.
+ */
+struct DirectBlock {
+    uintptr_t addr;
+    size_t bytes;
+};
+
+/**
+ * @brief The blocks the system is serving right now.
+ *
+ * DENSE, NOT HASHED.  `g_direct_n` says how many of the front slots are live
+ * and removing one moves the last into the hole, so a lookup scans exactly
+ * what is live -- 17 entries in a whole build, two cache lines -- and there
+ * are no probe chains to keep intact.  A hash over `kDirectSlots` would touch
+ * a similar number of lines on a miss and would need tombstones to stay
+ * correct; this is both faster where it matters and simpler to be sure of.
+ *
+ * @par Threads
+ * **Requires `g_direct_lock`.**  A lock and not atomics because every operation
+ * that reaches this table already costs microseconds in the system call next
+ * to it, so what it buys is not worth what lock-free removal from a table
+ * would cost in care.
+ */
+struct alignas(64) DirectLockWord {
+    std::atomic<uint32_t> v{0};
+    char pad[64 - sizeof(std::atomic<uint32_t>)];
+};
+DirectLockWord g_direct_lock;
+DirectBlock g_direct[kDirectSlots];
+uint32_t g_direct_n = 0;
+
+/// How many were served this way, and how many the table had no room for.
+std::atomic<uint64_t> g_direct_allocs{0};
+std::atomic<uint64_t> g_direct_refused{0};
+
+struct DirectLock {
+    DirectLock() noexcept {
+        for (;;) {
+            if (g_direct_lock.v.exchange(1, std::memory_order_acquire) == 0)
+                return;
+            while (g_direct_lock.v.load(std::memory_order_relaxed) != 0)
+                cpu_relax();
+        }
+    }
+    ~DirectLock() { g_direct_lock.v.store(0, std::memory_order_release); }
+};
+
+/// Notes a block the system served.  false when the table is full.
+bool direct_register(void *p, size_t bytes) noexcept {
+    DirectLock lk;
+    if (g_direct_n == kDirectSlots) {
+        g_direct_refused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_direct[g_direct_n].addr = reinterpret_cast<uintptr_t>(p);
+    g_direct[g_direct_n].bytes = bytes;
+    ++g_direct_n;
+    return true;
+}
+
+/**
+ * @brief Takes the block that CONTAINS @p p out of the table.
+ *
+ * IT PLACES INTERIOR POINTERS, not just the base, and that is not generosity:
+ * @c host_alloc_aligned_freeable hands the caller a pointer raised to its
+ * alignment INSIDE the block, and promises the ordinary @c host_free will take
+ * it.  In the region that works because masking finds the header from anywhere
+ * in the chunk; here the same job is this comparison.  Without it that entry
+ * would end in the panic for every size past the line -- and only on ELF,
+ * where the system does not hand back 64 KiB-aligned addresses and the raising
+ * therefore moves the pointer.
+ *
+ * @param base out: the address the system has to be given back, which is the
+ *        block's, not @p p.
+ * @return the block's size, or 0 when @p p is inside no block of ours.
+ */
+size_t direct_take(void *p, void **base) noexcept {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    DirectLock lk;
+    for (uint32_t i = 0; i < g_direct_n; ++i) {
+        if (a - g_direct[i].addr >= g_direct[i].bytes) continue;
+        const size_t bytes = g_direct[i].bytes;
+        *base = reinterpret_cast<void *>(g_direct[i].addr);
+        // The last one fills the hole, so the front of the table stays dense.
+        g_direct[i] = g_direct[--g_direct_n];
+        return bytes;
+    }
+    return 0;
+}
+
+/**
+ * @brief Serves a request too big for any span by asking the system.
+ *
+ * @param c the caller's cache, or nullptr; only used to count.
+ * @param n the useful bytes wanted.
+ * @return the block -- ALREADY ZERO, straight from the system -- or nullptr,
+ *         which means "serve it out of the region as before".  Failing here is
+ *         never an error: neither the system refusing nor the table being full
+ *         costs anything but the older path.
+ */
+void *alloc_direct(ThreadCache *c, size_t n) noexcept {
+    const size_t page = os_page_size();
+    // An absurd request must not wrap the rounding up and come out small.
+    if (n > size_t(-1) - page) return nullptr;
+    const size_t bytes = (n + page - 1) & ~(page - 1);
+
+    void *p = os_alloc(bytes, kOsReadWrite);
+    if (p == nullptr) return nullptr;
+    if (!direct_register(p, bytes)) {
+        /* No room to note it down.  Giving it back and serving from the region
+         * is slower but right; keeping a block that free could not recognise
+         * would not be. */
+        os_free(p, bytes);
+        return nullptr;
+    }
+    g_direct_allocs.fetch_add(1, std::memory_order_relaxed);
+    if (c != nullptr) {
+        c->stats.large_allocs++;
+        c->stats.bytes_reserved += bytes;
+    }
+    return p;
+}
+
 /**
  * @brief Sirve una reserva grande.  nullptr si la region no da mas.
  * @param fresh Si no es nulo, sale `true` cuando el tramo viene RECIEN del
@@ -1679,6 +1812,24 @@ uintptr_t take_chunks(size_t count) noexcept {
  */
 void *alloc_span(ThreadCache *c, size_t n, bool *fresh = nullptr) noexcept {
     if (fresh != nullptr) *fresh = false;
+
+    /* TOO BIG FOR THE POOL: the system serves it on a reservation of its own.
+     * Above this line the region can no longer recycle, so every allocation
+     * would commit inside the big reservation and every free decommit -- which
+     * is 9.4 + 55.2 us at 16 MiB against 0.7 + 0.7.  See `kMaxSpanBytes`.
+     *
+     * It is asked FIRST because everything below is bookkeeping for spans that
+     * cannot serve this size anyway, and it comes back nullptr when the system
+     * refuses or the table is full, which lands on exactly the path that ran
+     * before this existed. */
+    if (__builtin_expect(n > kMaxSpanBytes, 0)) {
+        if (void *p = alloc_direct(c, n)) {
+            // Straight from the system, so its pages are already zero.
+            if (fresh != nullptr) *fresh = true;
+            return p;
+        }
+    }
+
     const uint32_t chunks = chunks_for(n);
     const size_t bytes = size_t(chunks) * kChunkBytes;
     uintptr_t addr = 0;
@@ -2343,6 +2494,36 @@ void host_free_big(void *p) noexcept {
     host_free_remote(p, h);
 }
 
+void host_free_outside(void *p) noexcept {
+    void *base = nullptr;
+    const size_t bytes = direct_take(p, &base);
+    /* Not in the table, so it is not one of ours by any door: the process
+     * stops, exactly as it did before this path existed.  The lookup is what
+     * tells the two apart, and it happens only here -- on the cold branch that
+     * was already about to end the program. */
+    if (bytes == 0) no_foreign_free(p);
+    ThreadCache *c = cache();
+    if (c != nullptr) c->stats.large_frees++;
+    // The BLOCK's address, which is not @p p when the caller was handed an
+    // aligned pointer inside it.
+    os_free(base, bytes);
+}
+
+size_t direct_bytes(const void *p) noexcept {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    DirectLock lk;
+    for (uint32_t i = 0; i < g_direct_n; ++i) {
+        const uintptr_t off = a - g_direct[i].addr;
+        if (off >= g_direct[i].bytes) continue;
+        /* FROM @p p, not from the start of the block -- the same rule as the
+         * span path, and for the same reason: with a pointer raised to an
+         * alignment, answering with the whole size would promise bytes that are
+         * behind it, and whoever believed it would write past the end. */
+        return g_direct[i].bytes - size_t(off);
+    }
+    return 0;
+}
+
 void host_free_remote(void *p, ChunkHeader *h) noexcept {
     // De otro hilo: a su pila, sin bloquear a nadie.
     std::atomic<void *> &head = g_remote[h->owner].head[h->cls];
@@ -2372,6 +2553,14 @@ size_t host_span_trim() noexcept { return span_sweep(); }
 
 uint64_t host_per_thread_exhausted() noexcept {
     return g_no_per_thread_id.load(std::memory_order_relaxed);
+}
+
+uint64_t host_direct_allocs() noexcept {
+    return g_direct_allocs.load(std::memory_order_relaxed);
+}
+
+uint64_t host_direct_refused() noexcept {
+    return g_direct_refused.load(std::memory_order_relaxed);
 }
 
 uint64_t host_new_calls() noexcept {
@@ -2471,9 +2660,14 @@ size_t host_usable_size(const void *p) noexcept {
     if (p == nullptr) return 0;
     if (!in_region(p)) {
         // De la region grande: misma cuenta, otra mascara.
-        if (!in_big_region(p)) return 0;
-        const ChunkHeader *bh = big_chunk_of(const_cast<void *>(p));
-        return bh->magic == kChunkMagic ? kSizes[bh->cls] : 0;
+        if (in_big_region(p)) {
+            const ChunkHeader *bh = big_chunk_of(const_cast<void *>(p));
+            return bh->magic == kChunkMagic ? kSizes[bh->cls] : 0;
+        }
+        /* Fuera de las dos: puede ser uno de los que sirve el sistema en
+         * reserva propia, y esos si tienen tamano que dar.  Cero cuando no lo
+         * es, que es lo mismo que se contestaba antes. */
+        return detail::direct_bytes(p);
     }
     const ChunkHeader *h = chunk_of(const_cast<void *>(p));
     if (h->magic == kChunkMagic) return kSizes[h->cls];
@@ -2506,6 +2700,18 @@ void *host_realloc(void *p, size_t n) noexcept {
             void *q = host_alloc(n);
             if (q == nullptr) return nullptr;
             vesta_memcpy(q, p, old_big < n ? old_big : n);
+            host_free(p);
+            return q;
+        }
+        /* Servido por el sistema en reserva propia.  No se estira en su sitio:
+         * crecer una reserva propia es pedir el rango de al lado, y eso el
+         * sistema no lo promete.  Se copia y se suelta, como la region grande.
+         */
+        if (const size_t old_direct = detail::direct_bytes(p)) {
+            if (old_direct >= n) return p;
+            void *q = host_alloc(n);
+            if (q == nullptr) return nullptr;
+            vesta_memcpy(q, p, old_direct);
             host_free(p);
             return q;
         }
@@ -2728,6 +2934,26 @@ StatsDump::~StatsDump() {
                      "form returned null).  Nothing went to the system",
                      (unsigned long long)gave_up);
     std::fprintf(stderr, "\n");
+    /* Lo que sirvio el sistema por su cuenta.  Se enseña porque es una via
+     * DISTINTA -- esos bloques no salen de la region ni aparecen en lo
+     * comprometido de arriba --, y con ella la vez que la tabla se quedo corta,
+     * que es la unica forma de que este camino se apague sin decirlo. */
+    const uint64_t direct = g_direct_allocs.load(std::memory_order_relaxed);
+    if (direct != 0) {
+        std::fprintf(stderr,
+                     "[allocator] served by the SYSTEM directly: %llu  <- over "
+                     "%zu MiB, where the region can no longer recycle",
+                     (unsigned long long)direct,
+                     (size_t)(kMaxSpanBytes / (1024 * 1024)));
+        const uint64_t refused =
+            g_direct_refused.load(std::memory_order_relaxed);
+        if (refused != 0)
+            std::fprintf(stderr,
+                         "  | %llu WENT BACK to the region: no room left in "
+                         "the table of %u",
+                         (unsigned long long)refused, kDirectSlots);
+        std::fprintf(stderr, "\n");
+    }
     /* Y la otra cota que degradaba callando: quedarse sin identificador manda
      * a ese hilo a las listas compartidas, detras del unico cerrojo. */
     const uint64_t no_id = g_no_cache_id.load(std::memory_order_relaxed);

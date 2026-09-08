@@ -74,6 +74,66 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Cambiado
 
+- **Lo que pasa de 16 MiB lo sirve el SISTEMA, en una reserva propia.**  Esa
+  cifra no es un gusto: es `kMaxSpanChunks` por `kChunkBytes`, o sea el tramo
+  mas grande que la region puede RECICLAR.  Por encima, cada reserva
+  comprometia paginas dentro de la reserva grande y cada liberacion las
+  descomprometia -- y ese par no se parece en nada al de una reserva propia,
+  porque comprometer y descomprometer un SUBRANGO lo recorre y reservar y
+  soltar un rango entero no:
+
+  | 16 MiB, sin tocar nada         |  coger | devolver |
+  | ------------------------------ | -----: | -------: |
+  | commit/decommit en una reserva | 9,4 us |  55,2 us |
+  | reserve+commit / release       | 0,7 us |   0,7 us |
+
+  Es plano desde la primera vuelta, asi que no era el descriptor de la reserva
+  desgastandose con el uso: era lo que cuestan las dos llamadas.
+
+  Y ARREGLA UN AGOTAMIENTO, que es lo que de verdad estaba mal: un tramo de ese
+  tamano no cabia en el banco, asi que sus trozos no se volvian a repartir
+  nunca y el cursor de la region solo avanzaba.  Medido, no razonado:
+  **16.320 reservas de 16 MiB agotaban una region de 256 GiB con NADA vivo**, y
+  a partir de ahi el asignador contestaba nulo -- `operator new` lanzando en un
+  programa que no retenia ni un byte --.  Ahora 20.000 pasan sin una sola
+  negativa, y el test lo comprueba derivando las vueltas de la region que se
+  haya conseguido.
+
+  Lo que se gana, en la fila de 16 MiB (antes -> ahora, por fraccion del bloque
+  que el llamante llega a leer): 67,4 -> 2,3 us sin tocar nada; 81,5 -> 22,3
+  (1/256); 129,7 -> 45,0 (1/64); 301 -> 160 (1/16); 1,1 ms -> 487 us (1/4);
+  3,8 -> 2,5 ms (entero).  **Las seis le ganan ahora al asignador del sistema**,
+  de 1,04x a 4,55x; antes se perdian.  Ademas dejan de comerse espacio de
+  direcciones de la region que nadie devolvia, y sus paginas llegan YA A CERO,
+  que es lo que hace gratis a `host_alloc_zeroed` en estos tamanos.
+
+  POR DEBAJO DE LA RAYA NO SE TOCA NADA, y no por prudencia: nuestro coste es
+  plano en la fraccion leida -- se limpia el bloque entero -- y el del sistema
+  crece con las paginas tocadas, asi que las dos curvas se cruzan en una
+  FRACCION (entre 1/16 y 1/4), no en un tamano.  Ningun umbral por tamano puede
+  decidir ahi.
+
+  EN ELF LA GANANCIA ES OTRA, y se dice porque medirlo era el punto: alli
+  comprometer dentro de una reserva no cuesta lo que en Windows, asi que la
+  fila de 16 MiB sale igual antes y despues (4,3 -> 1,1 us sin tocar nada;
+  identica en las otras cinco).  Lo que se gana en ELF es el agotamiento de
+  arriba, que era comun a las dos.  **Y queda una perdida abierta ahi**: leido
+  1/4 y entero, 16 MiB pierde 0,71x y 0,20x contra glibc, que reutiliza el
+  MISMO bloque -- ya residente, cero fallos de pagina -- y lo limpia a ~56
+  GB/s.  Ya perdia exactamente igual antes de esto (0,75x y 0,21x): no es una
+  regresion, es el mismo problema de fraccion del tramo 2-12 MiB asomando por
+  arriba, y se decide igual, sabiendo cuanto va a leer el llamante.
+
+  Reconocerlos al soltarlos es la parte que costo: un bloque asi cae fuera de
+  las DOS regiones, y leer su memoria para averiguar si es nuestro es
+  justamente lo que no se puede hacer con un puntero que podria ser ajeno.  Se
+  contesta con una tabla densa de `kDirectSlots` (512), que se recorre entera
+  -- son 17 reservas de 1-16 MiB en una compilacion completa --, y llena no es
+  un fallo: la peticion vuelve a la region y `host_direct_refused()` lo cuenta.
+  El camino caliente de `host_free` sale **instruccion por instruccion igual**,
+  comprobado desensamblando; las tres que se anaden estan todas en la rama que
+  antes terminaba el programa.
+
 - **`include/` y `src/` se reparten en seis carpetas** por lo que hace cada
   cosa: `alloc/`, `interpose/`, `report/`, `symbols/` (con `symbols/dwarf/`
   debajo), `os/` y `mem/`.  Estaban las veinticuatro cabeceras y las treinta y
@@ -381,6 +441,65 @@ invita a creer que ampara.
   leaves out is always counted.
 
 ### Changed
+
+- **Anything over 16 MiB is served by the SYSTEM, on a reservation of its own.**
+  That figure is not a taste: it is `kMaxSpanChunks` times `kChunkBytes`, which
+  is to say the largest span the region can RECYCLE.  Above it, every
+  allocation committed pages inside the big reservation and every free
+  decommitted them again -- and that pair is nothing like the one a private
+  reservation costs, because committing and decommitting a SUB-RANGE walks it
+  while reserving and releasing a whole range does not:
+
+  | 16 MiB, nothing touched          |   take | give back |
+  | -------------------------------- | -----: | --------: |
+  | commit/decommit inside a reserve | 9.4 us |   55.2 us |
+  | reserve+commit / release         | 0.7 us |    0.7 us |
+
+  It is flat from the very first round, so it was not the reservation's
+  descriptor wearing out with use: it was what the two calls cost.
+
+  AND IT FIXES AN EXHAUSTION, which is what was really wrong: a span that size
+  did not fit in the pool, so its chunks were never handed out again and the
+  region's cursor only moved forward.  Measured, not reasoned: **16,320
+  allocations of 16 MiB exhausted a 256 GiB region with NOTHING live**, and
+  from there the allocator answered null -- `operator new` throwing in a
+  program that was not holding a single byte.  Now 20,000 pass without one
+  refusal, and the test checks it with the number of rounds derived from
+  whatever region was obtained.
+
+  What that buys, on the 16 MiB row (before -> now, by the fraction of the
+  block the caller actually reads): 67.4 -> 2.3 us touching nothing; 81.5 ->
+  22.3 (1/256); 129.7 -> 45.0 (1/64); 301 -> 160 (1/16); 1.1 ms -> 487 us
+  (1/4); 3.8 -> 2.5 ms (all of it).  **All six now beat the system allocator**,
+  by 1.04x to 4.55x; they used to lose.  They also stop eating region address
+  space that nothing ever handed back, and their pages arrive ALREADY ZERO,
+  which is what makes `host_alloc_zeroed` free at these sizes.
+
+  NOTHING BELOW THE LINE CHANGES, and not out of caution: our cost is flat in
+  the fraction read -- the whole block is cleared -- and the system's grows with
+  the pages touched, so the two curves cross at a FRACTION (around 1/16 to 1/4),
+  not at a size.  No threshold on size can decide there.
+
+  ON ELF THE GAIN IS A DIFFERENT ONE, and it is said because measuring it was
+  the point: there, committing inside a reservation does not cost what it costs
+  on Windows, so the 16 MiB row comes out the same before and after (4.3 -> 1.1
+  us touching nothing; identical on the other five).  What ELF gains is the
+  exhaustion above, which both had.  **And a loss stays open there**: read 1/4
+  and read whole, 16 MiB comes out at 0.71x and 0.20x against glibc, which
+  reuses the SAME block -- already resident, no page faults -- and clears it at
+  ~56 GB/s.  It lost by exactly the same margin before this (0.75x and 0.21x):
+  not a regression, but the 2-12 MiB fraction problem showing up from above,
+  and it is decided the same way, by knowing how much the caller will read.
+
+  Recognising them on free is the part that took work: such a block falls
+  outside BOTH regions, and reading its memory to find out whether it is ours is
+  exactly what must not be done with a pointer that might be foreign.  The
+  answer comes from a dense table of `kDirectSlots` (512) scanned end to end --
+  these are 17 allocations of 1-16 MiB in a whole build -- and full is not a
+  failure: the request goes back to the region and `host_direct_refused()`
+  counts it.  The hot path of `host_free` comes out **instruction for
+  instruction as it was**, verified by disassembly; the three that are added are
+  all on the branch that used to end the program.
 
 - **`include/` and `src/` are split into six folders** by what each one does:
   `alloc/`, `interpose/`, `report/`, `symbols/` (with `symbols/dwarf/` under

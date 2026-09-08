@@ -98,8 +98,14 @@ void check(bool ok, const char *what) {
     if (!ok) ++g_failures;
 }
 
+/* LA MISMA REGLA QUE `vesta_interpose::ours`, escrita aparte porque este test
+ * mira la libreria DESDE FUERA y no incluye lo privado de `src/interpose/`.
+ * Que sea una copia se paga cuando la regla cambia: al empezar a servir del
+ * sistema lo que pasa de un tramo, esta se quedo en dos comparaciones y la fila
+ * de abajo lo dijo -- que es exactamente para lo que sirve. */
 bool ours(const void *p) {
-    return util::in_region(p) || util::in_big_region(p);
+    if (util::in_region(p) || util::in_big_region(p)) return true;
+    return util::detail::direct_bytes(p) != 0;
 }
 
 /// Donde va a parar un puntero que hay que impedir que el optimizador borre.
@@ -124,6 +130,19 @@ void small_and_large() {
           "y uno grande tambien, por la region de lo grande");
     std::memset(big, 0x5A, 4u << 20);
     std::free(big);
+
+    /* Y lo que pasa de `kMaxSpanBytes`, que NO esta en ninguna de las dos
+     * regiones: lo sirve el sistema en una reserva propia.  Se comprueba aqui
+     * porque el modo de fallar es el peor de todos -- si `ours` no lo situa,
+     * `free` no devuelve un valor raro: PARA EL PROCESO --, y porque un
+     * programa cualquiera hace esto sin saber que hay tres caminos. */
+    const size_t enorme = util::kMaxSpanBytes + 1;
+    void *fuera = std::malloc(enorme);
+    check(fuera != nullptr && ours(fuera),
+          "y uno mayor que un tramo, que sirve el SISTEMA, sigue siendo nuestro");
+    std::memset(fuera, 0x5A, enorme);
+    std::free(fuera);
+    check(true, "y soltarlo con `free` no mata el proceso");
 }
 
 void calloc_zeroes_and_checks_overflow() {

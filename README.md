@@ -150,10 +150,23 @@ only for the ones it touches, while this allocator zeroes up front because its
 region is committed once and reused, so a recycled block carries the previous
 tenant's bytes. The row above is the same request read in full, where paying up
 front wins 5.4x — the size is identical in both, so no threshold on *size* can
-decide between them; only what the caller does next differs. What closes it is
-not a better guess but a large span that is not committed in full up front,
-which earns the same property the system gets for free. Until that is built the
-row stands as measured.
+decide between them; only what the caller does next differs.
+
+Above 16 MiB it *is* decided, and by measuring rather than guessing. That line
+is where the region stops being able to recycle, so every allocation past it
+committed pages inside the big reservation and every free decommitted them —
+9.4 us and 55.2 us at 16 MiB, against 0.7 and 0.7 for a reservation of its own.
+Those are now asked of the system directly, which wins every fraction there,
+and the same change fixed an exhaustion: 16,320 allocations of 16 MiB used to
+run a 256 GiB region dry with nothing live.
+
+That also rules out the obvious idea for the row that is still open. Deferring
+the zeroing *inside* our region means committing per allocation, and the two
+figures above are what that costs; measured end to end, a third region
+committed per allocation came out **2x worse** than going to the system. What
+is left to decide the open row is not a cheaper mechanism but knowing how much
+of the block the caller will read — which is a property of the call site, not
+of the size. Until that is built the row stands as measured.
 
 Every row is the mean of the clean half of eleven interleaved repeats, and the
 benchmark measures its own floor first — the same allocator in every column,

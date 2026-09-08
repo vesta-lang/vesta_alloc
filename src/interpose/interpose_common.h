@@ -50,10 +50,25 @@
 
 namespace vesta_interpose {
 
-/// Did this block come out of the allocator.  Two comparisons, no table, no
-/// lock -- and that is the whole reason freeing is cheap here.
+/**
+ * @brief Did this block come out of the allocator.
+ *
+ * Two comparisons, no table and no lock, which is the whole reason freeing is
+ * cheap here -- and they are still the only thing the common case runs.
+ *
+ * WHAT THE TABLE IS FOR.  Everything over `kMaxSpanBytes` is served by the
+ * system on a reservation of its own, so it falls outside BOTH regions and the
+ * two comparisons say no.  Before, that answer was final and the block went to
+ * `no_foreign_free`, which stops the process: `free()` of a 16 MiB `malloc`
+ * would have killed any program running with the interposition on.  So when
+ * they say no -- and only then, on the branch that was already about to end
+ * the program -- the table is asked, and it places the block without reading
+ * it, which is what a pointer that might be foreign requires.
+ */
 [[gnu::always_inline]] inline bool ours(const void *p) noexcept {
-    return util::in_region(p) || util::in_big_region(p);
+    if (__builtin_expect(util::in_region(p) || util::in_big_region(p), 1))
+        return true;
+    return util::detail::direct_bytes(p) != 0;
 }
 
 /**

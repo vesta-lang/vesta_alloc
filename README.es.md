@@ -153,10 +153,23 @@ region se compromete una vez y se reutiliza, asi que un bloque reciclado lleva
 los bytes del inquilino anterior. La fila de encima es la MISMA peticion leida
 entera, donde pagar por adelantado gana 5,4x -- el tamano es identico en las
 dos, asi que ningun umbral por TAMANO puede decidir entre ellas; lo que cambia
-es lo que el llamante hace despues. Lo que lo cierra no es adivinar mejor, sino
-un tramo grande que no se comprometa entero por adelantado, que es como se gana
-la misma propiedad que el sistema tiene gratis. Hasta que eso este, la fila
-queda tal como se midio.
+es lo que el llamante hace despues.
+
+De 16 MiB para arriba SI esta decidido, y midiendo en vez de suponiendo. Esa
+raya es donde la region deja de poder reciclar, asi que toda reserva por encima
+comprometia paginas dentro de la reserva grande y toda liberacion las
+descomprometia -- 9,4 us y 55,2 us a 16 MiB, contra 0,7 y 0,7 de una reserva
+propia. Eso se le pide ahora al sistema directamente, que gana ahi en todas las
+fracciones, y el mismo cambio arreglo un agotamiento: 16.320 reservas de 16 MiB
+dejaban seca una region de 256 GiB sin nada vivo.
+
+Y eso descarta ademas la idea evidente para la fila que sigue abierta. Aplazar
+el cero DENTRO de nuestra region significa comprometer por reserva, y las dos
+cifras de arriba son lo que eso cuesta; medido de punta a punta, una tercera
+region comprometida por reserva salio **2x peor** que ir al sistema. Lo que
+falta para decidir la fila abierta no es un mecanismo mas barato, sino saber
+cuanto del bloque va a leer el llamante -- que es una propiedad del sitio de
+llamada, no del tamano. Hasta que eso este, la fila queda tal como se midio.
 
 Cada fila es la media de la mitad limpia de once repeticiones intercaladas, y el
 banco mide primero su propio suelo -- el mismo asignador en todas las columnas,

@@ -228,6 +228,135 @@ int main() {
               "C: y al quitarla vuelve a \"no se\"");
     }
 
+    /* 6. Lo que pasa de `kMaxSpanBytes` lo sirve el SISTEMA en una reserva
+     *    propia, y hay que reconocerlo al soltarlo.
+     *
+     * Es el camino con mas formas de romperse en silencio de todo el fichero:
+     * un bloque asi cae FUERA de las dos regiones, asi que si la tabla no lo
+     * situa, soltarlo no da un valor raro -- para el proceso --.  Y si lo situa
+     * pero no lo saca, la tabla se llena y el camino se apaga solo, que es
+     * exactamente el tipo de degradacion muda que este proyecto no admite. */
+    {
+        const size_t n = util::kMaxSpanBytes + 1; // el primero que pasa la raya
+        const uint64_t d0 = util::host_direct_allocs();
+
+        void *p = util::host_alloc(n);
+        check(p != nullptr, "grande: se sirve una reserva mayor que un tramo");
+        check(util::host_direct_allocs() > d0,
+              "grande: y la sirve el SISTEMA, no la region");
+        if (p != nullptr) {
+            check((reinterpret_cast<uintptr_t>(p) & (util::kAlign - 1)) == 0,
+                  "grande: sale alineada");
+            check(write_and_verify(p, n, 0x5A),
+                  "grande: se escribe hasta el ULTIMO byte");
+            check(util::host_usable_size(p) >= n,
+                  "grande: dice un tamano utilizable de al menos lo pedido");
+        }
+
+        // Crecer: no se estira en su sitio, pero tiene que conservar todo.
+        void *mas = util::host_realloc(p, n + (1u << 20));
+        bool conserva = mas != nullptr;
+        if (conserva) {
+            const unsigned char *b = static_cast<unsigned char *>(mas);
+            for (size_t i = 0; i < n; i += 4096)
+                if (b[i] != (unsigned char)(0x5A + (i & 0x7F))) {
+                    conserva = false;
+                    break;
+                }
+        }
+        check(conserva, "grande: realloc que crece conserva el contenido");
+        util::host_free(mas);
+
+        // Y a cero de verdad, que es la mitad de por que existe este camino:
+        // las paginas llegan limpias del sistema y nadie las repasa.
+        unsigned char *z = static_cast<unsigned char *>(util::host_alloc_zeroed(n));
+        bool ceros = z != nullptr;
+        for (size_t i = 0; ceros && i < n; i += 4096)
+            if (z[i] != 0) ceros = false;
+        check(ceros, "grande: host_alloc_zeroed entrega TODO a cero");
+        util::host_free(z);
+
+        /* LA TABLA SE VACIA.  Mas vueltas que ranuras tiene: si soltar no
+         * sacara el bloque, a partir de la 512 no cabria ninguno mas y el
+         * contador de rechazos empezaria a subir -- seguiria funcionando, por
+         * el camino lento, sin que nada lo dijera. */
+        const uint64_t refused0 = util::host_direct_refused();
+        for (int vuelta = 0; vuelta < int(util::kDirectSlots) + 100; ++vuelta) {
+            void *q = util::host_alloc(n);
+            util::host_free(q);
+        }
+        check(util::host_direct_refused() == refused0,
+              "grande: soltar VACIA la ranura; la tabla no se llena en un bucle");
+
+        /* UN PUNTERO SUBIDO A SU ALINEACION DENTRO DEL BLOQUE.  Es el caso que
+         * este camino casi rompe: `host_alloc_aligned_freeable` promete que el
+         * `host_free` NORMAL lo suelta, y en la region eso funciona porque la
+         * mascara encuentra la cabecera desde cualquier sitio del trozo.  Aqui
+         * no hay cabecera que encontrar, asi que lo situa la tabla -- y si solo
+         * mirara la base, esto pararia el proceso.  En Windows no se veria: el
+         * sistema entrega direcciones alineadas a 64 KiB y la subida no mueve
+         * nada; en ELF, alineado solo a pagina, si. */
+        const size_t alineaciones[] = {64, 4096, 32768};
+        for (size_t align : alineaciones) {
+            void *a = util::host_alloc_aligned_freeable(n, align);
+            check(a != nullptr &&
+                      (reinterpret_cast<uintptr_t>(a) & (align - 1)) == 0,
+                  "grande: aligned_freeable entrega un puntero alineado");
+            if (a != nullptr) {
+                check(util::host_usable_size(a) >= n,
+                      "grande: y el sitio se cuenta DESDE el, no desde la base");
+                check(write_and_verify(a, n, 0x33),
+                      "grande: alineado, escribible hasta el ultimo byte");
+            }
+            util::host_free(a); // el NORMAL: si no lo reconoce, para el proceso
+        }
+
+        /* Y EL CASO A PELO, porque el de arriba depende de la suerte: hoy
+         * `mmap` devuelve bases ya alineadas a 64 KiB y la subida no mueve el
+         * puntero, asi que en esta maquina no llega a probar nada -- pero el
+         * sistema solo promete PAGINA, y donde no coincida el puntero se movera
+         * y habra que situarlo igual.  Aqui se desplaza a mano, que es
+         * determinista en las dos plataformas. */
+        unsigned char *base = static_cast<unsigned char *>(util::host_alloc(n));
+        if (base != nullptr) {
+            const size_t entero = util::host_usable_size(base);
+            unsigned char *dentro = base + 4096;
+            check(util::host_usable_size(dentro) == entero - 4096,
+                  "grande: un puntero de DENTRO se situa, y el sitio se resta");
+            util::host_free(dentro); // suelta el bloque entero, desde el medio
+            check(true, "grande: y soltarlo desde el medio no mata el proceso");
+        }
+
+        /* Y LA REGION NO SE CONSUME.  Un tramo de este tamano no cabia en el
+         * banco, asi que sus trozos no se repartian nunca mas: el cursor solo
+         * avanzaba.  Medido antes de este camino, 16.320 reservas de 16 MiB
+         * agotaban una region de 256 GiB **sin nada vivo**, y a partir de ahi
+         * el asignador contestaba nulo -- o sea `operator new` lanzando en un
+         * programa que no retenia ni un byte.
+         *
+         * Las vueltas se DERIVAN de la region que se haya conseguido, no se
+         * escriben: en una maquina que solo consiga el minimo, veinte mil
+         * sobrarian y aqui harian falta muchas menos. */
+        const size_t vueltas = util::host_region_reserved() / n + 16;
+        bool servidas = true;
+        for (size_t v = 0; v < vueltas && servidas; ++v) {
+            void *q = util::host_alloc(n);
+            if (q == nullptr) servidas = false;
+            util::host_free(q);
+        }
+        check(servidas,
+              "grande: pedir y soltar mas que la region entera no la agota");
+
+        /* Y la raya esta donde dice: justo por debajo sigue siendo un tramo de
+         * la region.  Sin esto, mover `kMaxSpanChunks` cambiaria de camino a
+         * medio proyecto sin que ningun test se enterara. */
+        const uint64_t d1 = util::host_direct_allocs();
+        void *justo = util::host_alloc(util::kMaxSpanBytes);
+        check(justo != nullptr && util::host_direct_allocs() == d1,
+              "grande: justo por debajo de la raya lo sirve la REGION");
+        util::host_free(justo);
+    }
+
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);
     return failures == 0 ? 0 : 1;
 }

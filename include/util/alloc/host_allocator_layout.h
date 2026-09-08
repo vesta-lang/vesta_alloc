@@ -767,29 +767,73 @@ inline constexpr uint32_t kSpanMagic = 0x5350414eu; // 'SPAN'
  *
  * \~english
  * **It is not a cap on what can be asked for.**  A larger allocation is served
- * all the same; the only thing that changes is that on release it goes back to
- * the system instead of being kept, because holding a block of over 16 MiB in
- * case it is needed again costs more than it saves.
+ * all the same, only by asking the SYSTEM for a reservation of its own instead
+ * of taking chunks out of the region -- see @c kMaxSpanBytes, which is this
+ * same line expressed in bytes and carries the measurement.
  *
  * 256 chunks are 16 MiB, which is where the tail measured TODAY ends: 17
  * allocations of a whole build fall between 1 and 16 MiB and none above.
- * Tomorrow it may be another figure; that is why it is a cache bound and not a
+ * Tomorrow it may be another figure; that is why it is a pool bound and not a
  * condition for working.
  *
  * \~spanish
  * **No es un tope de lo que se puede pedir.**  Una reserva mayor se sirve
- * igual; lo unico que cambia es que al soltarla se devuelve al sistema en vez
- * de quedarsela, porque guardar un bloque de mas de 16 MiB por si vuelve a
- * hacer falta cuesta mas de lo que ahorra.
+ * igual, solo que pidiendole al SISTEMA una reserva propia en vez de sacar
+ * trozos de la region -- ver @c kMaxSpanBytes, que es esta misma linea en
+ * bytes y lleva la medida.
  *
  * 256 trozos son 16 MiB, que es donde acaba la cola medida HOY: 17 reservas de
  * toda una compilacion caen entre 1 y 16 MiB y ninguna por encima.  Manana
- * puede ser otra cifra; por eso es una cota de cache y no una condicion de
+ * puede ser otra cifra; por eso es una cota del banco y no una condicion de
  * funcionamiento.
  *
  * \~
  */
 inline constexpr uint32_t kMaxSpanChunks = 256;
+
+/**
+ * \~english
+ * @brief How many blocks served straight by the system can be live at once.
+ *
+ * They have to be RECOGNISED when freed: such a block is outside both regions,
+ * so neither range test places it, and reading its memory to find out is
+ * exactly what must not be done with a pointer that might not be ours.  So the
+ * question is answered without touching the block, out of a table -- and the
+ * answer carries the size, which is what releasing takes on ELF.
+ *
+ * The table is affordable because these are RARE: 17 allocations between 1 and
+ * 16 MiB in a whole build, and none above.  It is fixed and dense, so
+ * registering a block never allocates -- which it could not do anyway, being
+ * in the middle of an allocation -- and a lookup scans what is live and
+ * nothing else.
+ *
+ * **Full is not a failure**: the request goes back to the region, which serves
+ * it as it always did.  @c host_direct_refused counts that, so a table that
+ * turns out to be too small says so instead of quietly costing.
+ *
+ * \~spanish
+ * @brief Cuantos bloques servidos directamente por el sistema pueden estar
+ *        vivos a la vez.
+ *
+ * Hay que RECONOCERLOS al soltarlos: un bloque asi cae fuera de las dos
+ * regiones, asi que ninguna comparacion de rango lo situa, y leer su memoria
+ * para averiguarlo es justo lo que no se puede hacer con un puntero que
+ * podria no ser nuestro.  La pregunta se contesta sin tocar el bloque, con una
+ * tabla -- y la respuesta trae el tamano, que es lo que hace falta para
+ * soltarlo en ELF.
+ *
+ * La tabla sale barata porque son RAROS: 17 reservas entre 1 y 16 MiB en toda
+ * una compilacion, y ninguna por encima.  Es fija y densa, asi que dar de alta
+ * un bloque no reserva nunca -- ni podria, estando en mitad de una reserva --
+ * y buscar recorre lo que esta vivo y nada mas.
+ *
+ * **Llena no es un fallo**: la peticion vuelve a la region, que la sirve como
+ * siempre.  @c host_direct_refused lo cuenta, para que una tabla que resulte
+ * pequena lo diga en vez de costar en silencio.
+ *
+ * \~
+ */
+inline constexpr uint32_t kDirectSlots = 512;
 
 /**
  * @brief
@@ -1428,6 +1472,74 @@ static_assert(sizeof(ChunkHeader) == kAlign,
 [[gnu::always_inline]] inline uint32_t chunks_for(size_t n) noexcept {
     return uint32_t((n + sizeof(ChunkHeader) + kChunkBytes - 1) / kChunkBytes);
 }
+
+/**
+ * \~english
+ * @brief The largest request a span can serve.  Above it, the system serves.
+ *
+ * It is @c kMaxSpanChunks in bytes, header included, so `n > kMaxSpanBytes`
+ * and `chunks_for(n) > kMaxSpanChunks` are the same question.
+ *
+ * THE LINE IS NOT A TASTE: it is exactly where the region stops being able to
+ * RECYCLE.  A span of more chunks than that does not fit in the pool, so every
+ * allocation of such a size commits pages inside the big reservation and every
+ * free decommits them again -- and that pair is nothing like the one a private
+ * reservation costs, because committing and decommitting a sub-range walks it
+ * while reserving and releasing a range of its own does not:
+ *
+ *     16 MiB, nothing touched              take    give back
+ *     commit/decommit inside a reserve    9.4 us     55.2 us
+ *     reserve+commit / release            0.7 us      0.7 us
+ *
+ * That is the whole difference, and it is flat from the very first round -- so
+ * it is not the reservation's descriptor wearing out with use, it is what the
+ * two calls cost.  Going to the system also stops these from eating region
+ * address space that nothing ever hands back, and their pages arrive ALREADY
+ * ZERO, which is what makes @c host_alloc_zeroed free at these sizes.
+ *
+ * Over the whole surface -- six sizes by six fractions of the block actually
+ * read -- direct wins EVERY row from here up, by 2x to 48x, and beats the C
+ * runtime as well.  Below the line it does not, and that is why the region
+ * keeps everything it can pool: our cost is flat in the fraction read
+ * (everything is cleared) and the system's grows with the pages touched, so
+ * the two cross at a FRACTION -- around 1/16 to 1/4 -- and not at a size.
+ *
+ * \~spanish
+ * @brief La mayor peticion que puede servir un tramo.  Por encima, el sistema.
+ *
+ * Es @c kMaxSpanChunks en bytes, cabecera incluida, asi que `n > kMaxSpanBytes`
+ * y `chunks_for(n) > kMaxSpanChunks` son la misma pregunta.
+ *
+ * LA LINEA NO ES UN GUSTO: es exactamente donde la region deja de poder
+ * RECICLAR.  Un tramo de mas trozos que eso no cabe en el banco, asi que cada
+ * reserva de ese tamano compromete paginas dentro de la reserva grande y cada
+ * liberacion las descompromete -- y ese par no se parece al que cuesta una
+ * reserva propia, porque comprometer y descomprometer un subrango lo recorre y
+ * reservar y soltar un rango entero no:
+ *
+ *     16 MiB, sin tocar nada              coger     devolver
+ *     commit/decommit en una reserva     9,4 us      55,2 us
+ *     reserve+commit / release           0,7 us       0,7 us
+ *
+ * Ahi esta toda la diferencia, y es plana desde la primera vuelta -- o sea que
+ * no es el descriptor de la reserva desgastandose con el uso, es lo que
+ * cuestan las dos llamadas.  Ir al sistema evita ademas que estos se coman
+ * espacio de direcciones de la region que nadie devuelve, y sus paginas llegan
+ * YA A CERO, que es lo que hace gratis a @c host_alloc_zeroed en estos
+ * tamanos.
+ *
+ * Sobre la superficie entera -- seis tamanos por seis fracciones de lo que el
+ * llamante llega a leer -- el directo gana TODAS las filas de aqui para
+ * arriba, de 2x a 48x, y tambien le gana al asignador del sistema.  Por debajo
+ * no, y por eso la region se queda con todo lo que puede reciclar: nuestro
+ * coste es plano en la fraccion leida (se limpia todo) y el del sistema crece
+ * con las paginas tocadas, asi que se cruzan en una FRACCION -- entre 1/16 y
+ * 1/4 -- y no en un tamano.
+ *
+ * \~
+ */
+inline constexpr size_t kMaxSpanBytes =
+    size_t(kMaxSpanChunks) * kChunkBytes - sizeof(ChunkHeader);
 
 namespace detail {
 
