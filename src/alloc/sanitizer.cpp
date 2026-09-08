@@ -308,8 +308,22 @@ struct Slot {
     uint32_t free_stack;  ///< id in the depot, 0 = none
     uint32_t req;         ///< what the caller asked for, before the canary
     uint32_t meta;        ///< state and the two thread ids; see below
+    /**
+     * @brief When it was born, counted in ALLOCATIONS of its own thread.
+     *
+     * NOT A CLOCK, and that is what makes it worth having: two runs of the same
+     * program give the same number, so a life can be compared between them and
+     * the report can gate a build.  Wall time would answer differently every
+     * run and could gate nothing.
+     *
+     * The counter is one the allocator ALREADY keeps -- `small_allocs` in the
+     * thread's cache -- so measuring lives adds no state anywhere.  That is the
+     * condition this whole mode was built under: what the checker needs, the
+     * checker pays for, and only in its own build.
+     */
+    uint32_t seq;
 };
-static_assert(sizeof(Slot) == 16, "the shadow costs 16 bytes per block");
+static_assert(sizeof(Slot) == 20, "the shadow costs 20 bytes per block");
 
 enum : uint32_t { kStNever = 0, kStAlive = 1, kStFreed = 2 };
 
@@ -387,6 +401,114 @@ Slot *slot_of(const void *p, size_t *block_bytes) noexcept {
     const uint32_t idx = uint32_t(off / kAlign);
     if (idx >= kSlotsPerChunk) return nullptr;
     return &slots[idx];
+}
+
+// =========================================================================
+//  What each site turns out to BE, measured instead of declared
+// =========================================================================
+
+/**
+ * @brief What the blocks of one site did, added up.
+ *
+ * THIS IS THE POINT OF THE WHOLE SHADOW, and it is worth saying plainly: the
+ * two axes the allocator lets a caller DECLARE -- how long a block lives and
+ * whether it grows -- come out of here MEASURED.  A declaration then stops
+ * being the source of truth and becomes a claim that can be checked against the
+ * data, which is what `@complexity` is to cost.
+ *
+ * And it matters more than it looks, because almost nothing declares anything:
+ * the whole VM reports `unknown`.  Measuring does not need the hundred sites to
+ * be visited one by one.
+ */
+struct Life {
+    uint64_t deaths;   ///< blocks of this site that were released
+    uint64_t life_sum; ///< total life, in allocations of the owning thread
+    uint64_t unknown;  ///< released on another thread: lives not comparable
+    uint32_t life_max;
+    uint32_t size_min;
+    uint32_t size_max;
+};
+
+Life *g_life = nullptr;
+
+/// The longest life anybody has recorded.  Read by @c san_longest_life, which
+/// exists so a test can demand that the clock is running at all.
+std::atomic<uint64_t> g_longest_life{0};
+
+/**
+ * @brief How many blocks THIS thread has been handed, ever.
+ *
+ * The clock a life is measured against, and it is one the allocator already
+ * keeps -- so measuring lives adds no state to anything, which was the
+ * condition.  It is the SUM of the per-purpose counters and not a total of its
+ * own: the total was replaced by that table precisely so counting by purpose
+ * would cost nothing extra, and there is no separate running total left to
+ * read.  Sixteen adds, in a mode that is not racing anybody.
+ *
+ * Looking for a field called `small_allocs` and using it is what the first
+ * version did.  That one is filled in at REPORT time by adding this same table
+ * up, so during the run it is zero -- and every life came out zero, with the
+ * report calmly declaring every site in the program "Instant".
+ */
+[[gnu::always_inline]] inline uint32_t thread_allocs(
+    const detail::ThreadCache *c) noexcept {
+    if (!detail::have_cache(c)) return 0;
+    uint64_t n = 0;
+    for (unsigned i = 0; i < VESTA_ALLOC_TAG_SLOTS; ++i) n += c->stats.by_tag[i];
+    return uint32_t(n);
+}
+
+/// Below this many allocations of its own thread, a block counts as instant.
+uint32_t g_life_instant = 100;
+/// And below this one, as medium.  Above, long.
+uint32_t g_life_medium = 100000;
+
+/// What that site IS, said in the same words a caller would have used to
+/// declare it -- so the two can be put side by side.
+const char *use_word(const Life &l) noexcept {
+    if (l.deaths == 0) return "Long";
+    const uint64_t avg = l.life_sum / l.deaths;
+    if (avg < g_life_instant) return "Instant";
+    if (avg < g_life_medium) return "Medium";
+    return "Long";
+}
+
+/// One size for every block is a buffer that is what it is; several is one that
+/// grew.  The allocator's own axis, read off the data instead of asked for.
+const char *shape_word(const Life &l) noexcept {
+    return l.size_min == l.size_max ? "Fixed" : "Growing";
+}
+
+/// Records what one block did with its life.  Called where the block dies,
+/// which is the only place that knows.
+void note_death(uint32_t stack, uint32_t req, bool same_thread,
+                uint32_t born, uint32_t now) noexcept {
+    if (g_life == nullptr || stack == 0 || stack >= kDepotSlots) return;
+    Life &l = g_life[stack];
+    if (l.deaths == 0 && l.unknown == 0) {
+        l.size_min = req;
+        l.size_max = req;
+    } else {
+        if (req < l.size_min) l.size_min = req;
+        if (req > l.size_max) l.size_max = req;
+    }
+    /* A LIFE ONLY MEANS SOMETHING WITHIN ONE THREAD: the counter is that
+     * thread's, so subtracting one thread's from another's would produce a
+     * number that looks like a life and is not one.  Those are counted apart
+     * rather than folded in, which is the difference between "we do not know"
+     * and "we know something wrong". */
+    if (!same_thread || now < born) {
+        ++l.unknown;
+        return;
+    }
+    const uint32_t life = now - born;
+    ++l.deaths;
+    l.life_sum += life;
+    if (life > l.life_max) l.life_max = life;
+    uint64_t top = g_longest_life.load(std::memory_order_relaxed);
+    while (life > top && !g_longest_life.compare_exchange_weak(
+                             top, life, std::memory_order_relaxed))
+        ;
 }
 
 // =========================================================================
@@ -684,10 +806,19 @@ bool ensure_config() noexcept {
                     detail::g_san_level = SanLevel::Poison;
                 }
             }
+            g_life_instant = env_num("VESTA_ALLOC_SAN_INSTANT", 100, 1u << 30);
+            g_life_medium =
+                env_num("VESTA_ALLOC_SAN_MEDIUM", 100000, 1u << 30);
+
             void *depot = os_alloc(sizeof(Stack) * kDepotSlots, kOsReadWrite);
             if (depot != nullptr) {
                 std::memset(depot, 0, sizeof(Stack) * kDepotSlots);
                 g_depot = static_cast<Stack *>(depot);
+            }
+            void *life = os_alloc(sizeof(Life) * kDepotSlots, kOsReadWrite);
+            if (life != nullptr) {
+                std::memset(life, 0, sizeof(Life) * kDepotSlots);
+                g_life = static_cast<Life *>(life);
             }
             cfg.store(2, std::memory_order_release);
         } else {
@@ -903,6 +1034,9 @@ bool guarded_free(void *p) noexcept {
     s->free_stack = 0;
     s->req = uint32_t(req);
     s->meta = meta_of(kStAlive, tid, 0);
+    /* Its birthday, in allocations of this thread.  Read from counters the
+     * allocator already keeps, so nothing new is stored anywhere. */
+    s->seq = thread_allocs(c);
 
     /* ONLY IF IT FITS, and the condition is checked and not assumed.  On the
      * very first allocation of the process `san_grow` sits out -- the region it
@@ -989,8 +1123,14 @@ bool guarded_free(void *p) noexcept {
      * legal and the allocator handles it.  It is counted because it is the
      * shape of ownership crossing threads by accident, which is worth seeing
      * even when nothing is broken. */
-    if (meta_alloc_thread(s->meta) != tid)
-        g_cross_thread.fetch_add(1, std::memory_order_relaxed);
+    const bool same_thread = meta_alloc_thread(s->meta) == tid;
+    if (!same_thread) g_cross_thread.fetch_add(1, std::memory_order_relaxed);
+
+    /* WHAT THIS BLOCK TURNED OUT TO BE.  Here, where it dies, is the only place
+     * that knows how long it lived -- and adding it up per site is what turns
+     * the two axes from something a caller declares into something the run
+     * MEASURES. */
+    note_death(s->alloc_stack, s->req, same_thread, s->seq, thread_allocs(c));
 
     s->free_stack = intern_stack(frames, n, walked);
     s->meta = meta_of(kStFreed, meta_alloc_thread(s->meta), tid);
@@ -1003,6 +1143,10 @@ bool guarded_free(void *p) noexcept {
 
 uint64_t san_verdicts() noexcept {
     return g_verdicts.load(std::memory_order_relaxed);
+}
+
+uint64_t san_longest_life() noexcept {
+    return g_longest_life.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -1119,6 +1263,47 @@ void report() noexcept {
                      "thread and released on another -- legal, and worth "
                      "seeing\n",
                      (unsigned long long)cross);
+
+    /* WHAT THE SITES ARE, measured.  This is the half of the report that is not
+     * about mistakes: it says, for every place that allocates, how long its
+     * blocks lived and whether they were all the same size -- which is exactly
+     * the two axes a caller can declare.  Declaring then stops being the source
+     * of truth and becomes a claim with something to check it against. */
+    if (g_life != nullptr) {
+        uint32_t sites = 0;
+        for (uint32_t i = 1; i < kDepotSlots; ++i)
+            if (g_life[i].deaths != 0 || g_life[i].unknown != 0) ++sites;
+        if (sites != 0) {
+            std::fprintf(stderr,
+                         "\n[allocator/check] what %u sites turned out to BE, "
+                         "measured (not declared).  A life is counted in "
+                         "allocations of its own thread, never in time, so two "
+                         "runs give the same number: under %u is Instant, under "
+                         "%u Medium, above that Long.\n",
+                         sites, g_life_instant, g_life_medium);
+            for (uint32_t i = 1; i < kDepotSlots; ++i) {
+                const Life &l = g_life[i];
+                if (l.deaths == 0 && l.unknown == 0) continue;
+                std::fprintf(stderr,
+                             "\n  %s / %s  -- %llu blocks, life avg %llu, max "
+                             "%u, sizes %u..%u",
+                             use_word(l), shape_word(l),
+                             (unsigned long long)l.deaths,
+                             (unsigned long long)(l.deaths != 0
+                                                      ? l.life_sum / l.deaths
+                                                      : 0),
+                             l.life_max, l.size_min, l.size_max);
+                if (l.unknown != 0)
+                    std::fprintf(stderr,
+                                 "  | %llu released on another thread, whose "
+                                 "lives are not comparable and are NOT in the "
+                                 "average",
+                                 (unsigned long long)l.unknown);
+                std::fprintf(stderr, "\n");
+                print_stack("  allocated", i);
+            }
+        }
+    }
 
     if (alive == 0) {
         std::fprintf(stderr, "[allocator/check] nothing was left alive\n");

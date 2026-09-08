@@ -172,6 +172,22 @@ int main(int argc, char **argv) {
     void *leaked = allocate_and_forget(40);
     check(leaked != nullptr, "and one block is left behind, for the report");
 
+    /* THE LIFE IS MEASURED, and this is the check that it is measured and not
+     * merely printed.  A block kept alive across a known number of allocations
+     * has to come out with a life of at least that many.  The first version
+     * read a counter that is only filled in when the report is written, so
+     * every life was zero and every site in every program was reported
+     * "Instant" -- a report that looks exactly like a working one. */
+    {
+        const uint64_t before = util::san_longest_life();
+        void *kept = util::host_alloc(32);
+        for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(16));
+        util::host_free(kept);
+        const uint64_t now = util::san_longest_life();
+        check(now >= 200 && now > before,
+              "a block kept alive across 200 allocations measures at least 200");
+    }
+
     /* THE GUARD LEVEL, from a safe distance.  What it catches, it catches by
      * faulting, so the mistakes are made in a child and what is asserted here
      * is that the child did not survive them -- and, just as important, that a

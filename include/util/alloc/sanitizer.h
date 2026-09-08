@@ -440,6 +440,43 @@ bool san_on_free(void *p) noexcept;
  */
 uint64_t san_verdicts() noexcept;
 
+/**
+ * @brief
+ * \~english The longest life measured so far, in allocations of a thread.
+ * \~spanish La vida mas larga medida hasta ahora, en reservas de un hilo.
+ * \~
+ *
+ * \~english
+ * Here so a test can demand that lives are MEASURED and not merely printed.  A
+ * report full of "Instant" looks exactly the same whether the clock works or is
+ * stuck at zero -- and it was stuck at zero, reading a field that is only
+ * filled in when the report is written.  A test that keeps a block alive across
+ * a known number of allocations and then asks for this catches that.
+ *
+ * @return the largest life recorded, or 0 when nothing has died yet.
+ *
+ * @code
+ *   const uint64_t before = util::san_longest_life();
+ *   void *p = util::host_alloc(32);
+ *   for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(16));
+ *   util::host_free(p);
+ *   // now san_longest_life() >= 200
+ * @endcode
+ * \~
+ *
+ * \~spanish
+ * Esta aqui para que un test pueda exigir que las vidas se MIDEN y no solo se
+ * imprimen.  Un informe lleno de "Instant" tiene el mismo aspecto si el reloj
+ * funciona que si esta clavado en cero -- y estaba clavado en cero, leyendo un
+ * campo que solo se rellena al escribir el informe.  Un test que mantiene un
+ * bloque vivo a lo largo de un numero conocido de reservas y luego pregunta
+ * esto lo caza.
+ *
+ * @return la vida mas larga apuntada, o 0 si no ha muerto nada todavia.
+ * \~
+ */
+uint64_t san_longest_life() noexcept;
+
 #else // the checker is not in this build / el comprobador no esta en este build
 
 /* Empty and always inlined: with the macro off, `host_alloc` and `host_free`
@@ -457,6 +494,7 @@ uint64_t san_verdicts() noexcept;
 [[gnu::always_inline]] inline void san_on_alloc(void *, size_t) noexcept {}
 [[gnu::always_inline]] inline bool san_on_free(void *) noexcept { return true; }
 [[gnu::always_inline]] inline uint64_t san_verdicts() noexcept { return 0; }
+[[gnu::always_inline]] inline uint64_t san_longest_life() noexcept { return 0; }
 
 #endif // VESTA_ALLOC_SANITIZER
 
