@@ -200,17 +200,35 @@ Stack *g_depot = nullptr;
  * @param walked set to true only if at least one frame came from the chain.
  * @return how many frames are real.
  */
-unsigned walk_stack(const void **out, const void *first,
+unsigned walk_stack(const void **out, const void *first, const void *from,
                     bool *walked) noexcept {
     out[0] = first;
     *walked = false;
     unsigned n = 1;
 
-    /* From this function's own frame the chain is [saved base pointer][return
-     * address], which is what both compilers emit whenever they keep the frame
-     * pointer at all.  When they do not, `plausible_frame` throws it out on the
-     * first step and we keep the one true address. */
-    const void *fp = __builtin_frame_address(0);
+    /* \~english WHERE TO START, and it is given rather than taken, for the same
+     * reason the return address is: every frame of the checker that sits
+     * between the program and this walk is a frame the walk has to begin ABOVE.
+     * Reading `__builtin_frame_address(0)` here worked while the hook was
+     * called straight from the allocator; with one door in front of it, the
+     * chain began inside the checker and the walk died on the first step -- one
+     * frame where there had been four.  From that frame the chain is [saved
+     * base pointer][return address], which is what both compilers emit whenever
+     * they keep the frame pointer at all.  When they do not, `plausible_frame`
+     * throws it out on the first step and the one true address is what is left.
+     *
+     * \~spanish POR DONDE EMPEZAR, y se le da en vez de tomarlo, por lo mismo
+     * que la direccion de retorno: cada marco del comprobador que se interpone
+     * entre el programa y este recorrido es un marco POR ENCIMA del cual hay
+     * que empezar.  Leer aqui `__builtin_frame_address(0)` valia mientras el
+     * gancho se llamaba directo desde el asignador; con una puerta delante, la
+     * cadena empezaba dentro del comprobador y el recorrido moria en el primer
+     * paso -- un marco donde habia cuatro --.  Desde ese marco la cadena es
+     * [base guardada][direccion de retorno], que es lo que emiten los dos
+     * compiladores siempre que conserven el puntero de marco.  Cuando no,
+     * `plausible_frame` lo tira en el primer paso y queda la unica direccion
+     * cierta.  \~ */
+    const void *fp = from != nullptr ? from : __builtin_frame_address(0);
     const void *below = fp;
     while (n < kFrames) {
         const void *const *slot = static_cast<const void *const *>(fp);
@@ -845,6 +863,65 @@ bool ensure_config() noexcept {
  * what reserves the room the canary is written into, so if it sits out the
  * first allocation while `san_on_alloc` does not, the canary goes past the end
  * of a block that has no room for it. */
+/**
+ * @brief The one entry the allocator calls, which decides everything else.
+ *
+ * ONE OUT-OF-LINE CALL, and the reason is measured: with three -- one to grow
+ * the request, one to try the guarded path, one to record the block -- an
+ * allocation cost 12.4 ns against the 4.9 of a build without the checker, with
+ * the checker switched OFF at run time.  Two thirds of that was asking three
+ * separate times whether there was anything to do.
+ *
+ * The set-up question is asked ONCE here, and when the answer is no the whole
+ * thing is a call, a compare and the ordinary path.
+ */
+/* The three that used to be public and are now only reachable through the door
+ * above.  Declared here because that door is defined first, and it reads better
+ * first: it is the one thing the allocator knows about. */
+size_t san_grow(size_t n) noexcept;
+void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept;
+void san_on_alloc(void *p, size_t req, const void *pc, const void *fp) noexcept;
+
+[[gnu::noinline]] void *san_alloc(size_t n) noexcept {
+    /* \~english READ ONCE, HERE, WHERE IT IS STILL TRUE.  `host_alloc` is
+     * inlined into its caller, so the return address of THIS call is the point
+     * in the program where the allocation happened -- the site the report has
+     * to name.  One step further in it would be an address inside the checker,
+     * which is why it travels as an argument from here on.  `noinline` is
+     * load-bearing for the same reason: inlined, there would be no return
+     * address of its own to read.  And the frame goes with it: from here the
+     * chain leads to the program, from one step deeper it leads through the
+     * checker.
+     *
+     * \~spanish LEIDOS UNA VEZ, AQUI, DONDE TODAVIA SON CIERTOS.  `host_alloc`
+     * va en linea dentro de quien llama, asi que la direccion de retorno de
+     * ESTA llamada es el punto del programa donde ocurrio la reserva -- el
+     * sitio que el informe tiene que nombrar --.  Un paso mas adentro seria una
+     * direccion del comprobador, y por eso viaja como argumento a partir de
+     * aqui.  El `noinline` sostiene lo mismo: en linea no habria direccion de
+     * retorno propia que leer.  Y el marco va con ella: desde aqui la cadena
+     * lleva al programa, un paso mas adentro lleva por el comprobador.  \~ */
+    const void *const pc = __builtin_return_address(0);
+    const void *const fp = __builtin_frame_address(0);
+
+    /* \~english THE ONE QUESTION, asked once.  Switched off, this whole mode is
+     * a call, a compare and the ordinary path -- which is what it cost
+     * measuring: three separate hooks each asking the same thing added 7.5 ns
+     * to every allocation for nothing.
+     *
+     * \~spanish LA UNICA PREGUNTA, hecha una vez.  Apagado, todo este modo son
+     * una llamada, una comparacion y el camino de siempre -- que es lo que
+     * costo medirlo: tres ganchos preguntando cada uno lo mismo anadian 7,5 ns
+     * a cada reserva para nada.  \~ */
+    if (!ensure_config() || detail::g_san_level == SanLevel::Off)
+        return detail::alloc_body(n);
+
+    void *p = san_alloc_guarded(n, pc, fp);
+    if (p == nullptr) p = detail::alloc_body(san_grow(n));
+    san_on_alloc(p, n, pc, fp);
+    return p;
+}
+
 size_t san_grow(size_t n) noexcept {
     if (!ensure_ready()) return n;
     if (detail::g_san_level < SanLevel::Canary) return n;
@@ -876,7 +953,7 @@ size_t san_grow(size_t n) noexcept {
  * for the life of the process.  That is the point, and it is also why this is
  * nobody's default.
  */
-void *san_alloc_guarded(size_t n) noexcept {
+void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     /* The CONFIG and not the whole set-up: a guarded block does not touch the
      * shadow, so waiting for the shadow would keep the very first allocation of
      * the process -- and in a small program, every allocation -- out of the
@@ -924,8 +1001,7 @@ void *san_alloc_guarded(size_t n) noexcept {
 
     const void *frames[kFrames];
     bool walked = false;
-    const unsigned nf =
-        walk_stack(frames, __builtin_return_address(0), &walked);
+    const unsigned nf = walk_stack(frames, pc, fp, &walked);
     g->base = base;
     g->total = total;
     g->req = n;
@@ -942,7 +1018,7 @@ void *san_alloc_guarded(size_t n) noexcept {
 }
 
 /// @return true when the release was handled here and must not go any further.
-bool guarded_free(void *p) noexcept {
+bool guarded_free(void *p, const void *fp) noexcept {
     Guarded *g = guard_find(p);
     if (g == nullptr) return false;
 
@@ -970,7 +1046,8 @@ bool guarded_free(void *p) noexcept {
     const void *frames[kFrames];
     bool walked = false;
     const unsigned nf =
-        walk_stack(frames, __builtin_return_address(0), &walked);
+        walk_stack(frames, __builtin_return_address(0),
+                   __builtin_frame_address(0), &walked);
     g->free_stack = intern_stack(frames, nf, walked);
     g->state = kStFreed;
 
@@ -983,9 +1060,9 @@ bool guarded_free(void *p) noexcept {
     return true;
 }
 
-[[gnu::noinline]] void san_on_alloc(void *p, size_t req) noexcept {
+void san_on_alloc(void *p, size_t req, const void *pc,
+                  const void *fp) noexcept {
     if (p == nullptr) return;
-    if (!ensure_config() || detail::g_san_level == SanLevel::Off) return;
 
     /* A guarded block wrote its own entry when it was served, and it does not
      * live in the region, so the shadow would count it as something it could
@@ -1024,8 +1101,7 @@ bool guarded_free(void *p) noexcept {
 
     const void *frames[kFrames];
     bool walked = false;
-    const unsigned n =
-        walk_stack(frames, __builtin_return_address(0), &walked);
+    const unsigned n = walk_stack(frames, pc, fp, &walked);
 
     const detail::ThreadCache *c = detail::current_cache();
     const uint32_t tid = detail::have_cache(c) ? c->id : 0;
@@ -1059,7 +1135,9 @@ bool guarded_free(void *p) noexcept {
      * `no_foreign_free`, which stops the process.  Answering false is what
      * keeps it here -- and it is asked BEFORE the shadow, which that block does
      * not have. */
-    if (detail::g_san_level >= SanLevel::Guard && guarded_free(p)) return false;
+    if (detail::g_san_level >= SanLevel::Guard &&
+        guarded_free(p, __builtin_frame_address(0)))
+        return false;
 
     if (!ensure_ready()) return true;
     size_t block = 0;
@@ -1082,7 +1160,8 @@ bool guarded_free(void *p) noexcept {
         const void *frames[kFrames];
         bool walked = false;
         const unsigned n =
-            walk_stack(frames, __builtin_return_address(0), &walked);
+            walk_stack(frames, __builtin_return_address(0),
+                   __builtin_frame_address(0), &walked);
         print_stack("released again", intern_stack(frames, n, walked));
         return false;
     }
@@ -1115,7 +1194,8 @@ bool guarded_free(void *p) noexcept {
     const void *frames[kFrames];
     bool walked = false;
     const unsigned n =
-        walk_stack(frames, __builtin_return_address(0), &walked);
+        walk_stack(frames, __builtin_return_address(0),
+                   __builtin_frame_address(0), &walked);
     const detail::ThreadCache *c = detail::current_cache();
     const uint32_t tid = detail::have_cache(c) ? c->id : 0;
 

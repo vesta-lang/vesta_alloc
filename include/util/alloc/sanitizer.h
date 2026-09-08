@@ -322,7 +322,45 @@ extern SanLevel g_san_level;
  * @return lo que hay que reservar en su lugar.
  * \~
  */
-size_t san_grow(size_t n) noexcept;
+/**
+ * @brief
+ * \~english The whole allocation, checker included.  ONE call, not three.
+ * \~spanish La reserva entera, comprobador incluido.  UNA llamada, no tres.
+ * \~
+ *
+ * \~english
+ * WHY IT IS ONE ENTRY AND NOT THREE.  The first version had `host_alloc` call
+ * three separate out-of-line hooks -- grow the size, try the guarded path,
+ * record the block -- and each of them asked whether the checker was set up.
+ * Measured: an allocation went from 4.9 ns to 12.4 with the checker switched OFF
+ * at run time, which is the checker charging for work it was not doing.
+ *
+ * With one entry the ordinary path calls out once and everything else happens
+ * on the other side, where it belongs -- including deciding, on the very first
+ * call, whether there is anything to do at all.
+ *
+ * @param n what the caller asked for.
+ * @return the block, or nullptr, exactly like @c host_alloc.
+ * \~
+ *
+ * \~spanish
+ * POR QUE UNA ENTRADA Y NO TRES.  La primera version hacia que `host_alloc`
+ * llamara a tres ganchos separados fuera de linea -- crecer el tamano, probar
+ * el camino con guarda, apuntar el bloque -- y cada uno preguntaba si el
+ * comprobador estaba montado.  Medido: una reserva pasaba de 4,9 ns a 12,4 con
+ * el comprobador APAGADO en ejecucion, o sea cobrando por un trabajo que no
+ * hacia.
+ *
+ * Con una sola entrada el camino de siempre sale una vez y todo lo demas ocurre
+ * al otro lado, que es su sitio -- incluido decidir, en la primera llamada, si
+ * hay algo que hacer.
+ *
+ * @param n lo que pidio quien llama.
+ * @return el bloque, o nulo, igual que @c host_alloc.
+ * \~
+ */
+void *san_alloc(size_t n) noexcept;
+
 
 /**
  * @brief
@@ -359,7 +397,19 @@ size_t san_grow(size_t n) noexcept;
  *         corre el camino de siempre, sin tocar.
  * \~
  */
-void *san_alloc_guarded(size_t n) noexcept;
+/* `san_grow`, the guarded path and the recording of a block used to be here.
+ * They are INTERNAL now, behind `san_alloc`, and the move is not tidying: each
+ * of them read the caller's return address on its own, and reading it from
+ * inside another one of them yields an address in the CHECKER instead of in the
+ * program.  With one door, the address is read once where it is still true and
+ * handed down as an argument.
+ *
+ * `san_grow`, el camino con guarda y el apuntar un bloque estaban aqui.  Ahora
+ * son INTERNOS, detras de `san_alloc`, y el cambio no es orden: cada uno leia
+ * por su cuenta la direccion de retorno del llamante, y leerla desde dentro de
+ * otro de ellos da una direccion del COMPROBADOR en vez de una del programa.
+ * Con una sola puerta se lee una vez, donde todavia es cierta, y se pasa como
+ * argumento. */
 
 /**
  * @brief
@@ -387,7 +437,6 @@ void *san_alloc_guarded(size_t n) noexcept;
  * @param req lo que pidio quien llama, ANTES de @c san_grow.
  * \~
  */
-void san_on_alloc(void *p, size_t req) noexcept;
 
 /**
  * @brief
@@ -487,11 +536,14 @@ uint64_t san_longest_life() noexcept;
  * tienen que generar las mismas instrucciones que si este fichero no
  * existiera.  Es una promesa que el build COMPRUEBA, no una intencion. */
 
-[[gnu::always_inline]] inline size_t san_grow(size_t n) noexcept { return n; }
-[[gnu::always_inline]] inline void *san_alloc_guarded(size_t) noexcept {
+[[gnu::always_inline]] inline void *san_alloc(size_t) noexcept {
+    /* \~english Never reached: with the macro off the allocator does not call
+     * it.  It is here so a consumer can include this header unconditionally.
+     * \~spanish No se alcanza nunca: con la macro apagada el asignador no la
+     * llama.  Esta para que quien la use pueda incluir esta cabecera sin
+     * condiciones.  \~ */
     return nullptr;
 }
-[[gnu::always_inline]] inline void san_on_alloc(void *, size_t) noexcept {}
 [[gnu::always_inline]] inline bool san_on_free(void *) noexcept { return true; }
 [[gnu::always_inline]] inline uint64_t san_verdicts() noexcept { return 0; }
 [[gnu::always_inline]] inline uint64_t san_longest_life() noexcept { return 0; }

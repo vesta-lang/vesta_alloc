@@ -201,9 +201,16 @@
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator_c.h" // ahi se declara `HostAllocStats`, para C
 #include "util/alloc/host_allocator_layout.h"
-/* El modo COMPROBACION.  Apagado -- que es lo normal -- sus entradas son
- * funciones en linea vacias y no queda ni una instruccion; ver el fichero. */
+/* \~english The CHECKING mode, and only when it was asked for.  Without the
+ * macro it is not even included: the everyday allocator does not mention the
+ * checker, not even by name.  See `util/alloc/sanitizer.h`.
+ *
+ * \~spanish El modo COMPROBACION, y SOLO cuando se ha pedido.  Sin la macro no
+ * se incluye siquiera: el asignador de todos los dias no menciona al
+ * comprobador ni por el nombre.  Ver `util/alloc/sanitizer.h`.  \~ */
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
 #include "util/alloc/sanitizer.h"
+#endif
 #include "util/alloc/size_buckets.h"
 /* `OsProt` y `OsNearScan`: los necesita `host_alloc_pages`, que entrega paginas
  * con permisos y dice si pudo colocarlas donde se le pidio. */
@@ -1432,16 +1439,27 @@ size_t direct_bytes(const void *p) noexcept;
  * @see host_free, host_alloc_zeroed, host_alloc_aligned
  */
 [[gnu::always_inline]] inline void *host_alloc(size_t n) noexcept {
-    /* THE CHECKING MODE goes around the outside, never through the middle.
-     * With `VESTA_ALLOC_SANITIZER` off, `san_grow` is the identity and
-     * `san_on_alloc` is an empty inline function, so what the compiler emits
-     * here is `detail::alloc_body(n)` and nothing else -- the same
-     * instructions, one for one, as before this mode existed.  See
-     * `util/alloc/sanitizer.h`. */
-    void *p = san_alloc_guarded(n);
-    if (p == nullptr) p = detail::alloc_body(san_grow(n));
-    san_on_alloc(p, n);
-    return p;
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+    /* \~english THE CHECKING MODE goes around the outside, never through the
+     * middle -- and only when it was asked for.  Without the macro this branch
+     * does not exist at all: not the call, not the name, not the include.
+     * Leaving it here unconditionally and trusting an empty inline function to
+     * vanish would have been the checker sitting in the ordinary path BY
+     * DEFAULT, and that is not what it was allowed to do.  ONE call and not
+     * three: three of them cost 7.5 ns per allocation to ask, three times over,
+     * whether there was anything to do.
+     *
+     * \~spanish EL MODO COMPROBACION va por FUERA, nunca por en medio -- y solo
+     * cuando se ha pedido.  Sin la macro esta rama no existe: ni la llamada, ni
+     * el nombre, ni el include.  Dejarla puesta siempre y confiar en que una
+     * funcion en linea vacia desaparezca habria sido el comprobador metido en
+     * el camino de siempre POR DEFECTO, que es lo que no tenia permitido.  UNA
+     * llamada y no tres: las tres costaban 7,5 ns por reserva para preguntar,
+     * tres veces, si habia algo que hacer.  \~ */
+    return san_alloc(n);
+#else
+    return detail::alloc_body(n);
+#endif
 }
 
 /**
@@ -1673,15 +1691,22 @@ namespace detail {
 } // namespace detail
 
 [[gnu::always_inline]] inline void host_free(void *p) noexcept {
-    /* THE CHECKING MODE, from the outside again, and here it can also say NO:
-     * on a double free it answers false and the block is NOT put back on any
-     * list.  Freeing it twice would hand one block to two owners, so a checker
-     * that reported the bug and then let it through would have turned a
-     * warning into a corrupted heap.
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+    /* \~english THE CHECKING MODE, from the outside again, and here it can also
+     * say NO: on a double free it answers false and the block is NOT put back
+     * on any list.  Freeing it twice would hand one block to two owners, so a
+     * checker that reported the bug and then let it through would have turned a
+     * warning into a corrupted heap.  And, like its twin above, this exists
+     * ONLY when the mode was asked for.
      *
-     * With `VESTA_ALLOC_SANITIZER` off this is an inline `true` and the branch
-     * disappears; see `util/alloc/sanitizer.h`. */
+     * \~spanish EL MODO COMPROBACION, otra vez por fuera, y aqui ademas puede
+     * decir que NO: ante una doble liberacion contesta false y el bloque NO
+     * vuelve a ninguna lista.  Soltarlo dos veces entregaria un bloque a dos
+     * duenos, asi que un comprobador que avisara del fallo y luego lo dejara
+     * pasar habria convertido un aviso en un monton corrompido.  Y, como su
+     * gemelo de arriba, esto existe SOLO cuando se ha pedido el modo.  \~ */
     if (!san_on_free(p)) return;
+#endif
     detail::free_body(p);
 }
 

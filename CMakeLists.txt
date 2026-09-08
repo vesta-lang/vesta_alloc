@@ -754,6 +754,27 @@ if(VESTA_ALLOC_BUILD_TESTS)
             message(STATUS "[vesta_alloc] sin doxygen o sin python: la "
                     "comprobacion de la documentacion bilingue NO se ejecuta")
         endif()
+
+        # -------------------------------------------------------------------
+        #  Y la prosa que Doxygen NO ve
+        # -------------------------------------------------------------------
+        #
+        # La comprobacion de arriba compara las dos referencias generadas, asi
+        # que ve lo que ve Doxygen: las cabeceras.  Los comentarios normales de
+        # los ficheros de implementacion le son invisibles, y ahi es justo donde
+        # la regla se habia deshecho -- 1.201 bloques en un solo idioma cuando
+        # se miro por primera vez.  Una regla sin quien la compruebe se deshace
+        # sola.
+        #
+        # No lleva lista de excepciones, que es como un comprobador empieza a
+        # mentir: lleva un TECHO que solo puede bajar, y la lista entera se
+        # imprime en cada corrida.  Solo necesita Python, no Doxygen.
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME vesta_alloc_comment_parity
+                    COMMAND ${Python3_EXECUTABLE}
+                            ${CMAKE_CURRENT_SOURCE_DIR}/doc/check_comment_parity.py
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        endif()
     endif()
 endif()
 
