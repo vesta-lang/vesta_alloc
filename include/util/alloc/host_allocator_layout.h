@@ -284,6 +284,128 @@ inline constexpr uint32_t kSizes[] = {
 /// \~
 inline constexpr uint32_t kClasses = sizeof(kSizes) / sizeof(kSizes[0]);
 
+/**
+ * \~english
+ * @brief How many blocks the hot batch holds.
+ *
+ * WHAT THE BATCH IS FOR.  A free list is a pointer chase: to know the new head
+ * you must first load the block's own first word, so consecutive allocations of
+ * one class form a chain of dependent L1 loads and the machine cannot start the
+ * next one early.  Measured with the microarchitecture counters, that shows up
+ * as L1 latency dependency with nothing above L1 involved at all.
+ *
+ * The batch breaks the chain for a run of allocations in the SAME class: the
+ * blocks are handed out from an array by index, which depends on nothing the
+ * previous allocation loaded.  Freeing into it is also one store to the array
+ * instead of a store INTO the block, which is a line the caller may not have
+ * touched in a while.
+ *
+ * EIGHT, so the array is exactly one cache line.  Bigger buys a longer run
+ * between refills and costs the same line count in every cache -- and there are
+ * `kTotalCaches` of them, so this is not free memory.  One class at a time and
+ * not one batch per class for the same reason: per class it would be
+ * `kClasses` lines each, which multiplies the whole table.
+ *
+ * \~spanish
+ * @brief Cuantos bloques guarda el lote caliente.
+ *
+ * PARA QUE ESTA.  Una lista libre es una persecucion de punteros: para saber la
+ * nueva cabeza hay que cargar antes la primera palabra del propio bloque, asi
+ * que reservas seguidas de una clase forman una cadena de cargas dependientes
+ * de L1 y la maquina no puede adelantar la siguiente.  Medido con los
+ * contadores microarquitectonicos, eso sale como dependencia de latencia de L1
+ * sin que L2 ni nada por encima participe.
+ *
+ * El lote rompe la cadena para una tirada de reservas de la MISMA clase: los
+ * bloques salen de un array por indice, que no depende de nada que cargara la
+ * reserva anterior.  Liberar en el es tambien un almacen al array en vez de un
+ * almacen DENTRO del bloque, que es una linea que el llamante puede llevar rato
+ * sin tocar.
+ *
+ * OCHO, para que el array sea exactamente una linea de cache.  Mas grande
+ * compra una tirada mas larga entre recargas y cuesta las mismas lineas en cada
+ * cache -- y hay `kTotalCaches` de ellos, asi que esta memoria no es gratis --.
+ * Una clase cada vez y no un lote por clase por lo mismo: por clase serian
+ * `kClasses` lineas cada uno, que multiplica la tabla entera.
+ * \~
+ */
+inline constexpr uint32_t kBatchSlots = 8;
+
+/**
+ * \~english
+ * @brief The largest block the hot batch takes charge of.
+ *
+ * NOT EVERY SIZE WANTS THE SAME MECHANISM, and measuring says so plainly.  The
+ * batch wins where a block is taken and given back over and over -- it comes
+ * out of the array and goes back into it without anybody touching its memory --
+ * and that is what small allocations do.  In a BURST, where hundreds are taken
+ * and only then given back, it breaks no chain at all: the list gets walked
+ * either way, and the batch just adds a refill every eight.
+ *
+ * Measured, per size, worst pattern against best:
+ *
+ *       16 B     every pattern gains
+ *       64 B     every pattern gains
+ *      256 B     `hot` 1.33 -> 0.87 but `burst` 1.71 -> 2.10 and
+ *                `calloc` 3.02 -> 3.75, and those are 23% and 24% against
+ *
+ * So the batch stops here and the classes above keep the plain list, which is
+ * the same thing this library does everywhere else: specialise, rather than
+ * make one mechanism serve sizes it was not good for.  It also happens to be
+ * where the volume is -- 81% of allocations in a real compilation are 64 bytes
+ * or less.
+ *
+ * IT COSTS THE FAST PATH NOTHING, and that is why the check is not there:
+ * `batch_cls` only ever holds a class at or below this one, so `batch_cls == k`
+ * already answers "is this a batched class?".  The only place that has to know
+ * is @c pop_block_refill, which runs once every @c kBatchSlots allocations.
+ *
+ * \~spanish
+ * @brief El bloque mas grande del que se hace cargo el lote caliente.
+ *
+ * NO TODOS LOS TAMANOS QUIEREN EL MISMO MECANISMO, y medir lo dice sin rodeos.
+ * El lote gana donde un bloque se coge y se devuelve una y otra vez -- sale del
+ * array y vuelve a el sin que nadie toque su memoria --, que es lo que hacen
+ * las reservas pequenas.  En una RAFAGA, donde se cogen cientos y solo despues
+ * se devuelven, no rompe ninguna cadena: la lista se recorre igual y el lote
+ * solo anade una recarga cada ocho.
+ *
+ * Medido, por tamano, el peor patron contra el mejor:
+ *
+ *       16 B     ganan todos los patrones
+ *       64 B     ganan todos los patrones
+ *      256 B     `hot` 1,33 -> 0,87 pero `burst` 1,71 -> 2,10 y
+ *                `calloc` 3,02 -> 3,75, que son un 23% y un 24% en contra
+ *
+ * Asi que el lote se para aqui y las clases de arriba siguen con la lista de
+ * siempre, que es lo mismo que esta libreria hace en todo lo demas:
+ * especializar, en vez de hacer que un mecanismo sirva tamanos para los que no
+ * era bueno.  Y ademas es donde esta el volumen: el 81% de las reservas de una
+ * compilacion real son de 64 bytes o menos.
+ *
+ * AL CAMINO RAPIDO NO LE CUESTA NADA, y por eso la comprobacion no esta ahi:
+ * `batch_cls` solo llega a contener clases de esta para abajo, asi que
+ * `batch_cls == k` ya responde "es una clase con lote?".  El unico sitio que
+ * tiene que saberlo es @c pop_block_refill, que corre una vez cada
+ * @c kBatchSlots reservas.
+ * \~
+ */
+inline constexpr size_t kBatchMaxSize = 128;
+
+/// \~english The class index @c kBatchMaxSize falls in, worked out from the
+///           table so that changing one does not silently disagree with the
+///           other.
+/// \~spanish El indice de clase en que cae @c kBatchMaxSize, sacado de la tabla
+///           para que cambiar uno no discrepe en silencio con el otro.
+/// \~
+inline constexpr uint32_t batch_max_class() noexcept {
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < kClasses; ++i)
+        if (kSizes[i] <= kBatchMaxSize) last = i;
+    return last;
+}
+inline constexpr uint32_t kBatchMaxClass = batch_max_class();
+
 /// \~english The chunk asked of the region every time a class runs out of
 ///           blocks.
 /// \~spanish Trozo que se pide a la region cada vez que una clase se queda sin

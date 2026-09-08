@@ -779,6 +779,26 @@ void calibrate() {
  *
  * @param name The section's short name, as it appears in the variable.
  */
+/* THE SECTIONS ARE NOT INDEPENDENT, AND A ROW CANNOT BE COMPARED ACROSS BUILDS
+ * FROM INSIDE A FULL RUN.
+ *
+ * Each one inherits whatever the ones before it left: which chunks the region
+ * handed out, where a class's blocks ended up, what is warm.  How much that is
+ * worth was measured the hard way, chasing what looked like a 16% regression:
+ *
+ *     calloc 256, ns/op        without the change    with it
+ *     inside the full run              3.02           3.50
+ *     the section on its own           3.76           3.58
+ *
+ * The BASELINE itself moves from 3.02 to 3.76 depending on whether the earlier
+ * sections ran -- a 25% swing from history alone, larger than the difference
+ * being attributed to the change, and in the opposite direction.  Read from the
+ * full run the change looked like a loss; read on its own it is a small win.
+ *
+ * So: to compare one section across two builds, run THAT SECTION on its own
+ * with `VESTA_BENCH_ONLY`.  The full run is for seeing the whole shape at once,
+ * and its rows are comparable to each other -- all four columns are interleaved
+ * inside the same round -- but not to the same row of a different binary. */
 bool section_wanted(const char *name) {
     const char *want = std::getenv("VESTA_BENCH_ONLY");
     if (want == nullptr || want[0] == '\0') return true;
@@ -967,5 +987,11 @@ int main() {
                 "result, not noise to be explained away -- and one marked\n"
                 "\"too close\" is the honest answer for a difference this\n"
                 "machine cannot resolve today, not a missing one.\n");
+    std::printf("\n%sComparing ONE row against another build?  Run that section\n"
+                "on its own -- VESTA_BENCH_ONLY=<section>.  The sections are not\n"
+                "independent: each inherits what the ones before it left, and\n"
+                "that is worth up to 25%% on a row, which is more than most\n"
+                "changes are.%s\n",
+                report::dim(), report::reset());
     return 0;
 }

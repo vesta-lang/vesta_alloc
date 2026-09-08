@@ -2110,6 +2110,61 @@ ThreadCache *per_thread_cache_slow() noexcept {
     return c;
 }
 
+/**
+ * @brief Llena el lote caliente desde la lista de la clase @p k.
+ *
+ * Corre una vez cada @c kBatchSlots reservas de la misma clase, o al cambiar de
+ * clase.  Aqui SI se paga la cadena de punteros -- se recorre la lista para
+ * recoger hasta ocho bloques --, y ese es justo el trato: se paga una vez por
+ * tirada en vez de en cada reserva.  Ver @c kBatchSlots.
+ *
+ * @param c El cache del hilo.
+ * @param k La clase que se pide.
+ * @return Un bloque, o nullptr si la lista tambien estaba vacia -- y entonces
+ *         el que llama va a @c host_alloc_refill, que es quien pide mas.
+ */
+void *pop_block_refill(ThreadCache *c, uint32_t k) noexcept {
+    /* LAS CLASES GRANDES NO USAN EL LOTE.  Ver `kBatchMaxClass`: ahi el lote no
+     * rompe ninguna cadena y solo anade trabajo.  Se sirve de la lista tal cual,
+     * que es lo que hacia esta funcion antes de que el lote existiera.
+     *
+     * Y por eso `batch_cls` nunca llega a valer una clase grande, que es lo que
+     * permite que el camino rapido no tenga que preguntarlo. */
+    if (k > kBatchMaxClass) {
+        void *p = c->free_list[k];
+        if (p == nullptr) return nullptr;
+        c->free_list[k] = *reinterpret_cast<void **>(p);
+        c->stats.by_tag[c->tag]++;
+        return p;
+    }
+
+    /* De otra clase: lo que quede vuelve a SU lista antes de nada.  Si no, esos
+     * bloques quedarian retenidos en el lote de una clase que ya nadie pide, y
+     * un bloque retenido es un bloque perdido mientras el hilo viva. */
+    if (c->batch_cls != k) {
+        while (c->batch_n != 0) {
+            void *q = c->batch[--c->batch_n];
+            *reinterpret_cast<void **>(q) = c->free_list[c->batch_cls];
+            c->free_list[c->batch_cls] = q;
+        }
+        c->batch_cls = k;
+    }
+
+    // Y a llenarlo, recorriendo la lista una vez.
+    void *p = c->free_list[k];
+    while (p != nullptr && c->batch_n < kBatchSlots) {
+        void *next = *reinterpret_cast<void **>(p);
+        c->batch[c->batch_n++] = p;
+        p = next;
+    }
+    c->free_list[k] = p;
+
+    if (c->batch_n == 0) return nullptr; // ni lote ni lista: hay que pedir mas
+    void *r = c->batch[--c->batch_n];
+    c->stats.by_tag[c->tag]++;
+    return r;
+}
+
 void *host_alloc_refill(ThreadCache *c, uint32_t k, size_t n) noexcept {
     void *chain = take_remote(c, k);
     if (chain == nullptr) chain = grow(c, k);

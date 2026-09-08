@@ -402,6 +402,41 @@ struct alignas(64) ThreadCache {
     ///           alguien pregunta.
     /// \~
     HostAllocStats stats;
+    /**
+     * \~english
+     * @brief The hot batch: blocks of ONE class, handed out by index so that an
+     *        allocation does not have to load the previous block to know where
+     *        the next one is.  See @c kBatchSlots and @c pop_block.
+     *
+     * AT THE END, and that is not tidiness.  Put at the FRONT it shifted every
+     * field after it by 72 bytes -- not a multiple of the line -- and everything
+     * else landed differently inside its cache line.  The span cache moved with
+     * it, and the churn row at 1 MiB, which does not touch this batch at all,
+     * went from 4.19 to 11.18 ns.  Appending leaves every existing offset where
+     * it was.
+     *
+     * \~spanish
+     * @brief El lote caliente: bloques de UNA clase, entregados por indice para
+     *        que una reserva no tenga que cargar el bloque anterior para saber
+     *        donde esta el siguiente.  Ver @c kBatchSlots y @c pop_block.
+     *
+     * AL FINAL, y no es por orden.  Puesto al PRINCIPIO desplazaba 72 bytes
+     * todos los campos de detras -- que no son multiplo de la linea -- y todo lo
+     * demas caia distinto dentro de su linea de cache.  El cache de tramos se
+     * movio con ellos, y la fila de `churn` a 1 MiB, que no toca este lote para
+     * nada, paso de 4,19 a 11,18 ns.  Anadiendo al final, cada campo que ya
+     * existia se queda donde estaba.
+     * \~
+     */
+    void *batch[kBatchSlots];
+    /// \~english How many are in it.  \~spanish Cuantos hay.  \~
+    uint32_t batch_n;
+    /// \~english Which class they belong to.  A pop of another class flushes
+    ///           what is left back to ITS list first; see @c pop_block_refill.
+    /// \~spanish De que clase son.  Sacar de otra clase devuelve antes lo que
+    ///           queda a SU lista; ver @c pop_block_refill.
+    /// \~
+    uint32_t batch_cls;
 };
 
 /**
@@ -708,13 +743,48 @@ constexpr uintptr_t kDyingCache = 1;
  * \~spanish el bloque, o nullptr si esa lista estaba vacia.
  * \~
  */
+/// \~english Fills the batch from the class's list, switching class if needed.
+///           Out of line: it runs once every @c kBatchSlots allocations.
+/// \~spanish Llena el lote desde la lista de la clase, cambiando de clase si
+///           hace falta.  Fuera de linea: corre una vez cada @c kBatchSlots
+///           reservas.
+/// \~
+void *pop_block_refill(ThreadCache *c, uint32_t k) noexcept;
+
 [[gnu::always_inline]] inline void *pop_block(ThreadCache *c,
                                               uint32_t k) noexcept {
+    /* FROM THE BATCH, BY INDEX.  The list is still there and still the truth;
+     * what changed is that a run of allocations in one class no longer walks it
+     * one dependent load at a time.  See @c kBatchSlots. */
+    /* THE CONSTANT IS ASKED FIRST, and the order is the whole point.  A class
+     * without a batch must not so much as LOOK at `batch_cls`: those fields sit
+     * at the end of the cache, `free_list` at the start, so touching them makes
+     * a big-class allocation read TWO lines where it used to read one.  Asking
+     * `k <= kBatchMaxClass` costs nothing -- a compare against a compile-time
+     * constant, no memory at all -- and keeps those classes exactly as they
+     * were before the batch existed.
+     *
+     * Measured with the test the other way round: `calloc` at 256 bytes, which
+     * is above the threshold and should not have moved, went from 3.02 to 4.05
+     * ns.  Nothing was going to the system -- the benchmark's own committed
+     * counter reads 0.00 for that row in both -- so it was this. */
+    if (__builtin_expect(k <= kBatchMaxClass, 1)) {
+        if (__builtin_expect(c->batch_cls == k && c->batch_n != 0, 1)) {
+            void *p = c->batch[--c->batch_n];
+            // Contar por etiqueta ES contar: el total sale de sumar esta tabla,
+            // asi que saber el proposito no anade ni una instruccion.
+            c->stats.by_tag[c->tag]++;
+            return p;
+        }
+        return pop_block_refill(c, k);
+    }
+
+    /* Y las clases grandes, exactamente como estaban: la lista, en linea.
+     * Mandarlas al camino de recarga ponia una LLAMADA en cada reserva suya, y
+     * se noto en el acto -- `churn` a 256 bytes paso de 1,22 a 1,76 ns. */
     void *p = c->free_list[k];
     if (p == nullptr) return nullptr;
     c->free_list[k] = *reinterpret_cast<void **>(p);
-    // Contar por etiqueta ES contar: el total sale de sumar esta tabla, asi
-    // que saber el proposito no anade ni una instruccion.
     c->stats.by_tag[c->tag]++;
     return p;
 }
@@ -750,9 +820,21 @@ constexpr uintptr_t kDyingCache = 1;
  */
 [[gnu::always_inline]] inline void push_block(ThreadCache *c, void *p,
                                               uint32_t k) noexcept {
+    c->stats.small_frees++;
+    /* INTO THE BATCH when it belongs there and there is room: one store to an
+     * array we are already touching, instead of a store INTO the block, which
+     * is a line the caller may have finished with a while ago.  See
+     * @c kBatchSlots.
+     *
+     * The constant goes first for the same reason as in @c pop_block: a class
+     * without a batch must not read `batch_cls` at all. */
+    if (__builtin_expect(k <= kBatchMaxClass, 1) &&
+        __builtin_expect(c->batch_cls == k && c->batch_n < kBatchSlots, 1)) {
+        c->batch[c->batch_n++] = p;
+        return;
+    }
     *reinterpret_cast<void **>(p) = c->free_list[k];
     c->free_list[k] = p;
-    c->stats.small_frees++;
 }
 
 /**
