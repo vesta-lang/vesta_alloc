@@ -2592,16 +2592,16 @@ uint64_t host_direct_refused() noexcept {
 }
 
 /**
- * @brief Trozos de la region grande, comprometidos con @p prot.
+ * @brief Chunks of the big region, committed with @p prot.
  *
- * El unico sitio donde se toca el cursor para esto, y por eso esta aparte: las
- * DOS entradas publicas -- la que persigue un ancla y la que no tiene ninguna
- * -- tienen que servir del mismo cursor, o dejarian de ser vecinos, que es
- * justamente lo que se compra aqui.
+ * The only place that touches the cursor for this, and that is why it is on its
+ * own: the TWO public entries -- the one that chases an anchor and the one with
+ * no anchor at all -- have to serve off the same cursor, or they would stop
+ * being neighbours, which is exactly what is being bought here.
  *
- * @return la direccion, o cero si la region no dio o las paginas no se pudieron
- *         comprometer.  Devuelve tambien @p got, que es lo que hay que
- *         descomprometer si luego no sirve.
+ * @return the address, or zero when the region could not give it or the pages
+ *         could not be committed.  It also hands back @p got, which is what has
+ *         to be decommitted if the block turns out not to serve.
  */
 static uintptr_t region_pages(size_t bytes, OsProt prot, size_t *got) noexcept {
     const size_t chunks = (bytes + kBigChunkBytes - 1) / kBigChunkBytes;
@@ -2618,9 +2618,9 @@ void *host_alloc_pages_in_region(size_t bytes, OsProt prot) noexcept {
     size_t got = 0;
     const uintptr_t addr = region_pages(bytes, prot, &got);
     if (addr == 0) return nullptr;
-    /* Se cuenta con las mismas paginas que las del codigo, y a proposito: son
-     * el mismo cursor y el mismo reparto, asi que separarlas en el informe
-     * diria que hay dos mecanismos donde hay uno. */
+    /* Counted together with the code pages, and on purpose: same cursor, same
+     * hand-out, so splitting them in the report would claim there are two
+     * mechanisms where there is one. */
     g_region_pages.fetch_add(1, std::memory_order_relaxed);
     return reinterpret_cast<void *>(addr);
 }
@@ -2651,10 +2651,10 @@ void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
         size_t got = 0;
         const uintptr_t addr = region_pages(bytes, prot, &got);
         if (addr != 0) {
-            /* Y se comprueba la distancia de verdad, no se da por hecha: el
-             * cursor pudo haberse alejado mas que la ventana, y entonces esto
-             * no sirve para lo que se pidio aunque la memoria sea buena.
-             * Decirlo es lo que permite que quien llama lo sepa. */
+            /* And the distance is CHECKED, not assumed: the cursor may have run
+             * further than the window, and then this does not serve what was
+             * asked for even though the memory is fine.  Saying so is what lets
+             * the caller find out. */
             const uintptr_t a = reinterpret_cast<uintptr_t>(anchor);
             const uintptr_t dist = addr > a ? (addr - a) : (a - addr);
             if (dist <= window) {
@@ -2662,9 +2662,9 @@ void *host_alloc_pages(size_t bytes, OsProt prot, const void *anchor,
                 if (placed != nullptr) *placed = true;
                 return reinterpret_cast<void *>(addr);
             }
-            /* Demasiado lejos.  Las paginas se descomprometen -- el rango no
-             * vuelve, igual que el de un tramo que no cabe en el banco -- y se
-             * cae al camino de fuera, que al menos puede acertar. */
+            /* Too far.  The pages are decommitted -- the range does not come
+             * back, the same as a span that did not fit the bank -- and it
+             * falls to the outside path, which at least may get it right. */
             os_decommit(reinterpret_cast<void *>(addr), got);
         }
         g_exec_far.fetch_add(1, std::memory_order_relaxed);

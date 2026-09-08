@@ -508,6 +508,48 @@ if(VESTA_ALLOC_INTERPOSE_MALLOC)
 endif()
 
 # -----------------------------------------------------------------------------
+#  EL MODO COMPROBACION: un sanitizador propio del asignador
+# -----------------------------------------------------------------------------
+#
+# Caza fugas, dobles liberaciones, punteros ajenos, desbordamientos y escrituras
+# despues de liberar, y los dice con pila, `fichero:linea` y codigo de salida.
+#
+# POR QUE NUESTRO Y NO UNA HERRAMIENTA DE FUERA: valgrind es de Linux y en
+# Windows con este juego de herramientas no hay equivalente usable, asi que
+# remitir a la herramienta externa dejaria la MITAD de las plataformas sin poder
+# mirar su propia memoria.  Y sale barato porque lo caro ya esta hecho: las
+# puertas de reserva estan interpuestas en los dos sistemas, los simbolos se
+# resuelven con nuestro lector DWARF y la tabla de exportacion de PE -- sin
+# simbolizador externo -- y los permisos de pagina ya son nuestros.
+#
+# ES UNA MACRO, NO UNA VARIABLE DE ENTORNO, y por lo mismo que
+# `VESTA_ALLOC_SIZE_HISTOGRAM`: un portillo en ejecucion costaria una carga y un
+# salto POR RESERVA para no hacer nada, en todos los builds y para siempre.
+# Apagada, cada entrada del comprobador es una funcion en linea vacia y
+# `host_alloc`/`host_free` generan exactamente lo mismo que antes de que esto
+# existiera.
+#
+# Lo que SI se elige en ejecucion, dentro de un build que ya lo lleva dentro, es
+# cuanto comprueba: `VESTA_ALLOC_SAN` (nivel), `VESTA_ALLOC_SAN_POISON` (cuanto
+# se envenena) y `VESTA_ALLOC_SAN_GUARD` (que borde vigila la pagina de guarda).
+# Ahi un portillo no cuesta nada que merezca contarse -- ese build no existe
+# para ir rapido -- y poder bajar el coste sin recompilar es lo que hace que el
+# comprobador se llegue a usar.
+option(VESTA_ALLOC_SANITIZER
+        "Modo COMPROBACION: fugas, dobles liberaciones, desbordamientos y uso \
+despues de liberar, con pila y fichero:linea.  Apagado no cuesta nada" OFF)
+
+if(VESTA_ALLOC_SANITIZER)
+    target_sources(vesta_alloc PRIVATE src/alloc/sanitizer.cpp)
+    # PUBLIC porque cambia lo que hacen funciones EN LINEA de la cabecera: quien
+    # nos incluya tiene que compilarse con la misma idea, o su `host_alloc` y el
+    # nuestro dejarian de ser la misma funcion.
+    target_compile_definitions(vesta_alloc PUBLIC VESTA_ALLOC_SANITIZER=1)
+    message(STATUS "[vesta_alloc] modo COMPROBACION encendido: este build NO es "
+            "para medir tiempos")
+endif()
+
+# -----------------------------------------------------------------------------
 #  Y el fichero que DEFINE los simbolos, cuando se pide.  Ver la opcion arriba.
 # -----------------------------------------------------------------------------
 #
@@ -656,6 +698,14 @@ if(VESTA_ALLOC_BUILD_TESTS)
        CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT MSVC)
         list(APPEND _va_tests test_malloc_interpose)
     endif()
+    # La del modo COMPROBACION solo cuando el modo esta puesto.  Sin el, el
+    # test no probaria nada: sus entradas son funciones vacias y sus cuatro
+    # fallos a proposito no los caza nadie -- o sea que pasaria en verde
+    # diciendo que todo esta bien, que es exactamente lo que un comprobador no
+    # puede hacer.
+    if(VESTA_ALLOC_SANITIZER)
+        list(APPEND _va_tests test_sanitizer)
+    endif()
     foreach(_t IN ITEMS ${_va_tests})
         add_executable(vesta_alloc_${_t} tests/${_t}.cpp
                 $<TARGET_OBJECTS:vesta_alloc>)
@@ -670,6 +720,15 @@ if(VESTA_ALLOC_BUILD_TESTS)
             add_test(NAME vesta_alloc_${_t} COMMAND vesta_alloc_${_t})
         endif()
     endforeach()
+
+    # El del comprobador necesita su entorno, y las dos variables por una razon
+    # distinta cada una: el nivel, porque comprueba cosas que solo existen a
+    # partir del 3; y el codigo de salida, porque ese programa DEBE estar lleno
+    # de fallos y sin apagarlo el comprobador mataria al test que lo comprueba.
+    if(VESTA_ALLOC_SANITIZER AND VESTA_ALLOC_STANDALONE)
+        set_tests_properties(vesta_alloc_test_sanitizer PROPERTIES
+                ENVIRONMENT "VESTA_ALLOC_SAN=3;VESTA_ALLOC_SAN_EXITCODE=0")
+    endif()
 
     # -------------------------------------------------------------------------
     #  Que la documentacion BILINGUE lo sea de verdad

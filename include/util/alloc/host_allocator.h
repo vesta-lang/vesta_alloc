@@ -201,6 +201,9 @@
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator_c.h" // ahi se declara `HostAllocStats`, para C
 #include "util/alloc/host_allocator_layout.h"
+/* El modo COMPROBACION.  Apagado -- que es lo normal -- sus entradas son
+ * funciones en linea vacias y no queda ni una instruccion; ver el fichero. */
+#include "util/alloc/sanitizer.h"
 #include "util/alloc/size_buckets.h"
 /* `OsProt` y `OsNearScan`: los necesita `host_alloc_pages`, que entrega paginas
  * con permisos y dice si pudo colocarlas donde se le pidio. */
@@ -1319,6 +1322,50 @@ void host_free_outside(void *p) noexcept;
  */
 size_t direct_bytes(const void *p) noexcept;
 
+/**
+ * @brief
+ * \~english The allocation itself, with nothing wrapped around it.
+ * \~spanish La reserva en si, sin nada envuelto alrededor.
+ * \~
+ *
+ * \~english
+ * Split out of @c host_alloc so the CHECKING mode can wrap it from the outside
+ * (see `util/alloc/sanitizer.h`) without there being two copies of the fast
+ * path -- and two copies of a hot path is how they drift apart.  Always
+ * inlined, so with the checker off the caller emits exactly this and nothing
+ * more.
+ *
+ * \~spanish
+ * Separada de @c host_alloc para que el modo COMPROBACION la pueda envolver
+ * desde fuera (ver `util/alloc/sanitizer.h`) sin que existan dos copias del
+ * camino rapido -- y dos copias de un camino caliente es como acaban
+ * separandose --.  Siempre en linea, asi que con el comprobador apagado el
+ * llamante emite exactamente esto y nada mas.
+ * \~
+ */
+[[gnu::always_inline]] inline void *alloc_body(size_t n) noexcept {
+    /* Un solo salto cubre los dos casos raros: con `n == 0` la resta da el
+     * mayor sin signo, que tambien cae fuera.  Asi el tamano se valida sin
+     * gastar una segunda comparacion en algo que no pasa casi nunca. */
+    if (n - 1 >= kMaxSmall) return host_alloc_slow(n);
+    ThreadCache *c = current_cache();
+    /* One unsigned comparison for "no cache" and "this thread is already being
+     * torn down"; see @c kDyingCache.  It is the same single instruction the
+     * null test compiled to. */
+    if (!have_cache(c)) return host_alloc_slow(n);
+#if VESTA_ALLOC_SIZE_HISTOGRAM
+    /* El portillo del histograma de tamanos.  Con la medida apagada -- que es
+     * lo normal en produccion -- son una carga de un global y un salto por
+     * reserva para no hacer nada.  Compilarlo fuera es la unica forma de que no
+     * se paguen; ver `VESTA_ALLOC_SIZE_HISTOGRAM`. */
+    if (g_measure) record_size(c, n);
+#endif
+    const uint32_t k = class_of(n);
+    void *p = pop_block(c, k);
+    if (p == nullptr) return host_alloc_refill(c, k, n);
+    return p;
+}
+
 } // namespace detail
 
 /**
@@ -1385,25 +1432,15 @@ size_t direct_bytes(const void *p) noexcept;
  * @see host_free, host_alloc_zeroed, host_alloc_aligned
  */
 [[gnu::always_inline]] inline void *host_alloc(size_t n) noexcept {
-    /* Un solo salto cubre los dos casos raros: con `n == 0` la resta da el
-     * mayor sin signo, que tambien cae fuera.  Asi el tamano se valida sin
-     * gastar una segunda comparacion en algo que no pasa casi nunca. */
-    if (n - 1 >= kMaxSmall) return detail::host_alloc_slow(n);
-    detail::ThreadCache *c = detail::current_cache();
-    /* One unsigned comparison for "no cache" and "this thread is already being
-     * torn down"; see @c kDyingCache.  It is the same single instruction the
-     * null test compiled to. */
-    if (!detail::have_cache(c)) return detail::host_alloc_slow(n);
-#if VESTA_ALLOC_SIZE_HISTOGRAM
-    /* El portillo del histograma de tamanos.  Con la medida apagada -- que es
-     * lo normal en produccion -- son una carga de un global y un salto por
-     * reserva para no hacer nada.  Compilarlo fuera es la unica forma de que no
-     * se paguen; ver `VESTA_ALLOC_SIZE_HISTOGRAM`. */
-    if (detail::g_measure) detail::record_size(c, n);
-#endif
-    const uint32_t k = class_of(n);
-    void *p = detail::pop_block(c, k);
-    if (p == nullptr) return detail::host_alloc_refill(c, k, n);
+    /* THE CHECKING MODE goes around the outside, never through the middle.
+     * With `VESTA_ALLOC_SANITIZER` off, `san_grow` is the identity and
+     * `san_on_alloc` is an empty inline function, so what the compiler emits
+     * here is `detail::alloc_body(n)` and nothing else -- the same
+     * instructions, one for one, as before this mode existed.  See
+     * `util/alloc/sanitizer.h`. */
+    const size_t want = san_grow(n);
+    void *p = detail::alloc_body(want);
+    san_on_alloc(p, n);
     return p;
 }
 
@@ -1581,7 +1618,24 @@ size_t direct_bytes(const void *p) noexcept;
  *
  * @see host_alloc, host_free_aligned
  */
-[[gnu::always_inline]] inline void host_free(void *p) noexcept {
+namespace detail {
+
+/**
+ * @brief
+ * \~english The release itself, with nothing wrapped around it.
+ * \~spanish La liberacion en si, sin nada envuelto alrededor.
+ * \~
+ *
+ * \~english
+ * The twin of @c detail::alloc_body, split for the same reason and with the
+ * same promise: with the checker off the caller emits exactly this.
+ *
+ * \~spanish
+ * La gemela de @c detail::alloc_body, separada por lo mismo y con la misma
+ * promesa: con el comprobador apagado el llamante emite exactamente esto.
+ * \~
+ */
+[[gnu::always_inline]] inline void free_body(void *p) noexcept {
     if (p == nullptr) return;
     if (!in_region(p)) {
         /* Aqui no llega NUNCA un bloque pequeno, y por eso la region de las
@@ -1614,6 +1668,21 @@ size_t direct_bytes(const void *p) noexcept;
         return;
     }
     detail::host_free_remote(p, h);
+}
+
+} // namespace detail
+
+[[gnu::always_inline]] inline void host_free(void *p) noexcept {
+    /* THE CHECKING MODE, from the outside again, and here it can also say NO:
+     * on a double free it answers false and the block is NOT put back on any
+     * list.  Freeing it twice would hand one block to two owners, so a checker
+     * that reported the bug and then let it through would have turned a
+     * warning into a corrupted heap.
+     *
+     * With `VESTA_ALLOC_SANITIZER` off this is an inline `true` and the branch
+     * disappears; see `util/alloc/sanitizer.h`. */
+    if (!san_on_free(p)) return;
+    detail::free_body(p);
 }
 
 /**
