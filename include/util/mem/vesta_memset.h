@@ -59,6 +59,7 @@
 #include "util/mem/x86/sse2_memset.h"
 #if defined(VESTA_MEM_ARCH_X86_64)
 #include "util/mem/x86/avx2_memset.h"
+#include "util/mem/x86/nt_memset.h"
 #include "util/mem/x86/x86_cpu.h"
 #endif
 #elif VESTA_ALLOC_FREESTANDING
@@ -142,6 +143,22 @@ vesta_mem_fill_dispatch(void *dst, uint8_t v, size_t n, int wide,
 #if defined(VESTA_MEM_ARCH_X86)
     if (n <= 128) {
         vesta_mem_sse2_fill_le128(d, vesta_mem_x86_splat16(v), n);
+        return;
+    }
+    /* PASADA LA CACHE, sin pasar por ella.  Va ANTES que `rep stosb` porque es
+     * el caso que ese camino peor lleva: ahi cada linea se lee antes de
+     * sobreescribirla y se desaloja lo que hubiera, para un bloque que no cabe.
+     * Medido, 64 MiB: 15 GB/s por las caches contra 52 sin ellas.  El umbral no
+     * es una constante -- es el ultimo nivel de cache, y se pregunta --; ver
+     * `nt_memset.h`, que lleva la tabla entera de por que esta ahi. */
+    if (vesta_mem_nt_worth_it(n)) {
+#if defined(VESTA_MEM_ARCH_X86_64)
+        if (wide && vesta_mem_x86_has_avx2()) {
+            vesta_mem_nt_fill32(d, v, n);
+            return;
+        }
+#endif
+        vesta_mem_nt_fill16(d, v, n);
         return;
     }
     if (n >= VESTA_MEM_ERMS_MIN_FILL && vesta_mem_x86_has_erms()) {

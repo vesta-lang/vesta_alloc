@@ -280,6 +280,79 @@ void noinline_variants() {
     }
 }
 
+/**
+ * @brief Rellenar un bloque MAYOR QUE LA CACHE, que es otro camino.
+ *
+ * Pasado el ultimo nivel de cache el relleno deja de escribir por las caches y
+ * usa almacenes no temporales, que son la clase de instruccion con la que un
+ * error no se nota: escriben bien el grueso y se salen por la cabeza o por la
+ * cola, o dejan de ser visibles por faltar la barrera.  Nada de eso lo pilla un
+ * caso de 300 bytes, que es hasta donde llegaba este fichero.
+ *
+ * El tamano se DERIVA de la cache, no se escribe: en otra maquina el camino
+ * empieza en otro sitio, y un test con la cifra dentro dejaria de probarlo sin
+ * decir nada.
+ */
+void past_the_cache() {
+#if !defined(VESTA_MEM_ARCH_X86_64)
+    /* DICIENDOLO.  Sin esta linea, un fichero donde la macro de arquitectura no
+     * llegue compila el caso entero fuera y el test sale verde habiendo
+     * probado cero -- que es peor que fallar. */
+    std::printf("  (no es x86-64: no hay camino no temporal que comprobar)\n");
+#else
+    const unsigned int llc = vesta_mem_x86_llc_bytes();
+    if (llc == VESTA_MEM_X86_LLC_UNKNOWN) {
+        std::printf("  (la CPU no describe su cache: el camino no temporal no "
+                    "se usa aqui, nada que comprobar)\n");
+        return;
+    }
+    std::printf("  cache de ultimo nivel: %.1f MiB -> se prueban %.0f y %.0f\n",
+                (double)llc / 1048576.0, (double)(llc + (1u << 20)) / 1048576.0,
+                (double)(llc - (1u << 20)) / 1048576.0);
+
+    /* Uno por encima de la raya y otro por debajo: el primero recorre el camino
+     * nuevo, el segundo confirma que la raya esta donde se cree y que el de
+     * siempre sigue dando lo mismo. */
+    const size_t sizes[] = {size_t(llc) + (1u << 20), size_t(llc) - (1u << 20)};
+    for (size_t n : sizes) {
+        // Desalineados a proposito, que es donde viven la cabeza y la cola.
+        for (size_t off : {size_t(0), size_t(1), size_t(17), size_t(31)}) {
+            Guarded dst(n + off);
+            util::vesta_memset(dst.data() + off, 0x3C, n);
+            bool ok = true;
+            const uint8_t *p = dst.data() + off;
+            for (size_t i = 0; i < n && ok; ++i)
+                if (p[i] != 0x3C) ok = false;
+            check(ok, "vesta_memset pasada la cache: contenido");
+            check(dst.intact(n + off),
+                  "vesta_memset pasada la cache: se escribio fuera");
+        }
+    }
+
+    /* Y las dos rutinas a pelo con tamanos que el despacho NUNCA les manda --
+     * por debajo de su propio minimo --, porque esa rama existe: son publicas y
+     * quien las llame no tiene por que saber donde empieza a compensar. */
+    for (size_t n : {size_t(0), size_t(1), size_t(15), size_t(31), size_t(63),
+                     size_t(127)}) {
+        Guarded a(n);
+        vesta_mem_nt_fill16(a.data(), 0x77, n);
+        bool ok16 = true;
+        for (size_t i = 0; i < n; ++i)
+            if (a.data()[i] != 0x77) ok16 = false;
+        check(ok16 && a.intact(n), "nt_fill16 por debajo de su minimo");
+
+        if (vesta_mem_x86_has_avx2()) {
+            Guarded b(n);
+            vesta_mem_nt_fill32(b.data(), 0x77, n);
+            bool ok32 = true;
+            for (size_t i = 0; i < n; ++i)
+                if (b.data()[i] != 0x77) ok32 = false;
+            check(ok32 && b.intact(n), "nt_fill32 por debajo de su minimo");
+        }
+    }
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -297,6 +370,7 @@ int main() {
             one_move(n, shift);
 
     dispatch_paths();
+    past_the_cache();
     inline_variants();
     noinline_variants();
     typed_layer();

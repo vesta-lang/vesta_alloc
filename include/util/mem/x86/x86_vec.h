@@ -140,6 +140,78 @@ typedef uint8_t vesta_v32a __attribute__((vector_size(32), may_alias));
 #define VESTA_MEM_STORE32A(p, v) (*(vesta_v32a *)(p) = (v))
 
 /**
+ * @def VESTA_MEM_STORENT16
+ * @def VESTA_MEM_STORENT32
+ * @def VESTA_MEM_FENCE_NT
+ * @brief
+ * \~english Aligned writes that DO NOT go through the caches, and the fence
+ *           they require.
+ * \~spanish Escrituras alineadas que NO pasan por las caches, y la barrera que
+ *           exigen.
+ * \~
+ *
+ * \~english
+ * A normal write reads the line it is about to overwrite -- to own it -- and
+ * leaves it in cache, evicting whatever was there.  For a block bigger than the
+ * cache both halves of that are waste: the read is thrown away immediately and
+ * there is nothing worth keeping.  These write whole lines straight to memory
+ * instead.  Measured filling and then reading the block back, streaming stops
+ * losing on ANY fraction read past the last level of cache, and by 64 MiB it is
+ * 2 to 3 times the bandwidth -- see @c vesta_mem_x86_llc_bytes, which is what
+ * decides when they are used.
+ *
+ * THE FENCE IS NOT TIDINESS.  Non-temporal stores are weakly ordered against
+ * everything else, so without it a later read -- another thread's, or this
+ * one's through another path -- may not see them.  It goes once at the end of
+ * the fill, not per store.
+ *
+ * ONE FORM PER COMPILER, and the reason is a trap that would not have shown up
+ * until link time: GCC 10 accepts `__builtin_nontemporal_store`, emits an
+ * ORDINARY store for it and leaves the name as an UNDEFINED SYMBOL -- checked
+ * with `nm -u`.  So the code would have compiled, written through the caches,
+ * and failed to link, in that order.  Clang has no `__builtin_ia32_movntdq`.
+ * Neither one covers both.
+ *
+ * \~spanish
+ * Una escritura normal lee la linea que va a sobreescribir -- para hacerla
+ * suya -- y la deja en cache, desalojando lo que hubiera.  Para un bloque mayor
+ * que la cache las dos mitades sobran: la lectura se tira en el acto y no hay
+ * nada que merezca la pena conservar.  Estas escriben lineas enteras
+ * directamente a memoria.  Medido rellenando y leyendo despues el bloque, el no
+ * temporal deja de perder en CUALQUIER fraccion leida pasado el ultimo nivel de
+ * cache, y a 64 MiB da de 2 a 3 veces el ancho de banda -- ver
+ * @c vesta_mem_x86_llc_bytes, que es quien decide cuando se usan.
+ *
+ * LA BARRERA NO ES UN ADORNO.  Los almacenes no temporales estan debilmente
+ * ordenados respecto a todo lo demas, asi que sin ella una lectura posterior --
+ * de otro hilo, o de este por otro camino -- puede no verlos.  Va una vez al
+ * final del relleno, no por almacen.
+ *
+ * UNA FORMA POR COMPILADOR, y el motivo es una trampa que no habria aparecido
+ * hasta enlazar: GCC 10 acepta `__builtin_nontemporal_store`, emite un almacen
+ * NORMAL y deja el nombre como SIMBOLO SIN RESOLVER -- comprobado con
+ * `nm -u` --.  O sea que el codigo habria compilado, escrito por las caches y
+ * fallado al enlazar, en ese orden.  Clang no tiene
+ * `__builtin_ia32_movntdq`.  Ninguno de los dos cubre a los dos.
+ *
+ * \~
+ */
+#if defined(VESTA_MEM_COMPILER_GCC)
+typedef long long vesta_v2di __attribute__((vector_size(16)));
+typedef long long vesta_v4di __attribute__((vector_size(32)));
+#define VESTA_MEM_STORENT16(p, v)                                             \
+    __builtin_ia32_movntdq((vesta_v2di *)(p), (vesta_v2di)(v))
+#define VESTA_MEM_STORENT32(p, v)                                             \
+    __builtin_ia32_movntdq256((vesta_v4di *)(p), (vesta_v4di)(v))
+#else
+#define VESTA_MEM_STORENT16(p, v)                                             \
+    __builtin_nontemporal_store((v), (vesta_v16a *)(p))
+#define VESTA_MEM_STORENT32(p, v)                                             \
+    __builtin_nontemporal_store((v), (vesta_v32a *)(p))
+#endif
+#define VESTA_MEM_FENCE_NT() __builtin_ia32_sfence()
+
+/**
  * @brief
  * \~english How many bytes have to be copied unaligned for @p d to end up
  *          aligned to @p a.

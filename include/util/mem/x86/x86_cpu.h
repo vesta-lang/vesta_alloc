@@ -325,6 +325,185 @@ VESTA_MEM_ALWAYS_INLINE int vesta_mem_x86_has_erms(void) VESTA_MEM_NOEXCEPT {
 #endif
 }
 
+/**
+ * @def VESTA_MEM_X86_LLC_UNKNOWN
+ * @brief
+ * \~english What @c vesta_mem_x86_llc_bytes answers when the CPU does not say.
+ * \~spanish Lo que contesta @c vesta_mem_x86_llc_bytes cuando la CPU no lo
+ *           dice.
+ * \~
+ *
+ * \~english
+ * It is 4 GiB minus one and not zero ON PURPOSE.  Whoever asks is comparing a
+ * size against it to decide whether to bypass the caches, and a huge answer
+ * makes every real block fall on the SAFE side -- the path that is used today
+ * -- with no special case to write and none to forget.  Zero would do the
+ * opposite and turn "the CPU did not say" into "bypass everything".
+ *
+ * \~spanish
+ * Es 4 GiB menos uno y no cero A PROPOSITO.  Quien pregunta compara un tamano
+ * contra esto para decidir si se salta las caches, y una respuesta enorme deja
+ * todo bloque real del lado SEGURO -- el camino de hoy --, sin ningun caso
+ * especial que escribir ni que olvidar.  Cero haria lo contrario y convertiria
+ * "la CPU no lo dijo" en "saltarselo todo".
+ *
+ * \~
+ */
+#define VESTA_MEM_X86_LLC_UNKNOWN 0xFFFFFFFFu
+
+/// \~english The last level cache, in bytes.  Zero while it has not been asked.
+/// \~spanish La cache de ultimo nivel, en bytes.  Cero mientras no se pregunte.
+/// \~
+static unsigned int vesta_mem_x86_llc_state = 0;
+
+/**
+ * @brief
+ * \~english Asks @c CPUID how big the last level of cache is.
+ * \~spanish Pregunta con @c CPUID cuanto mide el ultimo nivel de cache.
+ * \~
+ *
+ * \~english
+ * WHAT IT IS FOR, because a cache size is a strange thing for a memory
+ * primitive to want: it is the line above which a fill should stop going
+ * through the caches.  Writing through them reads every line before overwriting
+ * it and evicts whatever was there; a streaming store does neither.  Below the
+ * cache that trade is bad -- the block was going to be useful where it landed
+ * -- and above it there is nothing to keep, so the read is pure waste.
+ * Measured on Raptor Lake, filling and then reading the block back: streaming
+ * stops losing on ANY fraction read between 24 and 28 MiB, with a 30 MB cache.
+ * So the threshold is the cache, and it is asked for rather than written down.
+ *
+ * The walk is @c CPUID leaf 4, which describes one cache per subleaf until it
+ * reports type 0.  AMD says the same thing in leaf @c 0x8000001D with the same
+ * layout, so the same loop reads both; the older AMD leaf @c 0x80000006 is not
+ * consulted, and a CPU that only has that one comes out as unknown, which lands
+ * on the safe path.
+ *
+ * @par Threads
+ * Safe.  Two threads racing compute the SAME value from the same instruction
+ * and store it; there is no state that a torn read could break.
+ *
+ * \~spanish
+ * PARA QUE SIRVE, porque el tamano de una cache es algo raro que querer en una
+ * primitiva de memoria: es la raya por encima de la cual un relleno debe dejar
+ * de pasar por las caches.  Escribir por ellas lee cada linea antes de
+ * sobreescribirla y desaloja lo que hubiera; un almacen no temporal no hace
+ * ninguna de las dos.  Por debajo de la cache ese cambio es malo -- el bloque
+ * iba a servir donde cayo -- y por encima no hay nada que conservar, asi que la
+ * lectura se tira.  Medido en Raptor Lake, rellenando y leyendo despues el
+ * bloque: el no temporal deja de perder en CUALQUIER fraccion leida entre 24 y
+ * 28 MiB, con una cache de 30 MB.  Asi que el umbral es la cache, y se
+ * pregunta en vez de escribirse.
+ *
+ * El recorrido es la hoja 4 de @c CPUID, que describe una cache por subhoja
+ * hasta contestar tipo 0.  AMD dice lo mismo en la hoja @c 0x8000001D con el
+ * mismo formato, asi que el mismo bucle lee las dos; la hoja vieja de AMD
+ * @c 0x80000006 no se consulta, y una CPU que solo tenga esa sale como
+ * desconocida, que cae en el camino seguro.
+ *
+ * @par Hilos
+ * Segura.  Dos hilos a la vez calculan el MISMO valor de la misma instruccion y
+ * lo guardan; no hay estado que una lectura partida pueda romper.
+ *
+ * \~
+ * @return
+ * \~english the size in bytes, or @c VESTA_MEM_X86_LLC_UNKNOWN.
+ * \~spanish el tamano en bytes, o @c VESTA_MEM_X86_LLC_UNKNOWN.
+ * \~
+ */
+VESTA_MEM_INLINE unsigned int
+vesta_mem_x86_detect_llc(void) VESTA_MEM_NOEXCEPT {
+    unsigned int best = 0;      // bytes of the deepest cache seen
+    unsigned int best_level = 0; // and which level that was
+
+    /* Intel's leaf and AMD's say the same thing in the same registers, so the
+     * loop is written once and pointed at whichever exists. */
+    uint32_t leaf = 0;
+    if (vesta_mem_x86_cpuid_max() >= 4) {
+        leaf = 4;
+    } else if (vesta_mem_x86_cpuid(0x80000000u, 0).eax >= 0x8000001Du) {
+        leaf = 0x8000001Du;
+    }
+
+    if (leaf != 0) {
+        /* A bound and not `while (1)`: a CPU that never reports type 0 -- a
+         * virtual machine making it up, which is where this runs today --
+         * would spin here forever.  Sixteen is far past any real topology. */
+        for (uint32_t i = 0; i < 16; ++i) {
+            const vesta_cpuid_regs c = vesta_mem_x86_cpuid(leaf, i);
+            const unsigned int type = c.eax & 0x1Fu;
+            if (type == 0) break;          // no more caches described
+            if (type == 2) continue;       // instructions: not what fills go to
+            const unsigned int level = (c.eax >> 5) & 0x7u;
+            if (level < best_level) continue;
+
+            /* size = ways * partitions * line * sets, every field stored one
+             * less than it is. */
+            const unsigned int ways = ((c.ebx >> 22) & 0x3FFu) + 1u;
+            const unsigned int parts = ((c.ebx >> 12) & 0x3FFu) + 1u;
+            const unsigned int line = (c.ebx & 0xFFFu) + 1u;
+            const unsigned int sets = c.ecx + 1u;
+            const unsigned int bytes = ways * parts * line * sets;
+            if (bytes != 0) {
+                best = bytes;
+                best_level = level;
+            }
+        }
+    }
+
+    const unsigned int answer = best != 0 ? best : VESTA_MEM_X86_LLC_UNKNOWN;
+    __atomic_store_n(&vesta_mem_x86_llc_state, answer, __ATOMIC_RELAXED);
+    return answer;
+}
+
+/**
+ * @brief
+ * \~english How big the last level of cache is, in bytes.
+ * \~spanish Cuanto mide el ultimo nivel de cache, en bytes.
+ * \~
+ *
+ * \~english
+ * The same shape as @c vesta_mem_x86_features: one relaxed load and a branch
+ * that is right every time but the first.
+ *
+ * @par Threads
+ * Safe.
+ *
+ * \~spanish
+ * La misma forma que @c vesta_mem_x86_features: una lectura relajada y una rama
+ * que acierta siempre menos la primera vez.
+ *
+ * @par Hilos
+ * Segura.
+ *
+ * \~
+ * @return
+ * \~english the size in bytes, or @c VESTA_MEM_X86_LLC_UNKNOWN when the CPU
+ *           does not describe it.
+ * \~spanish el tamano en bytes, o @c VESTA_MEM_X86_LLC_UNKNOWN cuando la CPU no
+ *           lo describe.
+ * \~
+ *
+ * \~english
+ * @code
+ *   if (n >= vesta_mem_x86_llc_bytes()) { ... }   // past the caches
+ * @endcode
+ *
+ * \~spanish
+ * @code
+ *   if (n >= vesta_mem_x86_llc_bytes()) { ... }   // pasada la cache
+ * @endcode
+ *
+ * \~
+ */
+VESTA_MEM_ALWAYS_INLINE unsigned int
+vesta_mem_x86_llc_bytes(void) VESTA_MEM_NOEXCEPT {
+    const unsigned int v =
+        __atomic_load_n(&vesta_mem_x86_llc_state, __ATOMIC_RELAXED);
+    if (v != 0) return v;
+    return vesta_mem_x86_detect_llc();
+}
+
 #endif // VESTA_MEM_ARCH_X86_64
 
 #endif // VESTA_UTIL_MEM_X86_CPU_H

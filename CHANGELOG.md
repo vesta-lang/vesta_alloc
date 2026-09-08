@@ -74,6 +74,43 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Cambiado
 
+- **`vesta_memset` deja de pasar por las caches cuando el bloque no cabe en
+  ellas.**  Escribir por la cache lee cada linea antes de sobreescribirla --
+  para hacer suyo un valor que nadie va a mirar -- y desaloja lo que hubiera
+  para hacer sitio a un bloque que no va a caber.  Pasada la cache las dos
+  mitades sobran, y un almacen no temporal no hace ninguna.
+
+  Lo que costaba, con el bloque ya residente (sin fallos de pagina en la
+  medida): **nosotros caiamos de 47 a 15 GB/s entre 8 y 64 MiB, y glibc se
+  quedaba plana en 43-48** porque ya hacia esto.  A 64 MiB eran 2,83x.  En
+  Windows no se veia, y por eso no habia salido: msvcrt tampoco los usa, asi
+  que ahi empatabamos y nos hundiamos los dos.  El banco de estas primitivas no
+  llega a estos tamanos -- por debajo de la ultima cache el coste es del bucle
+  y por encima es de como se habla con la memoria, y son dos problemas
+  distintos.
+
+  Ahora: **1,00x contra glibc a 32 MiB y 1,03x a 64** (eran 2,89x y 2,83x), y
+  **2,88x y 3,14x MEJOR que msvcrt**, que sigue sin hacerlo.
+
+  EL UMBRAL NO ES UNA CONSTANTE: es el ultimo nivel de cache, preguntado con
+  `CPUID`.  Sale de medir el caso completo -- rellenar y leer despues una
+  fraccion --, no solo el relleno: leyendo poco el no temporal gana desde
+  16 MiB, pero leyendo entero pierde hasta 1,49x, y **deja de perder en
+  cualquier fraccion entre 24 y 28 MiB, con una cache de 30 MB**.  Una CPU que
+  no describa su cache contesta un tamano al que no llega ningun bloque, asi
+  que se queda el camino de antes sin ningun caso especial que escribir.
+
+  Dos cosas que estan donde se deciden: la barrera al final del relleno no es
+  un adorno -- los almacenes no temporales estan debilmente ordenados y sin ella
+  una lectura posterior puede no verlos --, y hace falta **una forma por
+  compilador**, porque GCC 10 acepta `__builtin_nontemporal_store`, emite un
+  almacen NORMAL y deja el nombre como simbolo SIN RESOLVER (comprobado con
+  `nm -u`): habria compilado, escrito por las caches y fallado al enlazar, en
+  ese orden.
+
+  PENDIENTE: `vesta_memcpy` tiene el mismo agujero, medido -- 1,06x a 1,58x por
+  detras de la libc entre 8 y 64 MiB --, y es el mismo arreglo.
+
 - **Lo que pasa de 16 MiB lo sirve el SISTEMA, en una reserva propia.**  Esa
   cifra no es un gusto: es `kMaxSpanChunks` por `kChunkBytes`, o sea el tramo
   mas grande que la region puede RECICLAR.  Por encima, cada reserva
@@ -441,6 +478,41 @@ invita a creer que ampara.
   leaves out is always counted.
 
 ### Changed
+
+- **`vesta_memset` stops going through the caches when the block does not fit
+  in them.**  Writing through the cache reads every line before overwriting it
+  -- to take ownership of a value nobody will ever look at -- and evicts
+  whatever was there to make room for a block that will not fit anyway.  Past
+  the cache both halves are waste, and a non-temporal store does neither.
+
+  What it cost, with the block already resident (no page faults in the
+  measurement): **we fell from 47 to 15 GB/s between 8 and 64 MiB, and glibc
+  stayed flat at 43-48** because it already did this.  At 64 MiB that was 2.83x.
+  It was invisible on Windows, which is why it had not come up: msvcrt does not
+  do it either, so there we tied and both sank.  These primitives' own benchmark
+  does not reach these sizes -- below the last level of cache the cost is the
+  loop and above it is how it talks to memory, and those are two problems.
+
+  Now: **1.00x against glibc at 32 MiB and 1.03x at 64** (from 2.89x and 2.83x),
+  and **2.88x and 3.14x BETTER than msvcrt**, which still does not do it.
+
+  THE THRESHOLD IS NOT A CONSTANT: it is the last level of cache, asked for with
+  `CPUID`.  It comes from measuring the whole case -- fill and then read a
+  fraction back -- and not the fill alone: reading little, streaming wins from
+  16 MiB, but reading all of it loses by up to 1.49x, and it **stops losing on
+  any fraction between 24 and 28 MiB, with a 30 MB cache**.  A CPU that does not
+  describe its cache answers a size no block reaches, so the older path stays
+  with no special case to write.
+
+  Two things live where they are decided: the fence at the end of the fill is
+  not tidiness -- non-temporal stores are weakly ordered and without it a later
+  read may not see them -- and it takes **one form per compiler**, because GCC
+  10 accepts `__builtin_nontemporal_store`, emits an ORDINARY store for it and
+  leaves the name as an UNDEFINED SYMBOL (checked with `nm -u`): it would have
+  compiled, written through the caches, and failed to link, in that order.
+
+  STILL OPEN: `vesta_memcpy` has the same hole, measured -- 1.06x to 1.58x
+  behind the C library between 8 and 64 MiB -- and it is the same fix.
 
 - **Anything over 16 MiB is served by the SYSTEM, on a reservation of its own.**
   That figure is not a taste: it is `kMaxSpanChunks` times `kChunkBytes`, which
