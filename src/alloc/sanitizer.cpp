@@ -390,6 +390,73 @@ Slot *slot_of(const void *p, size_t *block_bytes) noexcept {
 }
 
 // =========================================================================
+//  Pages of its own, with a guard behind them
+// =========================================================================
+
+/**
+ * @brief What is known about a block that lives on pages of its own.
+ *
+ * A SIDE TABLE and not a header in front of the block, and the reason is the
+ * whole trick: the block is placed FLUSH against the guard page, so there is no
+ * room behind it, and what is in front of it is a variable amount of slack that
+ * cannot be found again from the pointer alone.
+ */
+struct Guarded {
+    std::atomic<const void *> p; ///< what the caller holds; nullptr = free slot
+    const void *base;            ///< the first page of the reservation
+    size_t total;                ///< bytes reserved, guard page included
+    size_t req;                  ///< what the caller asked for
+    size_t tail;                 ///< bytes between the block and the guard
+    uint32_t alloc_stack;
+    uint32_t free_stack;
+    uint32_t state;
+};
+
+/// Open addressing, never evicting.  Full is COUNTED and the level falls back
+/// for that allocation, which is loud; evicting would lose a block's identity
+/// and turn a use-after-free into a wrong accusation.
+constexpr uint32_t kGuardSlots = 1u << 16;
+Guarded *g_guarded = nullptr;
+std::atomic<uint64_t> g_guard_full{0};
+std::atomic<uint64_t> g_guard_bytes{0};
+
+uint32_t guard_hash(const void *p) noexcept {
+    uint64_t v = reinterpret_cast<uintptr_t>(p) >> 4;
+    v *= 0x9E3779B97F4A7C15ull;
+    return uint32_t(v >> 48) & (kGuardSlots - 1);
+}
+
+/// The entry for @p p, or nullptr.  Never inserts: looking up must not create.
+Guarded *guard_find(const void *p) noexcept {
+    if (g_guarded == nullptr) return nullptr;
+    uint32_t i = guard_hash(p);
+    for (uint32_t probe = 0; probe < kGuardSlots; ++probe) {
+        Guarded &g = g_guarded[i];
+        const void *cur = g.p.load(std::memory_order_acquire);
+        if (cur == p) return &g;
+        if (cur == nullptr && g.base == nullptr) return nullptr; // never used
+        i = (i + 1) & (kGuardSlots - 1);
+    }
+    return nullptr;
+}
+
+Guarded *guard_insert(const void *p) noexcept {
+    if (g_guarded == nullptr) return nullptr;
+    uint32_t i = guard_hash(p);
+    for (uint32_t probe = 0; probe < kGuardSlots; ++probe) {
+        Guarded &g = g_guarded[i];
+        const void *expected = nullptr;
+        if (g.p.load(std::memory_order_relaxed) == nullptr &&
+            g.p.compare_exchange_strong(expected, p, std::memory_order_acq_rel,
+                                        std::memory_order_relaxed))
+            return &g;
+        i = (i + 1) & (kGuardSlots - 1);
+    }
+    g_guard_full.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+// =========================================================================
 //  Saying it
 // =========================================================================
 
@@ -536,50 +603,22 @@ unsigned env_num(const char *name, unsigned def, unsigned max) noexcept {
  * the allocator is already answering, and a constructor runs at a moment nobody
  * chose.
  */
-bool ensure_ready() noexcept {
-    static std::atomic<int> cfg{0}; // 0 = untouched, 1 = doing it, 2 = done
-    int st = cfg.load(std::memory_order_acquire);
-    if (st != 2) {
-        int expected = 0;
-        if (cfg.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
-                                        std::memory_order_acquire)) {
-            detail::g_san_level =
-                SanLevel(env_num("VESTA_ALLOC_SAN", unsigned(SanLevel::Track),
-                                 unsigned(SanLevel::Guard)));
-            g_poison = SanPoison(env_num("VESTA_ALLOC_SAN_POISON",
-                                         unsigned(SanPoison::Line),
-                                         unsigned(SanPoison::Whole)));
-            g_guard_edge = SanGuard(env_num("VESTA_ALLOC_SAN_GUARD",
-                                            unsigned(SanGuard::Overflow),
-                                            unsigned(SanGuard::Underflow)));
-            g_exit_code = env_num("VESTA_ALLOC_SAN_EXITCODE", 1, 2);
+/**
+ * @brief The knobs, the depot and the guarded table.  Everything but the
+ *        shadow.
+ *
+ * SEPARATE FROM THE SHADOW because they become usable at different moments, and
+ * tying them together made the guard level never run: the shadow needs the
+ * allocator's region, which on the very first allocation of the process does
+ * not exist yet -- and a guarded block does not need the shadow at all, since
+ * it lives on pages of its own with its own table.  Asking for both meant the
+ * first allocation was never guarded, and in a program whose first allocation
+ * is the one being tested, that means NONE of them were.
+ */
+bool ensure_config() noexcept;
 
-            /* THE LEVEL THAT IS NOT BUILT YET SAYS SO.  Answering to
-             * `SanLevel::Guard` by quietly doing what `Poison` does would be a
-             * checker claiming to watch every write when it watches none of
-             * them until the block comes back -- the exact silence this whole
-             * mode exists to avoid.  So it is announced, and what it actually
-             * does is stated. */
-            if (detail::g_san_level == SanLevel::Guard) {
-                std::fprintf(stderr,
-                             "[allocator/check] level %u (a page per block) is "
-                             "NOT BUILT YET: running at level %u instead, which "
-                             "catches an overflow when the block is released "
-                             "and not at the instant of the write\n",
-                             unsigned(SanLevel::Guard),
-                             unsigned(SanLevel::Poison));
-                detail::g_san_level = SanLevel::Poison;
-            }
-            void *depot = os_alloc(sizeof(Stack) * kDepotSlots, kOsReadWrite);
-            if (depot != nullptr) {
-                std::memset(depot, 0, sizeof(Stack) * kDepotSlots);
-                g_depot = static_cast<Stack *>(depot);
-            }
-            cfg.store(2, std::memory_order_release);
-        } else {
-            return false; // somebody else is in there; sit this one out
-        }
-    }
+bool ensure_ready() noexcept {
+    if (!ensure_config()) return false;
     if (detail::g_san_level == SanLevel::Off) return false;
     if (g_rows != nullptr) return true;
 
@@ -609,6 +648,55 @@ bool ensure_ready() noexcept {
     return true;
 }
 
+bool ensure_config() noexcept {
+    static std::atomic<int> cfg{0}; // 0 = untouched, 1 = doing it, 2 = done
+    int st = cfg.load(std::memory_order_acquire);
+    if (st != 2) {
+        int expected = 0;
+        if (cfg.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+            detail::g_san_level =
+                SanLevel(env_num("VESTA_ALLOC_SAN", unsigned(SanLevel::Track),
+                                 unsigned(SanLevel::Guard)));
+            g_poison = SanPoison(env_num("VESTA_ALLOC_SAN_POISON",
+                                         unsigned(SanPoison::Line),
+                                         unsigned(SanPoison::Whole)));
+            g_guard_edge = SanGuard(env_num("VESTA_ALLOC_SAN_GUARD",
+                                            unsigned(SanGuard::Overflow),
+                                            unsigned(SanGuard::Underflow)));
+            g_exit_code = env_num("VESTA_ALLOC_SAN_EXITCODE", 1, 2);
+
+            /* The table for the guarded blocks, and only when that level was
+             * asked for: it is two and a half megabytes, and a level that is
+             * not in force should not cost them. */
+            if (detail::g_san_level >= SanLevel::Guard) {
+                void *t = os_alloc(sizeof(Guarded) * kGuardSlots, kOsReadWrite);
+                if (t != nullptr) {
+                    std::memset(t, 0, sizeof(Guarded) * kGuardSlots);
+                    g_guarded = static_cast<Guarded *>(t);
+                } else {
+                    std::fprintf(stderr,
+                                 "[allocator/check] no room for the table of "
+                                 "guarded blocks: dropping to level %u, which "
+                                 "catches an overflow when the block is "
+                                 "released and not where it happens\n",
+                                 unsigned(SanLevel::Poison));
+                    detail::g_san_level = SanLevel::Poison;
+                }
+            }
+            void *depot = os_alloc(sizeof(Stack) * kDepotSlots, kOsReadWrite);
+            if (depot != nullptr) {
+                std::memset(depot, 0, sizeof(Stack) * kDepotSlots);
+                g_depot = static_cast<Stack *>(depot);
+            }
+            cfg.store(2, std::memory_order_release);
+        } else {
+            return false; // somebody else is in there; sit this one out
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 // =========================================================================
@@ -633,10 +721,148 @@ size_t san_grow(size_t n) noexcept {
     return n + kCanaryBytes;
 }
 
+/**
+ * @brief A block on pages of its own, flush against a page that is not mapped.
+ *
+ * HOW IT CATCHES THE WRITE AND NOT ITS CONSEQUENCE.  The pages are asked for
+ * with one MORE at the end, and that last one is left unmapped.  The block is
+ * then put at the far end of the mapped ones, so `p + req` lands on the guard:
+ * a write one byte past the end touches memory that does not exist and the
+ * process faults THERE, with the real address and the real stack, instead of
+ * quietly corrupting a neighbour and being found out somewhere else an hour
+ * later.  No compiler pass anywhere -- this is the hardware doing the check.
+ *
+ * THE GAP, and it is why the canary is still written.  What comes back has to
+ * be aligned like any other allocation, so the block is pushed DOWN to the
+ * alignment and that leaves up to fifteen bytes between its end and the guard.
+ * An overflow that small lands in the gap and the page never notices.  Those
+ * bytes carry the canary, so the gap is checked when the block is released --
+ * small overflows late, big ones instantly, and nothing in between missed.
+ *
+ * WHAT IT COSTS, and it is not a detail: the smallest allocation there is takes
+ * two pages, and the range is NEVER given back -- releasing only takes the
+ * pages away, so the addresses stay spent and a use-after-free keeps faulting
+ * for the life of the process.  That is the point, and it is also why this is
+ * nobody's default.
+ */
+void *san_alloc_guarded(size_t n) noexcept {
+    /* The CONFIG and not the whole set-up: a guarded block does not touch the
+     * shadow, so waiting for the shadow would keep the very first allocation of
+     * the process -- and in a small program, every allocation -- out of the
+     * level that was asked for. */
+    if (!ensure_config() || detail::g_san_level < SanLevel::Guard)
+        return nullptr;
+    if (g_guarded == nullptr || n == 0) return nullptr;
+
+    const size_t page = os_page_size();
+    const size_t data = (n + kCanaryBytes + page - 1) / page * page;
+    const size_t total = data + page; // the guard
+    if (data < n) return nullptr;     // wrapped: refuse rather than serve wrong
+
+    /* Reserved WITHOUT permissions and then only the data pages committed: what
+     * is left is the guard, and it is unmapped because nobody ever asked for
+     * it, not because something took it away. */
+    void *base = os_reserve(total);
+    if (base == nullptr) return nullptr;
+    if (!os_commit(base, data, kOsReadWrite)) {
+        os_free(base, total);
+        return nullptr;
+    }
+
+    unsigned char *const start = static_cast<unsigned char *>(base);
+    unsigned char *p;
+    size_t tail;
+    if (g_guard_edge == SanGuard::Underflow) {
+        /* The other edge: the block starts where the mapped pages start, so
+         * reading or writing BEFORE it is what faults.  Then the guard is the
+         * page before, and nothing watches the end. */
+        p = start + page;
+        tail = 0;
+    } else {
+        const uintptr_t end = reinterpret_cast<uintptr_t>(start) + data;
+        const uintptr_t want = (end - n) & ~uintptr_t(kAlign - 1);
+        p = reinterpret_cast<unsigned char *>(want);
+        tail = size_t(end - want - n);
+    }
+
+    Guarded *g = guard_insert(p);
+    if (g == nullptr) { // the table is full: say nothing false, serve nothing
+        os_free(base, total);
+        return nullptr;
+    }
+
+    const void *frames[kFrames];
+    bool walked = false;
+    const unsigned nf =
+        walk_stack(frames, __builtin_return_address(0), &walked);
+    g->base = base;
+    g->total = total;
+    g->req = n;
+    g->tail = tail;
+    g->alloc_stack = intern_stack(frames, nf, walked);
+    g->free_stack = 0;
+    g->state = kStAlive;
+    g_guard_bytes.fetch_add(total, std::memory_order_relaxed);
+
+    /* The gap between the end of the block and the guard, filled so that an
+     * overflow too small to reach the page still leaves a mark. */
+    if (tail != 0) std::memset(p + n, kCanaryByte, tail);
+    return p;
+}
+
+/// @return true when the release was handled here and must not go any further.
+bool guarded_free(void *p) noexcept {
+    Guarded *g = guard_find(p);
+    if (g == nullptr) return false;
+
+    if (g->state == kStFreed) {
+        verdict(Certainty::Proven, "released twice", p);
+        print_stack("allocated", g->alloc_stack);
+        print_stack("released the first time", g->free_stack);
+        return true; // and NOT again: the pages are already gone
+    }
+
+    for (size_t i = 0; i < g->tail; ++i) {
+        if (static_cast<unsigned char *>(p)[g->req + i] != kCanaryByte) {
+            verdict(Certainty::Proven, "written past the end of the block", p);
+            std::fprintf(stderr,
+                         "    asked for %zu bytes; it overran into the %zu that "
+                         "sit between the block and the guard page, from byte "
+                         "%zu.  A longer overrun would have faulted where it "
+                         "happened.\n",
+                         g->req, g->tail, i);
+            print_stack("allocated", g->alloc_stack);
+            break;
+        }
+    }
+
+    const void *frames[kFrames];
+    bool walked = false;
+    const unsigned nf =
+        walk_stack(frames, __builtin_return_address(0), &walked);
+    g->free_stack = intern_stack(frames, nf, walked);
+    g->state = kStFreed;
+
+    /* DECOMMITTED, NOT FREED.  The pages go, so touching the block from now on
+     * faults where it is touched; the range stays ours, so the address is never
+     * handed to anybody else and the fault is always about THIS block.  That is
+     * what makes a use-after-free point at the right code -- and what makes
+     * this level expensive. */
+    os_decommit(const_cast<void *>(g->base), g->total - os_page_size());
+    return true;
+}
+
 [[gnu::noinline]] void san_on_alloc(void *p, size_t req) noexcept {
     if (p == nullptr) return;
-    if (!ensure_ready() || detail::g_san_level == SanLevel::Off) return;
+    if (!ensure_config() || detail::g_san_level == SanLevel::Off) return;
 
+    /* A guarded block wrote its own entry when it was served, and it does not
+     * live in the region, so the shadow would count it as something it could
+     * not look at -- which would be a lie in the other direction. */
+    if (detail::g_san_level >= SanLevel::Guard && guard_find(p) != nullptr)
+        return;
+
+    if (!ensure_ready()) return;
     size_t block = 0;
     Slot *s = slot_of(p, &block);
     if (s == nullptr) {
@@ -692,8 +918,16 @@ size_t san_grow(size_t n) noexcept {
 
 [[gnu::noinline]] bool san_on_free(void *p) noexcept {
     if (p == nullptr) return true;
-    if (!ensure_ready() || detail::g_san_level == SanLevel::Off) return true;
+    if (!ensure_config() || detail::g_san_level == SanLevel::Off) return true;
 
+    /* A guarded block never goes back to the allocator: it was never served by
+     * it, and handing it over would send a pointer from outside the region to
+     * `no_foreign_free`, which stops the process.  Answering false is what
+     * keeps it here -- and it is asked BEFORE the shadow, which that block does
+     * not have. */
+    if (detail::g_san_level >= SanLevel::Guard && guarded_free(p)) return false;
+
+    if (!ensure_ready()) return true;
     size_t block = 0;
     Slot *s = slot_of(p, &block);
     if (s == nullptr) {
@@ -862,6 +1096,21 @@ void report() noexcept {
                      "[allocator/check] NOT COVERED: %llu chunks the system "
                      "would not give shadow memory for\n",
                      (unsigned long long)norow);
+
+    const uint64_t gfull = g_guard_full.load(std::memory_order_relaxed);
+    if (gfull != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] NOT COVERED: %llu allocations could "
+                     "not get a guarded block -- the table of %u was full -- "
+                     "and were served the ordinary way\n",
+                     (unsigned long long)gfull, kGuardSlots);
+    const uint64_t gb = g_guard_bytes.load(std::memory_order_relaxed);
+    if (gb != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] %llu MiB of address space went to "
+                     "guarded blocks and is NOT coming back: that is what buys "
+                     "the fault happening where the mistake is\n",
+                     (unsigned long long)(gb / (1024 * 1024)));
 
     const uint64_t cross = g_cross_thread.load(std::memory_order_relaxed);
     if (cross != 0)

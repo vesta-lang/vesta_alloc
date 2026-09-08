@@ -40,6 +40,7 @@
 #include "util/alloc/sanitizer.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -61,9 +62,72 @@ void check(bool ok, const char *what) {
     return util::host_alloc(n);
 }
 
+/**
+ * @brief Runs this same program again, at the guard level, told to misbehave.
+ *
+ * IT HAS TO BE A CHILD, and that is the point of the level rather than a
+ * nuisance: what it catches, it catches by FAULTING where the mistake is.  A
+ * test that made the mistake in its own process would die, and a dead test
+ * proves nothing -- so the mistake is made over there and what is checked here
+ * is that over there it died.
+ *
+ * The environment goes on the command line because setting it for a child
+ * portably is the one part of this that has no common spelling.
+ *
+ * @return the child's exit status, or -1 if it could not be run.
+ */
+int run_child(const char *self, const char *what) {
+    char cmd[1024];
+#if defined(_WIN32)
+    std::snprintf(cmd, sizeof cmd,
+                  "set VESTA_ALLOC_SAN=4&& set VESTA_ALLOC_SAN_EXITCODE=0&& "
+                  "\"%s\" %s > NUL 2>&1",
+                  self, what);
+#else
+    std::snprintf(cmd, sizeof cmd,
+                  "VESTA_ALLOC_SAN=4 VESTA_ALLOC_SAN_EXITCODE=0 "
+                  "'%s' %s > /dev/null 2>&1",
+                  self, what);
+#endif
+    return std::system(cmd);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    /* The child half: make one mistake and let the guard page answer.  If it
+     * comes back at all, the level did not do its job, and saying so out loud
+     * is what the parent reads. */
+    if (argc > 1) {
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+        if (std::strcmp(argv[1], "guard-overflow") == 0) {
+            unsigned char *p =
+                static_cast<unsigned char *>(util::host_alloc(64));
+            std::memset(p, 0x11, 4096); // far past the end: must fault HERE
+            std::printf("the write went through\n");
+            return 0; // and a zero here is the failure the parent looks for
+        }
+        if (std::strcmp(argv[1], "guard-afterfree") == 0) {
+            unsigned char *p =
+                static_cast<unsigned char *>(util::host_alloc(64));
+            util::host_free(p);
+            volatile unsigned char v = p[0]; // must fault HERE
+            std::printf("the read went through: %u\n", unsigned(v));
+            return 0;
+        }
+        if (std::strcmp(argv[1], "guard-ok") == 0) {
+            unsigned char *p =
+                static_cast<unsigned char *>(util::host_alloc(64));
+            std::memset(p, 0x22, 64); // exactly what was asked for
+            unsigned sum = 0;
+            for (int i = 0; i < 64; ++i) sum += p[i];
+            util::host_free(p);
+            return sum == 64u * 0x22 ? 0 : 1;
+        }
+#endif
+        return 0;
+    }
+
     std::printf("== the checking mode ==\n");
 
 #if !defined(VESTA_ALLOC_SANITIZER) || !VESTA_ALLOC_SANITIZER
@@ -107,6 +171,18 @@ int main() {
      * is one to find. */
     void *leaked = allocate_and_forget(40);
     check(leaked != nullptr, "and one block is left behind, for the report");
+
+    /* THE GUARD LEVEL, from a safe distance.  What it catches, it catches by
+     * faulting, so the mistakes are made in a child and what is asserted here
+     * is that the child did not survive them -- and, just as important, that a
+     * child which does nothing wrong comes back fine.  Without that last one,
+     * a level that killed everything would look like a level that worked. */
+    check(run_child(argv[0], "guard-ok") == 0,
+          "at the guard level, ordinary use still works");
+    check(run_child(argv[0], "guard-overflow") != 0,
+          "a write past the end faults WHERE it happens, not at release");
+    check(run_child(argv[0], "guard-afterfree") != 0,
+          "and so does a read of a block that was already released");
 
     std::printf(failures == 0 ? "TODO OK\n" : "HAY FALLOS\n");
     return failures == 0 ? 0 : 1;

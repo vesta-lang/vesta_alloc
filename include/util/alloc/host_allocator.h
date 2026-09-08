@@ -1438,8 +1438,8 @@ size_t direct_bytes(const void *p) noexcept;
      * here is `detail::alloc_body(n)` and nothing else -- the same
      * instructions, one for one, as before this mode existed.  See
      * `util/alloc/sanitizer.h`. */
-    const size_t want = san_grow(n);
-    void *p = detail::alloc_body(want);
+    void *p = san_alloc_guarded(n);
+    if (p == nullptr) p = detail::alloc_body(san_grow(n));
     san_on_alloc(p, n);
     return p;
 }

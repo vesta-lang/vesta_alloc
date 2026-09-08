@@ -326,6 +326,43 @@ size_t san_grow(size_t n) noexcept;
 
 /**
  * @brief
+ * \~english Serves the allocation ITSELF, when the level says pages of its own.
+ * \~spanish Sirve la reserva ENTERA, cuando el nivel pide paginas propias.
+ * \~
+ *
+ * \~english
+ * The other hooks watch what the allocator did; this one REPLACES it, and it
+ * has to: a guarded block lives on pages of its own, outside the allocator's
+ * region, so nothing of the ordinary path can hand it out and nothing of the
+ * ordinary path may take it back.  Its twin on the way out is @c san_on_free
+ * answering false.
+ *
+ * @param n what the caller asked for.
+ * @return the block, or nullptr when this level is not in force -- and then the
+ *         ordinary path runs, untouched.
+ *
+ * @code
+ *   void *p = util::san_alloc_guarded(n);
+ *   if (p == nullptr) p = util::detail::alloc_body(util::san_grow(n));
+ * @endcode
+ * \~
+ *
+ * \~spanish
+ * Los demas ganchos miran lo que hizo el asignador; este lo SUSTITUYE, y tiene
+ * que hacerlo: un bloque con guarda vive en paginas propias, fuera de la region
+ * del asignador, asi que ni el camino de siempre puede entregarlo ni puede
+ * recibirlo de vuelta.  Su gemelo a la salida es @c san_on_free contestando
+ * false.
+ *
+ * @param n lo que pidio quien llama.
+ * @return el bloque, o nulo cuando este nivel no esta en vigor -- y entonces
+ *         corre el camino de siempre, sin tocar.
+ * \~
+ */
+void *san_alloc_guarded(size_t n) noexcept;
+
+/**
+ * @brief
  * \~english Records a block that has just been handed out.
  * \~spanish Apunta un bloque que se acaba de entregar.
  * \~
@@ -414,6 +451,9 @@ uint64_t san_verdicts() noexcept;
  * existiera.  Es una promesa que el build COMPRUEBA, no una intencion. */
 
 [[gnu::always_inline]] inline size_t san_grow(size_t n) noexcept { return n; }
+[[gnu::always_inline]] inline void *san_alloc_guarded(size_t) noexcept {
+    return nullptr;
+}
 [[gnu::always_inline]] inline void san_on_alloc(void *, size_t) noexcept {}
 [[gnu::always_inline]] inline bool san_on_free(void *) noexcept { return true; }
 [[gnu::always_inline]] inline uint64_t san_verdicts() noexcept { return 0; }
