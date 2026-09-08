@@ -199,8 +199,15 @@ option(VESTA_ALLOC_INTERPOSE_MALLOC
 # una definicion propia a la vez, el enlazador resuelve `__real_malloc` con la
 # UNICA definicion que hay -- la nuestra --, y la primera reserva se llama a si
 # misma hasta agotar la pila.  Comprobado con una sonda de tres lineas antes de
-# escribir nada.  Por eso, mas abajo, esos dos simbolos salen de la lista de
+# escribir nada.  Por eso, mas abajo, esos simbolos salen de la lista de
 # `--wrap` cuando esto esta encendido.
+#
+# Y son los CUATRO -- `malloc`, `free`, `realloc` y `calloc` --, no solo el par.
+# En cuanto `malloc` es nuestro, la libc tiene bloques NUESTROS, y si `realloc`
+# sigue siendo suyo los hace crecer leyendo una cabecera que no escribio nadie.
+# No es un supuesto: `getcwd(NULL,0)` reserva con `malloc` y ENCOGE con
+# `realloc`, y con eso murio el compilador en Linux la primera vez que se
+# valido ahi.  La traza esta en la cabecera de `malloc_define.cpp`.
 #
 # ENCENDIDA EN ELF, y la razon de fondo es la PARIDAD.  En Windows el mismo
 # agujero lo cierra el gancho del runtime (`VESTA_ALLOC_HOOK_MSVCRT`, encendido
@@ -223,8 +230,9 @@ else()
     set(_va_define_malloc_default ON)
 endif()
 option(VESTA_ALLOC_DEFINE_MALLOC
-        "Que malloc/free sean simbolos NUESTROS (solo ELF; sustituye a --wrap \
-para esos dos y alcanza tambien lo que la libc reserva por dentro)"
+        "Que malloc/free/realloc/calloc sean simbolos NUESTROS (solo ELF; \
+sustituye a --wrap para esos cuatro y alcanza tambien lo que la libc reserva \
+por dentro)"
         ${_va_define_malloc_default})
 
 # -----------------------------------------------------------------------------
@@ -475,8 +483,15 @@ if(VESTA_ALLOC_INTERPOSE_MALLOC)
         # definicion y la primera reserva se llamaria a si misma.  Se quitan
         # aqui, y no en el otro bloque, para que la lista siga siendo un sitio
         # unico -- lo contrario es la forma de que un dia sobre uno.
+        #
+        # SON LOS CUATRO, y salen JUNTOS.  Con `malloc` nuestro y `realloc` de
+        # la libc, la libreria reserva por nuestra puerta y redimensiona por la
+        # suya, sobre un bloque cuya cabecera no escribio ella: `getcwd(NULL,0)`
+        # pide con `malloc` y ENCOGE con `realloc`, y ahi murio el compilador en
+        # Linux.  Partir la familia no es una version mas pequena del
+        # mecanismo, es una que corrompe.
         if(VESTA_ALLOC_DEFINE_MALLOC)
-            list(REMOVE_ITEM _wrapped malloc free)
+            list(REMOVE_ITEM _wrapped malloc free realloc calloc)
         endif()
         foreach(_fn IN ITEMS ${_wrapped})
             # Como "libreria" y no con `target_link_options` a proposito: eso
@@ -517,12 +532,13 @@ if(VESTA_ALLOC_DEFINE_MALLOC)
     # la libreria de C ya no lo tiene en `__real_malloc` y tiene que pedirlo con
     # `dlsym`, asi que tiene derecho a saberlo al compilar.
     target_compile_definitions(vesta_alloc PUBLIC VESTA_ALLOC_DEFINE_MALLOC=1)
-    # `dlsym` para encontrar el `free` de la libreria de C, que es lo que
-    # recibe los bloques del cargador dinamico.  En glibc 2.34 y posteriores ya
-    # vive en `libc`, pero pedirlo no molesta y en las anteriores hace falta.
+    # `dlsym` para encontrar el `free` y el `realloc` de la libreria de C, que
+    # es lo que recibe los bloques del cargador dinamico.  En glibc 2.34 y
+    # posteriores ya vive en `libc`, pero pedirlo no molesta y en las anteriores
+    # hace falta.
     target_link_libraries(vesta_alloc PUBLIC ${CMAKE_DL_LIBS})
-    message(STATUS "[vesta_alloc] malloc/free son simbolos NUESTROS "
-            "(--wrap retirado para esos dos)")
+    message(STATUS "[vesta_alloc] malloc/free/realloc/calloc son simbolos "
+            "NUESTROS (--wrap retirado para esos cuatro)")
 endif()
 
 # -----------------------------------------------------------------------------

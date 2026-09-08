@@ -398,6 +398,37 @@ un `git log` peor escrito; lo que hace falta saber es que problema habia.
 
 ### Corregido
 
+- **Ser `malloc` a medias CORROMPIA: `realloc` y `calloc` tambien son
+  nuestros.**  Definir el simbolo alcanza lo que la libreria de C reserva por
+  dentro -- que es justamente para lo que se hizo --, pero se definieron solo
+  `malloc` y `free`.  En cuanto `malloc` es nuestro, la libc tiene bloques
+  NUESTROS; y si `realloc` sigue siendo suyo, los hace crecer leyendo una
+  cabecera que nadie escribio.
+
+  No es un supuesto, es lo segundo que hizo el compilador al validarlo en
+  Linux, y la traza señala al culpable sin margen:
+
+  ```
+  musable (mem=0x7fbbf7900010)              <- lee la cabecera de chunk de glibc
+  __GI___libc_realloc (oldmem=..., bytes=8)
+  __GI___getcwd (buf=0x0)                   <- pide con malloc y luego ENCOGE
+  std::filesystem::current_path()
+  ```
+
+  `getcwd(NULL, 0)` reserva el buffer que devuelve y despues lo recorta a lo que
+  de verdad uso.  `vasprintf` hace lo mismo, y `getline` al crecer tambien.  Asi
+  que partir la familia no es una version mas pequeña del mecanismo: es una que
+  corrompe, y encima sobre los bloques que la otra mitad entrego a proposito.
+  Los cuatro salen ahora JUNTOS de la lista de `--wrap`.
+
+  `calloc` entra por la otra mitad de la misma regla.  No puede corromper --
+  nadie le pasa un puntero que ya exista --, pero un bloque que la libreria
+  puso a cero para si misma seria la unica reserva que no llega nunca al
+  informe, y un informe con un hueco es peor que no tenerlo: se lee como una
+  respuesta.  La arena de arranque cumple la promesa de `calloc` gratis, y por
+  construccion y no por suerte: vive en `.bss` y NUNCA recicla, asi que cada
+  byte que entrega es un byte que no ha escrito nadie.
+
 - **El informe llevaba contadores que no enseñaba, y tres cifras que decian otra
   cosa.**  Auditado uno por uno lo que el asignador cuenta contra lo que sale
   por pantalla, faltaban siete: las devoluciones grandes (`large-freed`), las
@@ -580,7 +611,7 @@ invita a creer que ampara.
 
 - **`malloc` is this allocator INSIDE the C runtime too.**  Link-time renaming
   reaches every call in the link and stops there: what the C library allocates
-  inside itself and hands back — `strdup`, `getline`, `_wgetdcwd` — is not a
+  inside itself and hands back -- `strdup`, `getline`, `_wgetdcwd` -- is not a
   pending reference, so no linker can touch it.  That memory showed as zero,
   and zero reads like "there is none".
 
@@ -591,7 +622,7 @@ invita a creer que ampara.
   and an internal call never leaves it).  ONLY msvcrt: not kernel32, not ntdll.
 
   Three things cost a round trip each, and are written where they are decided:
-  the two ways **cannot coexist** with `--wrap` for the same symbol —
+  the two ways **cannot coexist** with `--wrap` for the same symbol --
   `__real_malloc` would resolve against our own definition and the first
   allocation would call itself; on Windows the jumps have to go in from a TLS
   callback rather than a constructor, because the four blocks of difference
@@ -603,7 +634,7 @@ invita a creer que ampara.
   `aligned_alloc`, `memalign` and the whole Windows `_aligned_*` family.  On
   POSIX such a block is released with plain `free`, so it has to say what it is
   by itself: it is served as a span, whose header `free` already finds by
-  masking — no marker, no side table, and not one instruction added to the free
+  masking -- no marker, no side table, and not one instruction added to the free
   path.
 
   `_aligned_realloc` and its relatives are covered even though nobody calls
@@ -618,22 +649,22 @@ invita a creer que ampara.
   confidence as a true name.  A report is read as fact, and a wrong name is
   worse than a missing one.
 
-  For a foreign module the symbols are read from ITS file — `slurp` and
-  `build_table` were never specific to "self" — with what the loader offers as
+  For a foreign module the symbols are read from ITS file -- `slurp` and
+  `build_table` were never specific to "self" -- with what the loader offers as
   the fallback for a stripped one.
 
 - **The text dump resolves names too**, and allocations from other modules get
   a section of their own.  The same process used to write `parse_tokens` into
   the CSV and a bare offset to the terminal; and foreign sites, with nine
   allocations against three hundred and thirty, never surfaced in a list sorted
-  by count — which was exactly what had just been gained.
+  by count -- which was exactly what had just been gained.
 
 - **The report page filters by SCOPE and by LANGUAGE**, and the two axes
   combine: everything / only my calls folded onto my function / only my calls
   strictly / only external, crossed with C, C++ or undetermined.
   "Undetermined" is a view of its own and not a bin: with no debug information
   there is no file, and without a file a bare name does not say which language
-  wrote it — the page SAYS so, and says how to fix it.  Whatever a filter
+  wrote it -- the page SAYS so, and says how to fix it.  Whatever a filter
   leaves out is always counted.
 
 ### Changed
@@ -917,6 +948,36 @@ invita a creer que ampara.
   header, where nobody else could use it.  One fact, one producer.
 
 ### Fixed
+
+- **Being `malloc` by halves CORRUPTED: `realloc` and `calloc` are ours too.**
+  Defining the symbol reaches what the C library allocates inside itself --
+  which is the whole reason it was done -- but only `malloc` and `free` were
+  defined.  The moment `malloc` is ours the C library holds OUR blocks; and if
+  `realloc` is still theirs, it grows them by reading a header nobody wrote.
+
+  Not a scenario: it is the second thing the compiler did when it was validated
+  on Linux, and the backtrace names the culprit with no room for doubt:
+
+  ```
+  musable (mem=0x7fbbf7900010)              <- reads glibc's chunk header
+  __GI___libc_realloc (oldmem=..., bytes=8)
+  __GI___getcwd (buf=0x0)                   <- asks malloc, then SHRINKS
+  std::filesystem::current_path()
+  ```
+
+  `getcwd(NULL, 0)` allocates the buffer it returns and then trims it to the
+  length it actually used.  So does `vasprintf`, and so does `getline` when it
+  grows.  So splitting the family is not a smaller version of the mechanism: it
+  is a corrupting one, and on the very blocks the other half handed out on
+  purpose.  All four now leave the `--wrap` list TOGETHER.
+
+  `calloc` is here for the other half of the same rule.  It cannot corrupt --
+  nothing hands it an existing pointer -- but a block the library zeroed for
+  itself would be the one allocation that never reaches the report, and a report
+  with a hole in it is worse than none: it reads as an answer.  The bootstrap
+  arena keeps `calloc`'s promise for free, by construction and not by luck: it
+  lives in `.bss` and NEVER recycles, so every byte it hands out is a byte
+  nobody has written.
 
 - **The report carried counters it never showed, and three figures that said
   something else.**  Auditing one by one what the allocator counts against what

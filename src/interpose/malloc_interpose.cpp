@@ -70,15 +70,21 @@ extern "C" {
 /* What the linker leaves behind: the original entry points, still reachable
  * under these names.  They are needed for the blocks that are not ours.
  *
- * `malloc` and `free` are NOT among them when `malloc_define.cpp` is in the
- * build: it defines those two symbols, so the build removes their `--wrap`,
- * and asking for a `__real_` of a symbol nobody renamed is a name that does not
- * exist.  Their `__wrap_` twins go out with them, further down. */
-void *__real_calloc(size_t count, size_t size);
-void *__real_realloc(void *p, size_t n);
+ * THE CORE FOUR ARE NOT AMONG THEM when `malloc_define.cpp` is in the build: it
+ * defines those symbols, so the build removes their `--wrap`, and asking for a
+ * `__real_` of a symbol nobody renamed is a name that does not exist.  Their
+ * `__wrap_` twins go out with them, further down.
+ *
+ * They leave TOGETHER, and that is the part worth knowing: with `malloc` ours
+ * and `realloc` still the C library's, the library allocates through us and
+ * resizes through them, on a block whose header they never wrote.  Splitting
+ * the family is not a smaller version of the mechanism, it is a corrupting one
+ * -- see the backtrace in `malloc_define.cpp`. */
 #if !defined(VESTA_ALLOC_DEFINE_MALLOC)
 void *__real_malloc(size_t n);
 void __real_free(void *p);
+void *__real_calloc(size_t count, size_t size);
+void *__real_realloc(void *p, size_t n);
 #endif
 /* There is no `__real__aligned_free`, and that is not an oversight: asking for
  * it makes the linker pull the member of `libmsvcrt.a` that defines the thunk,
@@ -137,11 +143,15 @@ using vesta_interpose::pow2;
 
 extern "C" {
 
-/* `__wrap_malloc` and `__wrap_free` only exist when nobody DEFINES those two
- * symbols.  When `malloc_define.cpp` is in the build the renaming is removed
- * for them -- the two cannot coexist, see `interpose_common.h` -- so a
+/* The four below only exist when nobody DEFINES those symbols.  When
+ * `malloc_define.cpp` is in the build the renaming is removed for them -- the
+ * two ways cannot coexist for one symbol, see `interpose_common.h` -- so a
  * `__wrap_` twin here would be code the linker points nothing at, next to a
- * `__real_` that does not exist. */
+ * `__real_` that does not exist.
+ *
+ * ONE guarded block and not four, because they go as a family: `malloc` and
+ * `free` are two ends of the same promise, and `realloc` sits on both of them
+ * at once. */
 #if !defined(VESTA_ALLOC_DEFINE_MALLOC)
 
 void *__wrap_malloc(size_t n) {
@@ -150,8 +160,6 @@ void *__wrap_malloc(size_t n) {
     note_site(__builtin_return_address(0), n);
     return p;
 }
-
-#endif // !VESTA_ALLOC_DEFINE_MALLOC
 
 void *__wrap_calloc(size_t count, size_t size) {
     /* The overflow of the product is the classic `calloc` bug, and an
@@ -198,8 +206,6 @@ void *__wrap_realloc(void *p, size_t n) {
     note_site(__builtin_return_address(0), n);
     return q;
 }
-
-#if !defined(VESTA_ALLOC_DEFINE_MALLOC) // its twin: see `__wrap_malloc` above
 
 void __wrap_free(void *p) {
     if (p == nullptr) return;

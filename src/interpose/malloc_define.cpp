@@ -27,6 +27,31 @@
  * That side is served by `malloc_interpose.cpp` and its `__imp__` pointers.
  *
  * ------------------------------------------------------------------------
+ * WHY ALL FOUR, AND NOT JUST `malloc` AND `free`
+ * ------------------------------------------------------------------------
+ *
+ * Because the moment `malloc` is ours, the C library holds OUR blocks -- and
+ * then it grows them with ITS `realloc`, which reads a header we never wrote.
+ * That is not a scenario, it is what the compiler did on its second line of
+ * work, and the backtrace named the caller exactly:
+ *
+ *     musable (mem=0x7fbbf7900010)             <- reads glibc's chunk header
+ *     __GI___libc_realloc (oldmem=..., bytes=8)
+ *     __GI___getcwd (buf=0x0)                  <- asks malloc, then SHRINKS
+ *     std::filesystem::current_path()
+ *
+ * `getcwd(NULL, 0)` allocates the buffer it returns and then trims it to the
+ * length it actually used.  So does `vasprintf`, and so does `getline` when it
+ * grows.  Leaving `realloc` to the C library is therefore not a smaller version
+ * of this mechanism -- it is a mechanism that CORRUPTS, and it corrupts on
+ * blocks the other half handed out on purpose.
+ *
+ * `calloc` is here for the other half of the same rule.  It cannot corrupt --
+ * nothing hands it an existing pointer -- but a block the library zeroed for
+ * itself would be the one kind of allocation that never reaches the report, and
+ * a report with a hole in it is worse than no report: it reads as an answer.
+ *
+ * ------------------------------------------------------------------------
  * WHY IT CANNOT SHARE THE ROAD WITH `--wrap`
  * ------------------------------------------------------------------------
  *
@@ -76,6 +101,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 
 namespace {
@@ -176,6 +202,72 @@ FreeFn real_free() noexcept {
     return f;
 }
 
+/**
+ * @brief The C library's own `realloc`, for the same reason and found the same
+ *        way.
+ *
+ * Only ever reached for a block that is neither ours nor the bootstrap arena's
+ * -- which means the dynamic loader made it before we were anybody -- and that
+ * block can only be resized by whoever knows how big it is.
+ */
+using ReallocFn = void *(*)(void *, size_t);
+std::atomic<ReallocFn> g_real_realloc{nullptr};
+
+ReallocFn real_realloc() noexcept {
+    ReallocFn f = g_real_realloc.load(std::memory_order_acquire);
+    if (f != nullptr) return f;
+    f = reinterpret_cast<ReallocFn>(::dlsym(RTLD_NEXT, "realloc"));
+    g_real_realloc.store(f, std::memory_order_release);
+    return f;
+}
+
+/**
+ * @brief A pointer arriving at `realloc` that nobody can account for.
+ *
+ * The sibling of `no_foreign_free`, and separate from it so the message names
+ * what actually happened: sending someone to look at their `free` calls when
+ * the block came through `realloc` is a diagnostic that costs an afternoon.
+ *
+ * Returning null instead would be legal -- that is what `realloc` says when it
+ * cannot grow -- and it would be the wrong answer here: the caller would carry
+ * on with a block nobody owns, and the failure would surface somewhere else
+ * entirely.
+ */
+[[noreturn, gnu::noinline, gnu::cold]] void no_foreign_realloc(void *p) noexcept {
+    std::fprintf(stderr,
+                 "[allocator] PANIC: realloc() of %p, which this allocator "
+                 "never handed out, and the C library's own realloc could not "
+                 "be found to hand it back to.\n"
+                 "            A pointer arriving here came through a door we "
+                 "are not watching.\n",
+                 p);
+    std::fflush(stderr);
+    std::abort();
+}
+
+/**
+ * @brief The allocation that `malloc` makes, and that `realloc` makes when it
+ *        has to move a block out of the bootstrap arena.
+ *
+ * The order of the two tests is the whole design, and it is written once here
+ * because both entries need it identical.  Asking the allocator whether it is
+ * active is what triggers its decision, and during that decision it answers no
+ * -- which routes the request to the arena instead of into the re-entry that
+ * would hang.  Once it says yes it never goes back, so this costs one
+ * predictable branch for the rest of the process.
+ *
+ * @param ret the caller's return address, taken by whoever was actually called:
+ *            reading it here would name this helper's caller and not the
+ *            program's.
+ */
+[[gnu::always_inline]] inline void *fresh_block(size_t n,
+                                                const void *ret) noexcept {
+    if (__builtin_expect(!util::host_alloc_active(), 0)) return boot_alloc(n);
+    void *p = util::host_alloc(n);
+    note_site(ret, n);
+    return p;
+}
+
 } // namespace
 
 namespace vesta_interpose {
@@ -203,17 +295,79 @@ extern "C" {
 /**
  * @brief `malloc`, and this time it IS the symbol.
  *
- * The order of the two tests is the whole design.  Asking the allocator whether
- * it is active is what triggers its decision, and during that decision it
- * answers no -- which routes the request to the arena instead of into the
- * re-entry that would hang.  Once it says yes it never goes back, so this costs
- * one predictable branch for the rest of the process.
+ * See @c fresh_block for why the order of its two tests is the whole design.
  */
 void *malloc(size_t n) {
+    return fresh_block(n, __builtin_return_address(0));
+}
+
+/**
+ * @brief `calloc`, which is `malloc` plus a promise about the contents.
+ *
+ * The bootstrap arena keeps that promise for free, and that is a fact about how
+ * it is built and not a hope: it lives in `.bss`, so it starts zeroed, and it
+ * NEVER recycles -- every byte it hands out is a byte nobody has written.  The
+ * size header sits before the block, so it does not touch what the caller sees.
+ * Clearing it again would be writing over zeros.
+ *
+ * With the allocator up, `host_alloc_zeroed` says the same thing for the same
+ * reason: memory that has just come from the system is already zero, and only
+ * memory that has been used before has to be cleared.
+ */
+void *calloc(size_t count, size_t size) {
+    /* The overflow of the product is the classic `calloc` bug, and an expensive
+     * one: it allocates less than asked and the caller writes more.  Checked
+     * before multiplying. */
+    if (count != 0 && size > (size_t)-1 / count) return nullptr;
+    const size_t n = count * size;
     if (__builtin_expect(!util::host_alloc_active(), 0)) return boot_alloc(n);
-    void *p = util::host_alloc(n);
+    void *p = util::host_alloc_zeroed(n);
     note_site(__builtin_return_address(0), n);
     return p;
+}
+
+/**
+ * @brief `realloc`, with the same three kinds of block `free` tells apart.
+ *
+ * THIS IS THE ONE THAT HAD TO BE HERE.  With `malloc` ours and `realloc` the C
+ * library's, `getcwd(NULL, 0)` allocates through us and trims through them, on
+ * a block whose header they never wrote.  See the file header for the
+ * backtrace.
+ *
+ * Ours is the common case and goes first.  A bootstrap block cannot grow where
+ * it is -- that arena only moves forward -- so it is copied out and left
+ * behind, which is what the arena is for.  Anything else came from the loader
+ * and goes back to the C library that made it, whole.
+ */
+void *realloc(void *p, size_t n) {
+    /* `realloc(NULL, n)` IS `malloc(n)`, and the C library's own callers use it
+     * that way to avoid writing the first-time case twice. */
+    if (p == nullptr) return fresh_block(n, __builtin_return_address(0));
+
+    if (__builtin_expect(ours(p), 1)) {
+        void *q = util::host_realloc(p, n);
+        /* Recorded with the NEW size, which is what was just asked for.  A
+         * `realloc` is how things grow in C -- it is the `std::vector` of this
+         * side -- so leaving it out would hide the very pattern worth looking
+         * at. */
+        note_site(__builtin_return_address(0), n);
+        return q;
+    }
+
+    if (vesta_interpose::from_bootstrap(p)) {
+        /* A size of zero releases the block, and releasing a bootstrap block is
+         * dropping it: the arena does not recycle, by design. */
+        if (n == 0) return nullptr;
+        const size_t old = vesta_interpose::bootstrap_size(p);
+        void *fresh = fresh_block(n, __builtin_return_address(0));
+        if (fresh == nullptr) return nullptr; // `p` is still valid, as required
+        vesta_memcpy(fresh, p, old < n ? old : n);
+        return fresh;
+    }
+
+    const ReallocFn f = real_realloc();
+    if (f != nullptr) return f(p, n);
+    no_foreign_realloc(p); // does not return
 }
 
 /**
