@@ -52,7 +52,7 @@ MIN_LINES = 3
 # What was left the last time somebody looked.  It may go DOWN and never up.
 # Lower it in the same commit that fixes the blocks; that is what keeps it
 # honest.
-CEILING = 1008
+CEILING = 961
 
 ROOTS = ("src", "tests", "bench", "examples", "include", "support")
 SUFFIXES = (".c", ".cc", ".cpp", ".h", ".hpp")

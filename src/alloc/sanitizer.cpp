@@ -422,9 +422,14 @@ uint32_t intern_stack(const void *const *pc, unsigned n, bool walked) noexcept {
             }
             st = s.state.load(std::memory_order_acquire);
         }
-        /* Someone is filling it right now: it cannot be compared yet, and
-         * waiting here would be a lock in a path that must not have one.  The
-         * next slot is as good, at the price of one more entry. */
+        /* \~english Someone is filling it right now: it cannot be compared yet,
+         * and waiting here would be a lock in a path that must not have one.
+         * The next slot is as good, at the price of one more entry.
+         *
+         * \~spanish Alguien la esta llenando ahora mismo: todavia no se puede
+         * comparar, y esperar aqui seria un cerrojo en un camino que no puede
+         * tenerlo.  La ranura siguiente vale igual, al precio de una entrada
+         * mas.  \~ */
         if (st == kSlotReady && same_stack(s, pc, n)) return i;
         i = (i + 1) & (kDepotSlots - 1);
         if (i == 0) i = 1;
@@ -445,17 +450,33 @@ struct Slot {
     uint32_t req;         ///< what the caller asked for, before the canary
     uint32_t meta;        ///< state and the two thread ids; see below
     /**
-     * @brief When it was born, counted in ALLOCATIONS of its own thread.
+     * @brief
+     * \~english When it was born, counted in ALLOCATIONS of its own thread.
+     * \~spanish Cuando nacio, contado en RESERVAS de su propio hilo.
+     * \~
      *
+     * \~english
      * NOT A CLOCK, and that is what makes it worth having: two runs of the same
      * program give the same number, so a life can be compared between them and
      * the report can gate a build.  Wall time would answer differently every
      * run and could gate nothing.
      *
-     * The counter is one the allocator ALREADY keeps -- `small_allocs` in the
-     * thread's cache -- so measuring lives adds no state anywhere.  That is the
-     * condition this whole mode was built under: what the checker needs, the
-     * checker pays for, and only in its own build.
+     * The counter is one the allocator ALREADY keeps, so measuring lives adds
+     * no state anywhere.  That is the condition this whole mode was built
+     * under: what the checker needs, the checker pays for, and only in its own
+     * build.
+     *
+     * \~spanish
+     * NO ES UN RELOJ, y eso es lo que lo hace valer: dos corridas del mismo
+     * programa dan el mismo numero, asi que una vida se puede comparar entre
+     * ellas y el informe puede cortar un build.  El reloj de pared contestaria
+     * distinto cada vez y no podria cortar nada.
+     *
+     * El contador es uno que el asignador YA lleva, asi que medir vidas no
+     * anade estado en ningun sitio.  Es la condicion bajo la que se construyo
+     * todo este modo: lo que el comprobador necesita lo paga el comprobador, y
+     * solo en su propio build.
+     * \~
      */
     uint32_t seq;
 };
@@ -477,33 +498,54 @@ enum : uint32_t { kStNever = 0, kStAlive = 1, kStFreed = 2 };
     return (m >> 17) & 0x7FFFu;
 }
 
-/* One row per chunk, indexed by the offset inside the chunk in units of
- * `kAlign`.  Indexing by ALIGNMENT and not by size class costs slots -- a
+/* \~english One row per chunk, indexed by the offset inside the chunk in units
+ * of `kAlign`.  Indexing by ALIGNMENT and not by size class costs slots -- a
  * 48-byte block uses one of every three -- and buys not having to track which
  * class a chunk currently serves, which changes when a chunk is recycled.  A
  * checker that gets confused by recycling is a checker that accuses the wrong
- * line. */
+ * line.
+ *
+ * \~spanish Una fila por trozo, indexada por el desplazamiento dentro del trozo
+ * en unidades de `kAlign`.  Indexar por ALINEACION y no por clase de tamano
+ * gasta ranuras -- un bloque de 48 usa una de cada tres -- y compra no tener
+ * que seguir que clase sirve un trozo ahora mismo, que cambia cuando el trozo
+ * se recicla.  Un comprobador al que el reciclado confunde es un comprobador
+ * que acusa a la linea equivocada.  \~ */
 constexpr uint32_t kSlotsPerChunk = kChunkBytes / kAlign;
 
 std::atomic<Slot *> *g_rows = nullptr; ///< one entry per chunk of the region
 uint32_t g_row_count = 0;
 
 /**
- * @brief The slot of @p p, creating its row the first time.
+ * @brief
+ * \~english The slot of @p p, creating its row the first time.
+ * \~spanish La ranura de @p p, creando su fila la primera vez.
+ * \~
  *
- * @return nullptr when @p p is not a small-class block of the region -- a span,
- *         the big region, a direct block, or not ours at all.  That answer is
- *         COUNTED, because it is exactly what the report has to admit it did
- *         not look at.
+ * @return
+ * \~english nullptr when @p p is not a small-class block of the region -- a
+ *           span, the big region, a direct block, or not ours at all.  That
+ *           answer is COUNTED, because it is exactly what the report has to
+ *           admit it did not look at.
+ * \~spanish nulo cuando @p p no es un bloque de clase pequena de la region --
+ *           un tramo, la region grande, un bloque directo, o no nuestro.  Esa
+ *           respuesta se CUENTA, porque es justo lo que el informe tiene que
+ *           reconocer que no miro.
+ * \~
  */
 Slot *slot_of(const void *p, size_t *block_bytes) noexcept {
     if (!in_region(p)) return nullptr;
     ChunkHeader *h = chunk_of(const_cast<void *>(p));
     if (h->magic != kChunkMagic) return nullptr; // a span, not class blocks
-    /* The size of the BLOCK, which is not what the caller asked for.  Poisoning
-     * and the canary both need it: writing `req + something` bytes would run
-     * into the next block, and a checker that corrupts memory is worse than no
-     * checker at all. */
+    /* \~english The size of the BLOCK, which is not what the caller asked for.
+     * Poisoning and the canary both need it: writing `req + something` bytes
+     * would run into the next block, and a checker that corrupts memory is
+     * worse than no checker at all.
+     *
+     * \~spanish El tamano del BLOQUE, que no es lo que pidio quien llama.  Lo
+     * necesitan el veneno y el canario: escribir `req + algo` bytes se meteria
+     * en el bloque siguiente, y un comprobador que corrompe memoria es peor que
+     * no tener ninguno.  \~ */
     if (block_bytes != nullptr) *block_bytes = kSizes[h->cls];
 
     const uintptr_t base = detail::g_region_base.load(std::memory_order_relaxed);
@@ -544,8 +586,12 @@ Slot *slot_of(const void *p, size_t *block_bytes) noexcept {
 // =========================================================================
 
 /**
- * @brief What the blocks of one site did, added up.
+ * @brief
+ * \~english What the blocks of one site did, added up.
+ * \~spanish Lo que hicieron los bloques de un sitio, sumado.
+ * \~
  *
+ * \~english
  * THIS IS THE POINT OF THE WHOLE SHADOW, and it is worth saying plainly: the
  * two axes the allocator lets a caller DECLARE -- how long a block lives and
  * whether it grows -- come out of here MEASURED.  A declaration then stops
@@ -555,6 +601,17 @@ Slot *slot_of(const void *p, size_t *block_bytes) noexcept {
  * And it matters more than it looks, because almost nothing declares anything:
  * the whole VM reports `unknown`.  Measuring does not need the hundred sites to
  * be visited one by one.
+ *
+ * \~spanish
+ * ESTO ES PARA LO QUE ESTA EL SOMBREADO ENTERO, y conviene decirlo claro: los
+ * dos ejes que el asignador deja DECLARAR a quien llama -- cuanto vive un
+ * bloque y si crece -- salen de aqui MEDIDOS.  Una declaracion deja entonces de
+ * ser la fuente de verdad y pasa a ser una afirmacion contrastable con los
+ * datos, que es lo que `@complexity` es para el coste.
+ *
+ * Y pesa mas de lo que parece, porque casi nadie declara nada: la VM entera
+ * sale como `unknown`.  Medir no exige visitar los cien sitios uno a uno.
+ * \~
  */
 struct Life {
     uint64_t deaths;   ///< blocks of this site that were released
@@ -646,11 +703,16 @@ void note_death(uint32_t stack, uint32_t req, bool same_thread,
         if (req < l.size_min) l.size_min = req;
         if (req > l.size_max) l.size_max = req;
     }
-    /* A LIFE ONLY MEANS SOMETHING WITHIN ONE THREAD: the counter is that
-     * thread's, so subtracting one thread's from another's would produce a
+    /* \~english A LIFE ONLY MEANS SOMETHING WITHIN ONE THREAD: the counter is
+     * that thread's, so subtracting one thread's from another's would produce a
      * number that looks like a life and is not one.  Those are counted apart
      * rather than folded in, which is the difference between "we do not know"
-     * and "we know something wrong". */
+     * and "we know something wrong".
+     *
+     * \~spanish UNA VIDA SOLO SIGNIFICA ALGO DENTRO DE UN HILO: el contador es
+     * de ese hilo, asi que restar el de uno al de otro daria un numero con
+     * pinta de vida que no lo es.  Esas se cuentan aparte en vez de mezclarlas,
+     * que es la diferencia entre "no lo se" y "se algo equivocado".  \~ */
     if (!same_thread || now < born) {
         ++l.unknown;
         return;
@@ -670,12 +732,23 @@ void note_death(uint32_t stack, uint32_t req, bool same_thread,
 // =========================================================================
 
 /**
- * @brief What is known about a block that lives on pages of its own.
+ * @brief
+ * \~english What is known about a block that lives on pages of its own.
+ * \~spanish Lo que se sabe de un bloque que vive en paginas propias.
+ * \~
  *
+ * \~english
  * A SIDE TABLE and not a header in front of the block, and the reason is the
  * whole trick: the block is placed FLUSH against the guard page, so there is no
  * room behind it, and what is in front of it is a variable amount of slack that
  * cannot be found again from the pointer alone.
+ *
+ * \~spanish
+ * UNA TABLA APARTE y no una cabecera delante del bloque, y la razon es el truco
+ * entero: el bloque se coloca PEGADO a la pagina de guarda, asi que detras no
+ * queda sitio, y lo que hay delante es una cantidad variable de hueco que no se
+ * puede volver a encontrar solo con el puntero.
+ * \~
  */
 struct Guarded {
     std::atomic<const void *> p; ///< what the caller holds; nullptr = free slot
@@ -688,9 +761,15 @@ struct Guarded {
     uint32_t state;
 };
 
-/// Open addressing, never evicting.  Full is COUNTED and the level falls back
-/// for that allocation, which is loud; evicting would lose a block's identity
-/// and turn a use-after-free into a wrong accusation.
+/// \~english Open addressing, never evicting.  Full is COUNTED and the level
+///           falls back for that allocation, which is loud; evicting would lose
+///           a block's identity and turn a use-after-free into a wrong
+///           accusation.
+/// \~spanish Direccionamiento abierto, sin desalojar nunca.  Lleno se CUENTA y
+///           el nivel cae al de siempre para esa reserva, que es ruidoso;
+///           desalojar perderia la identidad de un bloque y convertiria un uso
+///           despues de liberar en una acusacion equivocada.
+/// \~
 constexpr uint32_t kGuardSlots = 1u << 16;
 Guarded *g_guarded = nullptr;
 std::atomic<uint64_t> g_guard_full{0};
@@ -737,8 +816,12 @@ Guarded *guard_insert(const void *p) noexcept {
 // =========================================================================
 
 /**
- * @brief One frame, resolved by asking WHOSE the address is FIRST.
+ * @brief
+ * \~english One frame, resolved by asking WHOSE the address is FIRST.
+ * \~spanish Un marco, resuelto preguntando PRIMERO de quien es la direccion.
+ * \~
  *
+ * \~english
  * That order is the whole point, and it is a trap this library has already
  * fallen into once: our own symbol table covers our own module and nothing
  * else, so handing it an address from `libstdc++` or from the loader makes it
@@ -749,6 +832,19 @@ Guarded *guard_insert(const void *p) noexcept {
  * So: whose is it?  If ours, resolve it.  If not, say which module and the
  * displacement inside it, which is the truth AND is the same between runs,
  * because the load address moves and the displacement does not.
+ *
+ * \~spanish
+ * Ese orden es lo importante, y es una trampa en la que esta libreria ya cayo
+ * una vez: nuestra tabla de simbolos cubre nuestro modulo y nada mas, asi que
+ * darle una direccion de `libstdc++` o del cargador hace que conteste con el
+ * ultimo simbolo que tenga -- `_fini` -- y un desplazamiento de tamano
+ * absurdo.  Un nombre seguro de si mismo y equivocado manda a arreglar otra
+ * funcion, que es peor que no dar nombre.
+ *
+ * Asi que: de quien es?  Si es nuestra, se resuelve.  Si no, se dice de que
+ * modulo y el desplazamiento dentro de el, que es la verdad Y es lo mismo entre
+ * corridas, porque la direccion de carga se mueve y el desplazamiento no.
+ * \~
  */
 void print_frame(const void *pc) noexcept {
     VestaModuleInfo m;
@@ -846,9 +942,14 @@ constexpr size_t kLinkBytes = sizeof(void *);
     return room < 64 ? room : 64; // one cache line, or all there is
 }
 
-/// Whether the guard bytes fit behind @p req inside a block of @p block bytes.
-/// Asked on both sides -- writing it and checking it -- so neither has to
-/// remember what the other did.
+/// \~english Whether the guard bytes fit behind @p req inside a block of
+///           @p block bytes.  Asked on both sides -- writing it and checking it
+///           -- so neither has to remember what the other did.
+/// \~spanish Si los bytes de guarda caben detras de @p req dentro de un bloque
+///           de @p block bytes.  Se pregunta por los dos lados -- al escribirlo
+///           y al comprobarlo -- para que ninguno tenga que recordar lo que
+///           hizo el otro.
+/// \~
 [[gnu::always_inline]] inline bool canary_fits(size_t req,
                                                size_t block) noexcept {
     return req + kCanaryBytes <= block;
@@ -871,9 +972,15 @@ unsigned check_canary(const void *p, size_t req) noexcept {
 //  Start-up
 // =========================================================================
 
-/// A number from the environment, clamped.  Clamped and not rejected because a
-/// typo in a knob must not silently switch the checker off: asking for level 9
-/// gets the highest there is, which is what the person meant.
+/// \~english A number from the environment, clamped.  Clamped and not rejected
+///           because a typo in a knob must not silently switch the checker off:
+///           asking for level 9 gets the highest there is, which is what the
+///           person meant.
+/// \~spanish Un numero del entorno, acotado.  Acotado y no rechazado porque una
+///           errata en un ajuste no puede apagar el comprobador en silencio:
+///           pedir el nivel 9 da el mas alto que haya, que es lo que la persona
+///           queria decir.
+/// \~
 unsigned env_num(const char *name, unsigned def, unsigned max) noexcept {
     char buf[16];
     const size_t n = os_env(name, buf, sizeof buf);
@@ -889,8 +996,12 @@ unsigned env_num(const char *name, unsigned def, unsigned max) noexcept {
 }
 
 /**
- * @brief Sets the checker up, and says whether it can work yet.
+ * @brief
+ * \~english Sets the checker up, and says whether it can work yet.
+ * \~spanish Monta el comprobador, y dice si ya puede trabajar.
+ * \~
  *
+ * \~english
  * TWO STEPS AND NOT ONE, and the reason cost a debugging round: the knobs can
  * be read at any time, but the shadow can only be sized once the ALLOCATOR'S
  * region exists -- and on the very first allocation of the process it does not,
@@ -901,11 +1012,30 @@ unsigned env_num(const char *name, unsigned def, unsigned max) noexcept {
  * So the knobs latch and the shadow retries.  Not a constructor either: by then
  * the allocator is already answering, and a constructor runs at a moment nobody
  * chose.
+ *
+ * \~spanish
+ * DOS PASOS Y NO UNO, y la razon costo una vuelta de depuracion: los ajustes se
+ * pueden leer en cualquier momento, pero el sombreado solo se puede dimensionar
+ * cuando existe la region DEL ASIGNADOR -- y en la primerisima reserva del
+ * proceso no existe, porque esa reserva es la que la crea --.  Un solo paso que
+ * se marcara "hecho" en esa primera llamada dejaba el sombreado en nada PARA
+ * SIEMPRE, y entonces el comprobador daba una corrida limpia sobre un programa
+ * lleno de fallos a proposito.
+ *
+ * Asi que los ajustes se fijan y el sombreado REINTENTA.  Tampoco desde un
+ * constructor: para entonces el asignador ya esta contestando, y un constructor
+ * corre en un momento que no eligio nadie.
+ * \~
  */
 /**
- * @brief The knobs, the depot and the guarded table.  Everything but the
- *        shadow.
+ * @brief
+ * \~english The knobs, the depot and the guarded table.  Everything but the
+ *           shadow.
+ * \~spanish Los ajustes, el deposito y la tabla de bloques con guarda.  Todo
+ *           menos el sombreado.
+ * \~
  *
+ * \~english
  * SEPARATE FROM THE SHADOW because they become usable at different moments, and
  * tying them together made the guard level never run: the shadow needs the
  * allocator's region, which on the very first allocation of the process does
@@ -913,6 +1043,16 @@ unsigned env_num(const char *name, unsigned def, unsigned max) noexcept {
  * it lives on pages of its own with its own table.  Asking for both meant the
  * first allocation was never guarded, and in a program whose first allocation
  * is the one being tested, that means NONE of them were.
+ *
+ * \~spanish
+ * SEPARADO DEL SOMBREADO porque se vuelven usables en momentos distintos, y
+ * atarlos hizo que el nivel de guarda no corriera nunca: el sombreado necesita
+ * la region del asignador, que en la primerisima reserva del proceso todavia no
+ * existe -- y un bloque con guarda no usa el sombreado para nada, porque vive
+ * en paginas propias con su propia tabla --.  Pedir los dos significaba que la
+ * primera reserva nunca iba guardada, y en un programa cuya primera reserva es
+ * justo la que se esta probando, eso son TODAS.
+ * \~
  */
 bool ensure_config() noexcept;
 
@@ -921,9 +1061,14 @@ bool ensure_ready() noexcept {
     if (detail::g_san_level == SanLevel::Off) return false;
     if (g_rows != nullptr) return true;
 
-    /* Sized by what the region ACTUALLY reserved, never by `kRegionBytes`: the
-     * region asks for a maximum and takes what the system gives, so the
-     * constant would size this for memory that may not exist. */
+    /* \~english Sized by what the region ACTUALLY reserved, never by
+     * `kRegionBytes`: the region asks for a maximum and takes what the system
+     * gives, so the constant would size this for memory that may not exist.
+     *
+     * \~spanish Dimensionado por lo que la region reservo DE VERDAD, nunca por
+     * `kRegionBytes`: la region pide un maximo y se queda con lo que le da el
+     * sistema, asi que la constante lo dimensionaria para memoria que puede no
+     * existir.  \~ */
     const size_t reserved = host_region_reserved();
     if (reserved == 0) return false; // no region yet: try again next time
 
@@ -965,9 +1110,13 @@ bool ensure_config() noexcept {
                                             unsigned(SanGuard::Underflow)));
             g_exit_code = env_num("VESTA_ALLOC_SAN_EXITCODE", 1, 2);
 
-            /* The table for the guarded blocks, and only when that level was
-             * asked for: it is two and a half megabytes, and a level that is
-             * not in force should not cost them. */
+            /* \~english The table for the guarded blocks, and only when that
+             * level was asked for: it is two and a half megabytes, and a level
+             * that is not in force should not cost them.
+             *
+             * \~spanish La tabla de los bloques con guarda, y solo cuando se ha
+             * pedido ese nivel: son dos megas y medio, y un nivel que no esta
+             * en vigor no puede costarlos.  \~ */
             if (detail::g_san_level >= SanLevel::Guard) {
                 void *t = os_alloc(sizeof(Guarded) * kGuardSlots, kOsReadWrite);
                 if (t != nullptr) {
@@ -1011,20 +1160,35 @@ bool ensure_config() noexcept {
 //  What the allocator calls
 // =========================================================================
 
-/* THE SET-UP GOES FIRST, IN BOTH ENTRIES, and it is not a detail: the level
- * starts at `Off` and only becomes what the environment asked for inside
+/* \~english THE SET-UP GOES FIRST, IN BOTH ENTRIES, and it is not a detail: the
+ * level starts at `Off` and only becomes what the environment asked for inside
  * `ensure_ready`.  Testing the level before running it means the answer is
  * always `Off`, the checker never starts, and it reports a clean run on a
  * program full of mistakes -- which is the one failure mode a checker must not
- * have.  Found by pointing it at four deliberate bugs and getting zero.
+ * have.  Found by pointing it at four deliberate bugs and getting zero.  And it
+ * has to be in `san_grow` too, not only in `san_on_alloc`: `san_grow` is what
+ * reserves the room the canary is written into, so if it sits out the first
+ * allocation while `san_on_alloc` does not, the canary goes past the end of a
+ * block that has no room for it.
  *
- * And it has to be in `san_grow` too, not only in `san_on_alloc`: `san_grow` is
- * what reserves the room the canary is written into, so if it sits out the
- * first allocation while `san_on_alloc` does not, the canary goes past the end
- * of a block that has no room for it. */
+ * \~spanish EL MONTAJE VA PRIMERO, EN LAS DOS ENTRADAS, y no es un detalle: el
+ * nivel arranca en `Off` y solo pasa a ser lo que pidio el entorno dentro de
+ * `ensure_ready`.  Mirar el nivel antes de ejecutarlo significa que la
+ * respuesta es siempre `Off`, el comprobador no arranca nunca, y da una corrida
+ * limpia sobre un programa lleno de fallos -- que es el unico modo de fallo que
+ * un comprobador no puede tener --.  Se descubrio apuntandolo a cuatro fallos a
+ * proposito y sacando cero.  Y tiene que estar tambien en `san_grow`, no solo
+ * en `san_on_alloc`: `san_grow` es quien reserva el sitio donde se escribe el
+ * canario, asi que si se salta la primera reserva y `san_on_alloc` no, el
+ * canario acaba pasado el final de un bloque que no tiene sitio para el.  \~ */
 /**
- * @brief The one entry the allocator calls, which decides everything else.
+ * @brief
+ * \~english The one entry the allocator calls, which decides everything else.
+ * \~spanish La unica entrada que llama el asignador, y que decide todo lo
+ *           demas.
+ * \~
  *
+ * \~english
  * ONE OUT-OF-LINE CALL, and the reason is measured: with three -- one to grow
  * the request, one to try the guarded path, one to record the block -- an
  * allocation cost 12.4 ns against the 4.9 of a build without the checker, with
@@ -1033,10 +1197,25 @@ bool ensure_config() noexcept {
  *
  * The set-up question is asked ONCE here, and when the answer is no the whole
  * thing is a call, a compare and the ordinary path.
+ *
+ * \~spanish
+ * UNA LLAMADA FUERA DE LINEA, y la razon esta medida: con tres -- una para
+ * crecer la peticion, otra para probar el camino con guarda, otra para apuntar
+ * el bloque -- una reserva costaba 12,4 ns frente a los 4,9 de un build sin
+ * comprobador, y con el comprobador APAGADO en ejecucion.  Dos tercios de eso
+ * era preguntar tres veces por separado si habia algo que hacer.
+ *
+ * La pregunta del montaje se hace UNA vez aqui, y cuando la respuesta es que no
+ * todo esto son una llamada, una comparacion y el camino de siempre.
+ * \~
  */
-/* The three that used to be public and are now only reachable through the door
- * above.  Declared here because that door is defined first, and it reads better
- * first: it is the one thing the allocator knows about. */
+/* \~english The three that used to be public and are now only reachable
+ * through the door above.  Declared here because that door is defined first,
+ * and it reads better first: it is the one thing the allocator knows about.
+ *
+ * \~spanish Las tres que eran publicas y ahora solo se alcanzan por la puerta
+ * de arriba.  Declaradas aqui porque esa puerta se define antes, y antes se lee
+ * mejor: es lo unico que el asignador conoce.  \~ */
 size_t san_grow(size_t n) noexcept;
 void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept;
 void san_on_alloc(void *p, size_t req, const void *pc, const void *fp) noexcept;
@@ -1141,10 +1320,15 @@ size_t san_grow(size_t n) noexcept {
  * \~
  */
 void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
-    /* The CONFIG and not the whole set-up: a guarded block does not touch the
-     * shadow, so waiting for the shadow would keep the very first allocation of
-     * the process -- and in a small program, every allocation -- out of the
-     * level that was asked for. */
+    /* \~english The CONFIG and not the whole set-up: a guarded block does not
+     * touch the shadow, so waiting for the shadow would keep the very first
+     * allocation of the process -- and in a small program, every allocation --
+     * out of the level that was asked for.
+     *
+     * \~spanish Los AJUSTES y no el montaje entero: un bloque con guarda no
+     * toca el sombreado, asi que esperar al sombreado dejaria la primerisima
+     * reserva del proceso -- y en un programa pequeno, todas -- fuera del nivel
+     * que se habia pedido.  \~ */
     if (!ensure_config() || detail::g_san_level < SanLevel::Guard)
         return nullptr;
     if (g_guarded == nullptr || n == 0) return nullptr;
@@ -1154,9 +1338,13 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     const size_t total = data + page; // the guard
     if (data < n) return nullptr;     // wrapped: refuse rather than serve wrong
 
-    /* Reserved WITHOUT permissions and then only the data pages committed: what
-     * is left is the guard, and it is unmapped because nobody ever asked for
-     * it, not because something took it away. */
+    /* \~english Reserved WITHOUT permissions and then only the data pages
+     * committed: what is left is the guard, and it is unmapped because nobody
+     * ever asked for it, not because something took it away.
+     *
+     * \~spanish Reservado SIN permisos y luego comprometidas solo las paginas
+     * de datos: lo que queda es la guarda, y esta sin mapear porque nadie la
+     * pidio nunca, no porque algo se la quitara.  \~ */
     void *base = os_reserve(total);
     if (base == nullptr) return nullptr;
     if (!os_commit(base, data, kOsReadWrite)) {
@@ -1168,9 +1356,14 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     unsigned char *p;
     size_t tail;
     if (g_guard_edge == SanGuard::Underflow) {
-        /* The other edge: the block starts where the mapped pages start, so
-         * reading or writing BEFORE it is what faults.  Then the guard is the
-         * page before, and nothing watches the end. */
+        /* \~english The other edge: the block starts where the mapped pages
+         * start, so reading or writing BEFORE it is what faults.  Then the
+         * guard is the page before, and nothing watches the end.
+         *
+         * \~spanish El otro borde: el bloque empieza donde empiezan las paginas
+         * mapeadas, asi que lo que falla es leer o escribir ANTES de el.
+         * Entonces la guarda es la pagina de delante, y nadie vigila el final.
+         * \~ */
         p = start + page;
         tail = 0;
     } else {
@@ -1238,11 +1431,18 @@ bool guarded_free(void *p, const void *fp) noexcept {
     g->free_stack = intern_stack(frames, nf, walked);
     g->state = kStFreed;
 
-    /* DECOMMITTED, NOT FREED.  The pages go, so touching the block from now on
-     * faults where it is touched; the range stays ours, so the address is never
-     * handed to anybody else and the fault is always about THIS block.  That is
-     * what makes a use-after-free point at the right code -- and what makes
-     * this level expensive. */
+    /* \~english DECOMMITTED, NOT FREED.  The pages go, so touching the block
+     * from now on faults where it is touched; the range stays ours, so the
+     * address is never handed to anybody else and the fault is always about
+     * THIS block.  That is what makes a use-after-free point at the right code
+     * -- and what makes this level expensive.
+     *
+     * \~spanish DESCOMPROMETIDO, NO LIBERADO.  Las paginas se van, asi que
+     * tocar el bloque a partir de ahora falla donde se toca; el rango sigue
+     * siendo nuestro, asi que la direccion no se le entrega a nadie mas y el
+     * fallo siempre es sobre ESTE bloque.  Eso es lo que hace que un uso
+     * despues de liberar apunte al codigo correcto -- y lo que hace caro este
+     * nivel.  \~ */
     os_decommit(const_cast<void *>(g->base), g->total - os_page_size());
     return true;
 }
@@ -1251,9 +1451,13 @@ void san_on_alloc(void *p, size_t req, const void *pc,
                   const void *fp) noexcept {
     if (p == nullptr) return;
 
-    /* A guarded block wrote its own entry when it was served, and it does not
-     * live in the region, so the shadow would count it as something it could
-     * not look at -- which would be a lie in the other direction. */
+    /* \~english A guarded block wrote its own entry when it was served, and it
+     * does not live in the region, so the shadow would count it as something it
+     * could not look at -- which would be a lie in the other direction.
+     *
+     * \~spanish Un bloque con guarda escribio su propia entrada al servirse, y
+     * no vive en la region, asi que el sombreado lo contaria como algo que no
+     * pudo mirar -- que seria mentir en el otro sentido.  \~ */
     if (detail::g_san_level >= SanLevel::Guard && guard_find(p) != nullptr)
         return;
 
@@ -1265,9 +1469,14 @@ void san_on_alloc(void *p, size_t req, const void *pc,
         return;
     }
 
-    /* A WRITE AFTER FREE, caught where it can be caught without a page each:
-     * the block was poisoned when it was released, so anything that is not the
-     * poison now was written by somebody who no longer owned it. */
+    /* \~english A WRITE AFTER FREE, caught where it can be caught without a
+     * page each: the block was poisoned when it was released, so anything that
+     * is not the poison now was written by somebody who no longer owned it.
+     *
+     * \~spanish UNA ESCRITURA DESPUES DE LIBERAR, cazada donde se puede cazar
+     * sin una pagina por bloque: el bloque se enveneno al soltarlo, asi que
+     * todo lo que ahora no sea el veneno lo escribio alguien que ya no era su
+     * dueno.  \~ */
     if (detail::g_san_level >= SanLevel::Poison &&
         meta_state(s->meta) == kStFreed && g_poison != SanPoison::None) {
         const size_t from = poison_from();
@@ -1301,14 +1510,22 @@ void san_on_alloc(void *p, size_t req, const void *pc,
      * allocator already keeps, so nothing new is stored anywhere. */
     s->seq = thread_allocs(c);
 
-    /* ONLY IF IT FITS, and the condition is checked and not assumed.  On the
-     * very first allocation of the process `san_grow` sits out -- the region it
-     * needs does not exist yet -- while this call, one instant later, finds it
-     * ready.  Writing the canary then would put it past the end of a block that
-     * was never grown to hold it: the checker corrupting memory.
-     *
+    /* \~english ONLY IF IT FITS, and the condition is checked and not assumed.
+     * On the very first allocation of the process `san_grow` sits out -- the
+     * region it needs does not exist yet -- while this call, one instant later,
+     * finds it ready.  Writing the canary then would put it past the end of a
+     * block that was never grown to hold it: the checker corrupting memory.
      * The same condition is asked again when the block is released, so the two
-     * sides agree without having to remember anything. */
+     * sides agree without having to remember anything.
+     *
+     * \~spanish SOLO SI CABE, y la condicion se comprueba, no se da por hecha.
+     * En la primerisima reserva del proceso `san_grow` se queda fuera -- la
+     * region que necesita todavia no existe -- mientras que esta llamada, un
+     * instante despues, ya la encuentra montada.  Escribir el canario entonces
+     * lo pondria pasado el final de un bloque que nunca crecio para tenerlo: el
+     * comprobador corrompiendo memoria.  La misma condicion se pregunta otra
+     * vez al soltar el bloque, asi que los dos lados coinciden sin tener que
+     * recordar nada.  \~ */
     if (detail::g_san_level >= SanLevel::Canary && canary_fits(req, block))
         write_canary(p, req);
 }
@@ -1317,11 +1534,17 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     if (p == nullptr) return true;
     if (!ensure_config() || detail::g_san_level == SanLevel::Off) return true;
 
-    /* A guarded block never goes back to the allocator: it was never served by
-     * it, and handing it over would send a pointer from outside the region to
-     * `no_foreign_free`, which stops the process.  Answering false is what
-     * keeps it here -- and it is asked BEFORE the shadow, which that block does
-     * not have. */
+    /* \~english A guarded block never goes back to the allocator: it was never
+     * served by it, and handing it over would send a pointer from outside the
+     * region to `no_foreign_free`, which stops the process.  Answering false is
+     * what keeps it here -- and it is asked BEFORE the shadow, which that block
+     * does not have.
+     *
+     * \~spanish Un bloque con guarda no vuelve nunca al asignador: no lo sirvio
+     * el, y entregarselo mandaria un puntero de fuera de la region a
+     * `no_foreign_free`, que para el proceso.  Contestar false es lo que lo
+     * mantiene aqui -- y se pregunta ANTES que el sombreado, que ese bloque no
+     * tiene.  \~ */
     if (detail::g_san_level >= SanLevel::Guard &&
         guarded_free(p, __builtin_frame_address(0)))
         return false;
@@ -1337,10 +1560,17 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     const uint32_t st = meta_state(s->meta);
 
     if (st == kStFreed) {
-        /* A DOUBLE FREE, and it is PROVEN: this exact block is already on a
-         * free list.  Letting it through would push it a second time and hand
-         * one block to two owners, so the checker would have turned a reported
-         * bug into a corrupted heap.  That is why this answers false. */
+        /* \~english A DOUBLE FREE, and it is PROVEN: this exact block is
+         * already on a free list.  Letting it through would push it a second
+         * time and hand one block to two owners, so the checker would have
+         * turned a reported bug into a corrupted heap.  That is why this
+         * answers false.
+         *
+         * \~spanish UNA DOBLE LIBERACION, y es DEMOSTRADA: este mismo bloque ya
+         * esta en una lista de libres.  Dejarla pasar lo meteria una segunda
+         * vez y entregaria un bloque a dos duenos, con lo que el comprobador
+         * habria convertido un fallo avisado en un monton corrompido.  Por eso
+         * esto contesta false.  \~ */
         verdict(Certainty::Proven, "released twice", p);
         print_stack("allocated", s->alloc_stack);
         print_stack("released the first time", s->free_stack);
@@ -1354,11 +1584,17 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     }
 
     if (st == kStNever) {
-        /* Ours by address, but we never saw it handed out.  That is what a
-         * block allocated before the checker was ready looks like, and also
-         * what a block from a door that is not instrumented looks like, so it
-         * is SUSPECTED and the release goes ahead: refusing would break a
-         * program that is doing nothing wrong. */
+        /* \~english Ours by address, but we never saw it handed out.  That is
+         * what a block allocated before the checker was ready looks like, and
+         * also what a block from a door that is not instrumented looks like, so
+         * it is SUSPECTED and the release goes ahead: refusing would break a
+         * program that is doing nothing wrong.
+         *
+         * \~spanish Nuestro por la direccion, pero no lo vimos entregarse.  Eso
+         * es lo que parece un bloque reservado antes de que el comprobador
+         * estuviera listo, y tambien lo que parece uno que entro por una puerta
+         * sin instrumentar, asi que es SOSPECHA y la liberacion sigue adelante:
+         * negarse romperia un programa que no esta haciendo nada mal.  \~ */
         verdict(Certainty::Suspected,
                 "released a block the checker never saw handed out", p);
         g_uncovered.fetch_add(1, std::memory_order_relaxed);
@@ -1386,17 +1622,27 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     const detail::ThreadCache *c = detail::current_cache();
     const uint32_t tid = detail::have_cache(c) ? c->id : 0;
 
-    /* Allocated on one thread and released on another.  NOT a verdict: it is
-     * legal and the allocator handles it.  It is counted because it is the
-     * shape of ownership crossing threads by accident, which is worth seeing
-     * even when nothing is broken. */
+    /* \~english Allocated on one thread and released on another.  NOT a
+     * verdict: it is legal and the allocator handles it.  It is counted because
+     * it is the shape of ownership crossing threads by accident, which is worth
+     * seeing even when nothing is broken.
+     *
+     * \~spanish Reservado en un hilo y soltado en otro.  NO es un veredicto: es
+     * legal y el asignador lo maneja.  Se cuenta porque tiene la forma de la
+     * propiedad cruzando de hilo sin querer, que merece verse aunque no haya
+     * nada roto.  \~ */
     const bool same_thread = meta_alloc_thread(s->meta) == tid;
     if (!same_thread) g_cross_thread.fetch_add(1, std::memory_order_relaxed);
 
-    /* WHAT THIS BLOCK TURNED OUT TO BE.  Here, where it dies, is the only place
-     * that knows how long it lived -- and adding it up per site is what turns
-     * the two axes from something a caller declares into something the run
-     * MEASURES. */
+    /* \~english WHAT THIS BLOCK TURNED OUT TO BE.  Here, where it dies, is the
+     * only place that knows how long it lived -- and adding it up per site is
+     * what turns the two axes from something a caller declares into something
+     * the run MEASURES.
+     *
+     * \~spanish LO QUE ESTE BLOQUE RESULTO SER.  Aqui, donde muere, es el unico
+     * sitio que sabe cuanto vivio -- y sumarlo por sitio es lo que convierte
+     * los dos ejes de algo que declara quien llama en algo que la corrida MIDE.
+     * \~ */
     note_death(s->alloc_stack, s->req, same_thread, s->seq, thread_allocs(c));
 
     s->free_stack = intern_stack(frames, n, walked);
@@ -1425,9 +1671,15 @@ struct Leak {
     uint64_t bytes;
 };
 
-/// Sorted by bytes and then by stack id, which is what makes two runs of the
-/// same program print the same list.  A report that reorders itself between
-/// runs cannot gate a build, and gating a build is the point.
+/// \~english Sorted by bytes and then by stack id, which is what makes two runs
+///           of the same program print the same list.  A report that reorders
+///           itself between runs cannot gate a build, and gating a build is the
+///           point.
+/// \~spanish Ordenado por bytes y luego por identificador de pila, que es lo
+///           que hace que dos corridas del mismo programa impriman la misma
+///           lista.  Un informe que se reordena entre corridas no puede cortar
+///           un build, y cortar un build es de lo que se trata.
+/// \~
 void sort_leaks(Leak *v, uint32_t n) noexcept {
     for (uint32_t i = 1; i < n; ++i) {
         const Leak k = v[i];
@@ -1443,14 +1695,28 @@ void sort_leaks(Leak *v, uint32_t n) noexcept {
 }
 
 /**
- * @brief Walks the shadow at exit and says what never came back.
+ * @brief
+ * \~english Walks the shadow at exit and says what never came back.
+ * \~spanish Recorre el sombreado al salir y dice que no volvio nunca.
+ * \~
  *
+ * \~english
  * WHY THE MODULE IS ASKED HERE AND NOT WHEN ALLOCATING: because the allocator
  * must not pay for the checker's comfort.  The shadow keeps a raw address; who
  * it belongs to is worked out ONCE, at the end, and only for the blocks that
  * survived.  It is also what replaces a suppression list -- third-party
  * libraries leak on purpose, and a list of exceptions is how a checker starts
  * lying, so the split comes out DERIVED from where the code lives.
+ *
+ * \~spanish
+ * POR QUE EL MODULO SE PREGUNTA AQUI Y NO AL RESERVAR: porque el asignador no
+ * puede pagar la comodidad del comprobador.  El sombreado guarda una direccion
+ * cruda; de quien es se averigua UNA vez, al final, y solo por los bloques que
+ * sobrevivieron.  Es ademas lo que sustituye a una lista de supresiones -- las
+ * librerias de terceros sueltan cosas a proposito, y una lista de excepciones
+ * es como un comprobador empieza a mentir, asi que el reparto sale DERIVADO de
+ * donde vive el codigo.
+ * \~
  */
 void report() noexcept {
     if (g_rows == nullptr || g_depot == nullptr) return;
@@ -1484,9 +1750,13 @@ void report() noexcept {
                  unsigned(detail::g_san_level), unsigned(g_poison),
                  unsigned(g_guard_edge));
 
-    /* WHAT IT DID NOT LOOK AT, and it goes FIRST.  A checker that stays quiet
-     * about its blind spots is read as "there is nothing there", which is the
-     * one way this whole thing could do harm. */
+    /* \~english WHAT IT DID NOT LOOK AT, and it goes FIRST.  A checker that
+     * stays quiet about its blind spots is read as "there is nothing there",
+     * which is the one way this whole thing could do harm.
+     *
+     * \~spanish LO QUE NO MIRO, y va PRIMERO.  Un comprobador que se calla sus
+     * puntos ciegos se lee como "ahi no hay nada", que es la unica forma en que
+     * todo esto podria hacer dano.  \~ */
     const uint64_t unc = g_uncovered.load(std::memory_order_relaxed);
     if (unc != 0)
         std::fprintf(stderr,
@@ -1531,11 +1801,19 @@ void report() noexcept {
                      "seeing\n",
                      (unsigned long long)cross);
 
-    /* WHAT THE SITES ARE, measured.  This is the half of the report that is not
-     * about mistakes: it says, for every place that allocates, how long its
-     * blocks lived and whether they were all the same size -- which is exactly
-     * the two axes a caller can declare.  Declaring then stops being the source
-     * of truth and becomes a claim with something to check it against. */
+    /* \~english WHAT THE SITES ARE, measured.  This is the half of the report
+     * that is not about mistakes: it says, for every place that allocates, how
+     * long its blocks lived and whether they were all the same size -- which is
+     * exactly the two axes a caller can declare.  Declaring then stops being
+     * the source of truth and becomes a claim with something to check it
+     * against.
+     *
+     * \~spanish LO QUE SON LOS SITIOS, medido.  Esta es la mitad del informe
+     * que no va de fallos: dice, por cada sitio que reserva, cuanto vivieron
+     * sus bloques y si eran todos del mismo tamano -- que son justo los dos
+     * ejes que quien llama puede declarar.  Declarar deja entonces de ser la
+     * fuente de verdad y pasa a ser una afirmacion con algo contra lo que
+     * contrastarla.  \~ */
     if (g_life != nullptr) {
         uint32_t sites = 0;
         for (uint32_t i = 1; i < kDepotSlots; ++i)
@@ -1601,14 +1879,22 @@ void report() noexcept {
     os_free(mem, bytes);
     std::fflush(stderr);
 
-    /* THE VERDICT REACHES THE SHELL, which is what lets this gate a build
-     * instead of being a wall of text somebody scrolls past.
+    /* \~english THE VERDICT REACHES THE SHELL, which is what lets this gate a
+     * build instead of being a wall of text somebody scrolls past.  `_Exit` and
+     * not `exit`: we are already inside static destruction, and calling `exit`
+     * from there is undefined.  The price is that the static destructors that
+     * had not run yet do not run -- which is why it is a knob and not a law,
+     * and why the line below says it out loud rather than leaving somebody to
+     * wonder where the rest of the output went.
      *
-     * `_Exit` and not `exit`: we are already inside static destruction, and
-     * calling `exit` from there is undefined.  The price is that the static
-     * destructors that had not run yet do not run -- which is why it is a knob
-     * and not a law, and why the line below says it out loud rather than
-     * leaving somebody to wonder where the rest of the output went. */
+     * \~spanish EL VEREDICTO LLEGA AL INTERPRETE DE ORDENES, que es lo que
+     * permite que esto corte un build en vez de ser un muro de texto que
+     * alguien pasa de largo.  `_Exit` y no `exit`: ya estamos dentro de la
+     * destruccion estatica, y llamar a `exit` desde ahi es indefinido.  El
+     * precio es que los destructores estaticos que faltaran no corren -- por lo
+     * que es un ajuste y no una ley, y por lo que la linea de abajo lo dice en
+     * voz alta en vez de dejar a alguien preguntandose donde fue el resto de la
+     * salida.  \~ */
     const uint64_t proven = g_proven.load(std::memory_order_relaxed);
     const uint64_t all = g_verdicts.load(std::memory_order_relaxed);
     const uint64_t gating = g_exit_code >= 2 ? all : proven;
@@ -1625,9 +1911,15 @@ void report() noexcept {
     }
 }
 
-/// Runs the report last thing, and only when the checker actually ran.  A
-/// destructor and not `atexit`: `atexit` allocates on some runtimes, and this
-/// is the one place that must not ask the allocator for anything at the end.
+/// \~english Runs the report last thing, and only when the checker actually
+///           ran.  A destructor and not `atexit`: `atexit` allocates on some
+///           runtimes, and this is the one place that must not ask the
+///           allocator for anything at the end.
+/// \~spanish Corre el informe lo ultimo, y solo si el comprobador llego a
+///           correr.  Un destructor y no `atexit`: `atexit` reserva en algunos
+///           runtimes, y este es el unico sitio que no puede pedirle nada al
+///           asignador al final.
+/// \~
 struct Reporter {
     ~Reporter() {
         if (detail::g_san_level != SanLevel::Off) report();

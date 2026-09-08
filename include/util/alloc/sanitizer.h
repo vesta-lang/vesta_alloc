@@ -397,19 +397,19 @@ void *san_alloc(size_t n) noexcept;
  *         corre el camino de siempre, sin tocar.
  * \~
  */
-/* `san_grow`, the guarded path and the recording of a block used to be here.
- * They are INTERNAL now, behind `san_alloc`, and the move is not tidying: each
- * of them read the caller's return address on its own, and reading it from
- * inside another one of them yields an address in the CHECKER instead of in the
- * program.  With one door, the address is read once where it is still true and
- * handed down as an argument.
+/* \~english `san_grow`, the guarded path and the recording of a block used to
+ * be here.  They are INTERNAL now, behind `san_alloc`, and the move is not
+ * tidying: each of them read the caller's return address on its own, and
+ * reading it from inside another one of them yields an address in the CHECKER
+ * instead of in the program.  With one door, the address is read once where it
+ * is still true and handed down as an argument.
  *
- * `san_grow`, el camino con guarda y el apuntar un bloque estaban aqui.  Ahora
+ * \~spanish `san_grow`, el camino con guarda y el apuntar un bloque estaban aqui.  Ahora
  * son INTERNOS, detras de `san_alloc`, y el cambio no es orden: cada uno leia
  * por su cuenta la direccion de retorno del llamante, y leerla desde dentro de
  * otro de ellos da una direccion del COMPROBADOR en vez de una del programa.
  * Con una sola puerta se lee una vez, donde todavia es cierta, y se pasa como
- * argumento. */
+ * argumento.  \~ */
 
 /**
  * @brief
@@ -528,13 +528,14 @@ uint64_t san_longest_life() noexcept;
 
 #else // the checker is not in this build / el comprobador no esta en este build
 
-/* Empty and always inlined: with the macro off, `host_alloc` and `host_free`
- * have to generate the same instructions as if this file did not exist.  That
- * is a promise the build checks, not an intention.
+/* \~english Empty and always inlined: with the macro off, `host_alloc` and
+ * `host_free` have to generate the same instructions as if this file did not
+ * exist.  That is a promise the build checks, not an intention.
  *
- * Vacias y siempre en linea: con la macro apagada, `host_alloc` y `host_free`
- * tienen que generar las mismas instrucciones que si este fichero no
- * existiera.  Es una promesa que el build COMPRUEBA, no una intencion. */
+ * \~spanish Vacias y siempre en linea: con la macro apagada, `host_alloc` y
+ * `host_free` tienen que generar las mismas instrucciones que si este fichero
+ * no existiera.  Es una promesa que el build COMPRUEBA, no una intencion.
+ * \~ */
 
 [[gnu::always_inline]] inline void *san_alloc(size_t) noexcept {
     /* \~english Never reached: with the macro off the allocator does not call
