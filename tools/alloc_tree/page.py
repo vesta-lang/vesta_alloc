@@ -30,7 +30,7 @@ import os
 
 from .i18n import LANGS, STRINGS
 from .ours import is_library_frame
-from .text import FILES
+from .text import CHECK_FILES, FILES
 from .tree import human_bytes
 
 TEMPLATES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -71,7 +71,12 @@ def _tables(report):
     screen and what is in the directory.  What is translated is what it holds.
     """
     out = []
-    for name, key in FILES:
+    # The checker's three go LAST and only when the run had them.  Last because
+    # they are a different population and reading them first invites adding
+    # their numbers to the ones above; only when present because three empty
+    # tables read like an export that lost them.
+    names = FILES + (CHECK_FILES if report.check else ())
+    for name, key in names:
         rows = report.raw.get(name, [])
         columns = report.columns.get(name, [])
         out.append({
@@ -106,7 +111,48 @@ def _payload(report):
     precooked trees to a fraction of that, because in a call tree the same
     function name appears under dozens of branches.
     """
-    site_columns = report.columns.get("sites.csv", [])
+    data = _dataset(report, report.sites, report.chain_of,
+                    report.columns.get("sites.csv", []))
+    # What each bucket means, so the page can label the split without a second
+    # copy of the boundaries -- they come from the export, which took them
+    # from the allocator.
+    data["buckets"] = [[int(r["bucket"]), int(r["upper_bytes"])]
+                       for r in report.sizes]
+    # The checker's population, built the SAME way and kept apart.  The page
+    # switches between the two with one control and folds the tree it needs
+    # with the same code, which is the whole reason for giving them one shape:
+    # a second renderer would drift from the first the day one of them gains a
+    # column.
+    if report.check:
+        check = _dataset(report, report.check.sites, report.check.chain_of,
+                         report.columns.get("check_sites.csv", []))
+        check["buckets"] = []
+        data["check"] = check
+    return dict(data,
+                # The whole catalogue travels, not the chosen language: the
+                # reader who wants the other one is not going to run the tool
+                # again, and a page that has to be regenerated to change
+                # language is a page that stays in the language of whoever
+                # generated it.
+                strings=STRINGS, langs=[list(l) for l in LANGS],
+                meta=_meta(report),
+                # The checker's warnings travel with the allocator's, in one
+                # list.  They are about the same run, and splitting them into
+                # two boxes would let a reader dismiss one box and miss that
+                # half of the bytes were only weighed.
+                warnings=[[k, p] for k, p in report.warnings()]
+                + ([[k, p] for k, p in report.check.warnings()]
+                   if report.check else []))
+
+
+def _dataset(report, site_list, chain_of, site_columns):
+    """One population, interned: the frames written once and the sites into
+    them.
+
+    Taken out of `_payload` so the checker's export goes through exactly this
+    code and not a copy of it.  The two differ in what they measured, never in
+    how they are drawn.
+    """
     frames = []
     index = {}
 
@@ -130,8 +176,8 @@ def _payload(report):
         return at
 
     sites = []
-    for site in report.sites:
-        chain = report.chain_of(site)
+    for site in site_list:
+        chain = chain_of(site)
         sites.append({
             "id": site.sid,
             # Innermost first, the order the export writes them in.
@@ -167,22 +213,9 @@ def _payload(report):
             # it was folded from without another lookup table.
             "row": [site.row.get(c, "") for c in site_columns],
         })
-    # What each bucket means, so the page can label the split without a second
-    # copy of the boundaries -- they come from the export, which took them
-    # from the allocator.
-    buckets = [[int(r["bucket"]), int(r["upper_bytes"])]
-               for r in report.sizes]
     return {"frames": frames, "sites": sites, "siteCols": site_columns,
-            "buckets": buckets,
             "totals": {"allocs": sum(s["allocs"] for s in sites),
-                       "bytes": sum(s["bytes"] for s in sites)},
-            # The whole catalogue travels, not the chosen language: the reader
-            # who wants the other one is not going to run the tool again, and
-            # a page that has to be regenerated to change language is a page
-            # that stays in the language of whoever generated it.
-            "strings": STRINGS, "langs": [list(l) for l in LANGS],
-            "meta": _meta(report),
-            "warnings": [[k, p] for k, p in report.warnings()]}
+                       "bytes": sum(s["bytes"] for s in sites)}}
 
 
 def _meta(report):
@@ -233,6 +266,10 @@ def write_page(report, build_tree, out_path, title):
         title=title,
         langs=LANGS,
         tables=tables,
+        # Whether to offer the population switch at all.  Not a disabled
+        # control: one that offers something the file does not carry is a
+        # promise the page cannot keep.
+        has_check=bool(report.check),
         raw_rows=sum(len(t["rows"]) for t in tables),
         css=Markup(_read("page.css")),
         # ORDER MATTERS: `page.js` calls into `tables.js` while it starts up,

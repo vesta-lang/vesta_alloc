@@ -18,7 +18,7 @@ the template arguments are; trimming it to keep the columns straight throws
 away the part that separates two instantiations of the same template.
 """
 from .i18n import t
-from .tree import human_bytes, print_tree
+from .tree import build_tree, human_bytes, print_tree
 
 # The order they are printed in, and the catalogue key that says what each one
 # is.  The description is printed with it: a column called `over_allocs` means
@@ -30,6 +30,16 @@ FILES = (
     ("site_sizes.csv", "file.site_sizes"),
     ("tags.csv", "file.tags"),
     ("summary.csv", "file.summary"),
+)
+
+# The checker's own three, printed only when the run had it.  Kept in a second
+# tuple rather than folded into the one above so that a run WITHOUT the checker
+# does not end with three empty tables -- which reads like an export that lost
+# them, not like a build that never wrote them.
+CHECK_FILES = (
+    ("check_sites.csv", "file.check_sites"),
+    ("check_frames.csv", "file.check_frames"),
+    ("check_summary.csv", "file.check_summary"),
 )
 
 
@@ -68,6 +78,35 @@ def print_table(columns, rows, out):
                   % "  ".join(c.ljust(width[i]) for i, c in enumerate(cells)))
 
 
+def print_check(report, limit, out, lang="en"):
+    """The checker's tree, when the run had one.
+
+    A SECOND tree and not more branches of the first, because the two measure
+    different populations: the allocator's export covers every block through
+    one return address, and this one covers what fits the shadow through a
+    walked stack.  Drawing them as one would add up numbers that do not mean
+    the same thing, and the sum would look more certain than either.
+
+    Silence when there is no export: a run without the checker is the normal
+    case, and a warning for it would train the reader to skip warnings.
+    """
+    check = report.check
+    if check is None:
+        return
+    tree = build_tree(check, True, "", None)
+    out.write("\n== %s ==\n\n%s\n\n" % (t(lang, "chk.title"),
+                                        t(lang, "chk.sub")))
+    weighed = sum(s.weighed_bytes for s in check.sites)
+    alive = sum(s.alive_bytes for s in check.sites)
+    out.write("%s moved, %s in %d stacks; %s only weighed, %s alive at exit\n\n"
+              % (human_bytes(tree.bytes), "{:,}".format(tree.allocs),
+                 len(check.sites), human_bytes(weighed), human_bytes(alive)))
+    for key, params in check.warnings():
+        out.write("WARNING: %s\n" % t(lang, key, **params))
+    out.write("\n")
+    print_tree(tree, tree.allocs, 0, limit, out)
+
+
 def print_header(report, tree, out, lang="en"):
     summary = report.summary
     out.write("\n%s\n" % t(lang, "head.totals",
@@ -88,9 +127,10 @@ def print_report(report, tree, limit, out, tables=True, lang="en"):
     print_header(report, tree, out, lang)
     out.write("\n== %s ==\n\n" % t(lang, "head.tree"))
     print_tree(tree, tree.allocs, 0, limit, out)
+    print_check(report, limit, out, lang)
     if not tables:
         return
-    for name, key in FILES:
+    for name, key in FILES + (CHECK_FILES if report.check else ()):
         rows = report.raw.get(name, [])
         columns = report.columns.get(name, [])
         out.write("\n== %s -- %s (%s) ==\n\n"

@@ -5,7 +5,7 @@
  * License: MIT (see LICENSE).  Part of the VestaVM family.
  *
  * Folding the measurement into a tree.  Nothing in here touches the document:
- * it takes `DATA.sites` and `DATA.frames` and returns nodes.
+ * it takes `VIEW.sites` and `VIEW.frames` and returns nodes.
  *
  * WHY IT IS BUILT HERE AND NOT IN THE GENERATOR.  Because there is more than
  * one tree.  The same sites read from the binary inwards answer "where does
@@ -24,6 +24,29 @@
 'use strict';
 
 var F_FN = 0, F_FILE = 1, F_LINE = 2, F_MOD = 3, F_INLINED = 4, F_LIB = 5;
+
+/*
+ * WHICH POPULATION IS ON SCREEN.  An export can carry two, and they are not
+ * two halves of one measurement: the allocator's covers every block through
+ * ONE return address, and the checker's covers what fits its shadow through a
+ * WALKED stack.  Adding them up would produce a total that is neither.
+ *
+ * So they are drawn one at a time, by the same code.  Everything below reads
+ * `VIEW` and not `DATA`, which is what keeps a second renderer -- and the
+ * drift that comes with it -- from ever being needed.
+ */
+var VIEW = DATA;
+
+/**
+ * Switch population.  The cache is dropped rather than keyed by dataset: the
+ * switch is a deliberate act a reader does a handful of times, while the key
+ * would be paid on every redraw, and a stale tree from the other population is
+ * the one mistake this must not make.
+ */
+function setView(which) {
+  VIEW = (which === 'check' && DATA.check) ? DATA.check : DATA;
+  CACHE = {};
+}
 
 /**
  * The chain to show for a site under the "only my own calls" filter, or null
@@ -54,7 +77,7 @@ function ownChain(site, chain, scope) {
   if (scope === 'extern') {
     if (site.foreign) return chain;
     if (!chain.length) return null;
-    return DATA.frames[chain[0]][F_LIB] ? chain : null;
+    return VIEW.frames[chain[0]][F_LIB] ? chain : null;
   }
 
   // Another module entirely -- the C runtime, a system library.  This one is
@@ -62,9 +85,9 @@ function ownChain(site, chain, scope) {
   if (site.foreign) return null;
   if (!chain.length) return chain;
   if (scope === 'hide')
-    return DATA.frames[chain[0]][F_LIB] ? null : chain;
+    return VIEW.frames[chain[0]][F_LIB] ? null : chain;
   for (var i = 0; i < chain.length; i++)
-    if (!DATA.frames[chain[i]][F_LIB]) return chain.slice(i);
+    if (!VIEW.frames[chain[i]][F_LIB]) return chain.slice(i);
   // All the way out and still library code: there is nobody to hang it on.
   // Inventing a parent would put the allocation under a function that never
   // asked for it.
@@ -98,7 +121,7 @@ function langOfChain(chain) {
    * Un fichero `.c` es C con certeza y un `.cpp` es C++ con certeza; eso lo
    * decide `langOf`, la misma que pinta los nombres. */
   for (var i = 0; i < chain.length; i++) {
-    var f = DATA.frames[chain[i]];
+    var f = VIEW.frames[chain[i]];
     var l = langOf(f[F_FILE], f[F_FN]);
     if (l) return l;
   }
@@ -166,7 +189,7 @@ function groupNode(site, chain, how) {
    * and its file are whose code ASKED -- which is the question.  The innermost
    * would answer `std::string`, which is true and useless. */
   for (var i = chain.length - 1; i >= 0; i--) {
-    var f = DATA.frames[chain[i]];
+    var f = VIEW.frames[chain[i]];
     if (how === 'module' && f[F_MOD]) return makeNode(f[F_MOD], '', 0, f[F_MOD], 0);
     if (how === 'file' && f[F_FILE]) return makeNode(f[F_FILE], f[F_FILE], 0, f[F_MOD], 0);
   }
@@ -218,9 +241,9 @@ function accum(node, site) {
 /// The size split of a branch, biggest bucket first, with its bound.
 function sizesOf(node) {
   var out = [];
-  for (var i = 0; i < DATA.buckets.length; i++) {
-    var b = DATA.buckets[i][0];
-    if (node.sizes[b]) out.push({ b: b, upper: DATA.buckets[i][1],
+  for (var i = 0; i < VIEW.buckets.length; i++) {
+    var b = VIEW.buckets[i][0];
+    if (node.sizes[b]) out.push({ b: b, upper: VIEW.buckets[i][1],
                                   n: node.sizes[b] });
   }
   return out;
@@ -260,8 +283,8 @@ function treeFor(dir, grouping, scope, lang) {
    * escribio: una vista de "solo C" vacia se leeria como "aqui no hay C"
    * cuando lo que falta es con que saberlo. */
   root.noLang = 0;
-  for (var s = 0; s < DATA.sites.length; s++) {
-    var site = DATA.sites[s];
+  for (var s = 0; s < VIEW.sites.length; s++) {
+    var site = VIEW.sites[s];
     var chain = ownChain(site, site.chain, scope);
     /* El idioma se mira SOBRE lo que el ambito dejo, no sobre la cadena
      * entera: si el ambito plego hacia fuera, la funcion que reserva es otra,
@@ -286,7 +309,7 @@ function treeFor(dir, grouping, scope, lang) {
 
     for (var k = 0; k < chain.length; k++) {
       // `chain` is innermost first; top-down walks it backwards.
-      var f = DATA.frames[chain[dir === 'td' ? chain.length - 1 - k : k]];
+      var f = VIEW.frames[chain[dir === 'td' ? chain.length - 1 - k : k]];
       node = childOf(node, f[F_FN], f[F_FILE], f[F_LINE], f[F_MOD], f[F_INLINED]);
       accum(node, site);
     }

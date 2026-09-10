@@ -112,6 +112,12 @@ STRINGS = {
                        "written before that file existed",
         "file.tags": "how much each declared purpose accounts for",
         "file.summary": "the totals, and what could not be resolved",
+        "file.check_sites": "one row per walked STACK: what it moved, what it "
+                            "left behind, and what its blocks turned out to be",
+        "file.check_frames": "one row per (stack, frame, depth): `frame` is "
+                             "the call frame the walk found, `depth` the "
+                             "inline level inside it -- two different axes",
+        "file.check_summary": "what the checker could not cover, and why",
         "head.totals": "{allocs} allocations across {sites} sites, "
                        "{bytes} committed",
         "head.tree": "tree (allocs, % of total, bytes, self, purpose, "
@@ -123,6 +129,32 @@ STRINGS = {
         "warn.evicted": "{n} allocations evicted a weaker entry, so those "
                         "counts are lower bounds",
         "warn.deep": "some chain reached the frame limit ({n}) and may be cut",
+        "warn.check.depotfull": "the checker's stack depot filled up ({cap}): "
+                                "{n} stacks were not recorded",
+        "warn.check.nosite": "{n} blocks ({b} bytes) had no stack to charge "
+                             "them to",
+        "warn.check.outside": "{n} blocks were outside the shadow and could "
+                              "not be tracked",
+        "warn.check.nowalk": "{n} of {total} stacks are ONE frame: the walk "
+                             "found no frame pointer to follow. Build with "
+                             "-fno-omit-frame-pointer and they become real "
+                             "stacks",
+        "chk.title": "The checker: real stacks, measured purpose",
+        "chk.sub": "A different population from the table above, not more "
+                   "rows of it. Here a site is a walked STACK, the purpose is "
+                   "what the blocks turned out to BE -- not what anybody "
+                   "declared -- and the blocks over the small-class limit are "
+                   "weighed but not inspected",
+        "chk.col.weighed": "Only weighed",
+        "chk.col.alive": "Alive at exit",
+        "chk.col.life": "Life (avg/max)",
+        "chk.col.sizes": "Sizes",
+        "chk.col.walked": "Walked",
+        "chk.none": "this run had no checker export "
+                    "(check_sites.csv is missing)",
+        "tool.dataset": "Measurement:",
+        "data.alloc": "allocator: every block, one return address",
+        "data.check": "checker: walked stacks, measured purpose",
     },
     "es": {
         "tab.tree": "Arbol de reservas",
@@ -211,6 +243,13 @@ STRINGS = {
                        "antes de que ese fichero existiera",
         "file.tags": "cuanto se lleva cada proposito declarado",
         "file.summary": "los totales, y lo que no se pudo resolver",
+        "file.check_sites": "una fila por PILA recorrida: cuanto movio, cuanto "
+                            "dejo detras, y que resultaron ser sus bloques",
+        "file.check_frames": "una fila por (pila, marco, profundidad): `frame` "
+                             "es el marco de llamada que encontro el "
+                             "recorrido, `depth` el nivel de inline dentro de "
+                             "el -- dos ejes distintos",
+        "file.check_summary": "lo que el comprobador no pudo cubrir, y por que",
         "head.totals": "{allocs} reservas en {sites} sitios, "
                        "{bytes} comprometidos",
         "head.tree": "arbol (reservas, % del total, bytes, propias, "
@@ -223,6 +262,32 @@ STRINGS = {
                         "asi que esas cuentas son cotas inferiores",
         "warn.deep": "alguna cadena llego al tope de marcos ({n}) y puede "
                      "estar cortada",
+        "warn.check.depotfull": "el deposito de pilas del comprobador se lleno "
+                                "({cap}): {n} pilas no se registraron",
+        "warn.check.nosite": "{n} bloques ({b} bytes) no tenian pila a la que "
+                             "cargarlos",
+        "warn.check.outside": "{n} bloques quedaron fuera de la sombra y no se "
+                              "pudieron seguir",
+        "warn.check.nowalk": "{n} de {total} pilas son de UN marco: el "
+                             "recorrido no encontro puntero de marco que "
+                             "seguir. Compilando con -fno-omit-frame-pointer "
+                             "pasan a ser pilas de verdad",
+        "chk.title": "El comprobador: pilas reales, proposito medido",
+        "chk.sub": "Es otra poblacion, no mas filas de la tabla de arriba. "
+                   "Aqui un sitio es una PILA recorrida, el proposito es lo "
+                   "que los bloques resultaron SER -- no lo que alguien "
+                   "declaro -- y los bloques por encima del limite de clase "
+                   "pequena se pesan pero no se inspeccionan",
+        "chk.col.weighed": "Solo pesado",
+        "chk.col.alive": "Vivo al salir",
+        "chk.col.life": "Vida (media/max)",
+        "chk.col.sizes": "Tamanos",
+        "chk.col.walked": "Recorrida",
+        "chk.none": "esta corrida no trae exportacion del comprobador "
+                    "(falta check_sites.csv)",
+        "tool.dataset": "Medida:",
+        "data.alloc": "asignador: todo bloque, una direccion de retorno",
+        "data.check": "comprobador: pilas recorridas, proposito medido",
     },
 }
 

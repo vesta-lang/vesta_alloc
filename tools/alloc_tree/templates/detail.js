@@ -50,9 +50,9 @@ function detail(node) {
    * so the function that contains the site, the function it physically
    * allocates in, and where that is in the source go next to the numbers. */
   var rowsHtml = ids.map(function (s) {
-    var site = DATA.sites[s];
-    var outer = DATA.frames[site.chain[site.chain.length - 1]];
-    var inner = DATA.frames[site.chain[0]];
+    var site = VIEW.sites[s];
+    var outer = VIEW.frames[site.chain[site.chain.length - 1]];
+    var inner = VIEW.frames[site.chain[0]];
     var lang = langOf(outer[1], outer[0]);
     var where = inner[1] ? inner[1] + (inner[2] ? ':' + inner[2] : '') : '';
     return '<tr><td class="name"><span class="sym">' +
@@ -71,7 +71,7 @@ function detail(node) {
    * the CSV's own column names and do not -- renaming them would make the
    * page and the file disagree about what a column is called. */
   var heads = [T('det.fn'), T('det.inner'), T('det.source'), T('det.module')]
-      .concat(DATA.siteCols).map(function (c) {
+      .concat(VIEW.siteCols).map(function (c) {
         return '<th>' + esc(c) + '</th>';
       }).join('');
 

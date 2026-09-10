@@ -49,6 +49,16 @@
 
 <div class="panel on" id="p-tree">
   <div class="row bar-tools">
+    {%- if has_check %}
+    {# Only when the run had a checker export.  It goes FIRST because it
+       chooses what everything after it is filtering. #}
+    <label class="pick"><span data-t="tool.dataset"></span>
+      <select id="dataset">
+        <option value="alloc" data-t="data.alloc"></option>
+        <option value="check" data-t="data.check"></option>
+      </select>
+    </label>
+    {%- endif %}
     <label class="pick"><span data-t="tool.grouping"></span>
       <select id="grouping">
         <option value="stack" data-t="group.stack"></option>

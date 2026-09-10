@@ -110,7 +110,7 @@ function rowHtml(e) {
   var purposes = purposesOf(n).map(function (t) {
     return '<span class="tag">' + esc(t) + '</span>';
   }).join('');
-  var offs = n.sites.map(function (s) { return DATA.sites[s].off; }).join(' ');
+  var offs = n.sites.map(function (s) { return VIEW.sites[s].off; }).join(' ');
   var classes = classCount(n);
   return '<tr data-i="' + e.i + '"' + (picked === n ? ' class="sel"' : '') + '>' +
     '<td class="name"><span class="tw" style="padding-left:' + (e.depth * 14) + 'px">' +
@@ -202,6 +202,11 @@ function flip(what, value) {
   if (what === 'dir') dir = value;
   else if (what === 'scope') scope = value;
   else if (what === 'lang') langFilter = value;
+  /* Switching population also drops what was open and what was picked, and
+   * that is not tidiness: a node and a site id only mean something inside the
+   * dataset they came from, so carrying them across would reopen a branch that
+   * is not the same branch and highlight a site that is a different site. */
+  else if (what === 'dataset') setView(value);
   else grouping = value;
   unfolded.clear();
   picked = null;
@@ -237,6 +242,13 @@ function boot() {
   });
   document.getElementById('grouping').onchange = function (e) {
     flip('group', e.target.value);
+  };
+  /* Only present when the export carried a checker run.  A control that offers
+   * a population the file does not have would be a promise the page cannot
+   * keep, so the template leaves it out entirely rather than disabling it. */
+  var pickData = document.getElementById('dataset');
+  if (pickData) pickData.onchange = function (e) {
+    flip('dataset', e.target.value);
   };
   document.getElementById('scope').onchange = function (e) {
     flip('scope', e.target.value);

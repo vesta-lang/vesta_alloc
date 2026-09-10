@@ -76,6 +76,133 @@ class Site(object):
         self.foreign = (row.get("foreign") or "0").strip() == "1"
 
 
+class CheckSite(object):
+    """One STACK the checker saw, with what its blocks did.
+
+    Deliberately the same shape as `Site`, so the tree builder, the text
+    output and the page work on it unchanged.  The two exports answer the same
+    question from different sides -- who allocated -- and giving them two
+    incompatible models would mean writing every consumer twice and then
+    watching the two drift.
+
+    The names that differ are mapped rather than renamed:
+
+        allocs  <- births        every block, released or not
+        bytes   <- bytes         the same, in bytes
+        tag     <- use/shape     MEASURED, not declared: the checker derives
+                                 both axes from lifetime and from whether the
+                                 size varied
+    """
+
+    __slots__ = ("sid", "allocs", "bytes", "over", "over_bytes", "tag",
+                 "classes", "large", "pc", "row", "mask", "sizes", "foreign",
+                 "weighed_allocs", "weighed_bytes", "deaths", "alive_blocks",
+                 "alive_bytes", "life_avg", "life_max", "cross_thread",
+                 "size_min", "size_max", "use", "shape", "walked", "frames")
+
+    def __init__(self, row):
+        self.row = row
+        self.sid = int(row["stack_id"])
+        self.allocs = int(row["births"])
+        self.bytes = int(row["bytes"])
+        # WHAT WAS ONLY WEIGHED.  Blocks over the small-class limit are counted
+        # in the bytes but not inspected, so a row's certainty is not uniform.
+        # Kept apart from the totals for the same reason `over` is: folding
+        # them in would produce a number that looks equally measured
+        # throughout and is not.
+        self.weighed_allocs = int(row.get("outside_births") or 0)
+        self.weighed_bytes = int(row.get("outside_bytes") or 0)
+        self.deaths = int(row.get("deaths") or 0)
+        self.alive_blocks = int(row.get("alive_blocks") or 0)
+        self.alive_bytes = int(row.get("alive_bytes") or 0)
+        self.life_avg = int(row.get("life_avg") or 0)
+        self.life_max = int(row.get("life_max") or 0)
+        # Blocks released by a thread other than the one that allocated them.
+        # Their lives are not comparable -- the counter belongs to a thread --
+        # so the checker counts them apart instead of folding them in.
+        self.cross_thread = int(row.get("cross_thread") or 0)
+        self.size_min = int(row.get("size_min") or 0)
+        self.size_max = int(row.get("size_max") or 0)
+        self.use = row.get("use") or ""
+        self.shape = row.get("shape") or ""
+        # Whether the frame chain could be followed.  A single frame with this
+        # false is not a shallow stack: it is a stack that could not be walked,
+        # and reading it as the first would understate every branch above it.
+        self.walked = (row.get("walked") or "0").strip() == "1"
+        self.frames = int(row.get("frames") or 0)
+
+        # --- the fields `Site` has and this export does not ----------------
+        # Answered as "nothing", never invented.  `over` is the allocator
+        # table's eviction inheritance; the checker's depot does not evict, it
+        # fills up and says so, so there is no inherited count to report.
+        self.over = 0
+        self.over_bytes = 0
+        self.large = 0
+        self.classes = 0
+        self.mask = 0
+        self.sizes = {}
+        self.foreign = False
+        self.pc = 0
+        # The purpose, MEASURED.  The allocator's `tag` is what the programmer
+        # declared; this is what the blocks turned out to be.  They go in the
+        # same field so that `--group purpose` and the purpose column work on
+        # both exports -- and the header says which one is being shown, because
+        # confusing intent with outcome is exactly the mistake worth avoiding.
+        self.tag = ("%s/%s" % (self.use, self.shape)) if self.use else ""
+
+
+class CheckReport(object):
+    """The checker's three files, in the shape the rest of the tool expects.
+
+    `chain_of` is where the two exports really differ.  The allocator records
+    ONE return address and resolves its inlining chain; the checker walks the
+    stack, so it has TWO axes -- `frame`, the call frame, and `depth`, the
+    inline level inside it.  Flattening them innermost-first gives exactly what
+    the tree builder already consumes, and keeps the distinction visible in the
+    frame itself, so nobody has to line up two tables by eye.
+    """
+
+    def __init__(self, sites, chains, summary):
+        self.sites = sites
+        self.chains = chains          # stack_id -> [Frame], innermost first
+        self.summary = summary
+
+    def chain_of(self, site):
+        chain = self.chains.get(site.sid)
+        if chain:
+            return chain
+        # A stack with no resolvable frame is still a place, and dropping it
+        # would quietly shrink the totals.
+        return [Frame("(stack %d)" % site.sid, "", 0, False)]
+
+    def warnings(self):
+        """What the checker could NOT do, as (key, parameters)."""
+        out = []
+        full = int(self.summary.get("stacks_that_did_not_fit", 0) or 0)
+        if full:
+            out.append(("warn.check.depotfull",
+                        {"n": full,
+                         "cap": int(self.summary.get("depot_slots", 0) or 0)}))
+        blocks = int(self.summary.get("blocks_with_no_site", 0) or 0)
+        if blocks:
+            out.append(("warn.check.nosite",
+                        {"n": blocks,
+                         "b": int(self.summary.get("bytes_with_no_site", 0)
+                                  or 0)}))
+        outside = int(self.summary.get("blocks_outside_the_shadow", 0) or 0)
+        if outside:
+            out.append(("warn.check.outside", {"n": outside}))
+        # Not a failure of the export, a property of the build: without a frame
+        # pointer the walk stops at the first step.  Said once, with the count,
+        # instead of leaving the reader to notice that many stacks are one
+        # frame deep and guess why.
+        unwalked = sum(1 for s in self.sites if not s.walked)
+        if unwalked:
+            out.append(("warn.check.nowalk",
+                        {"n": unwalked, "total": len(self.sites)}))
+        return out
+
+
 class Report(object):
     """The five files, loaded."""
 
@@ -149,6 +276,47 @@ class Report(object):
                 int(row["bucket"])] = int(row["allocs"])
         for site in self.sites:
             site.sizes = by_site.get(site.sid, {})
+        self.check = self._load_check()
+
+    def _load_check(self):
+        """The checker's export, when the run had it.  `None` when it did not.
+
+        It is a DIFFERENT population, not more rows of the same one: the
+        allocator's export is keyed by one return address and covers every
+        block, while this one is keyed by a walked stack and only inspects what
+        fits the shadow.  Merging them into one list would add up numbers that
+        do not mean the same thing.
+        """
+        rows = self._read("check_sites.csv", optional=True)
+        if not rows:
+            return None
+        sites = [CheckSite(r) for r in rows]
+
+        # frame -> its inlining chain, then flattened innermost-first.  Built
+        # in two steps because the rows are ordered by neither axis on their
+        # own, and assuming an order here would hang branches off the wrong
+        # parent without anything looking odd.
+        by_stack = {}
+        for row in self._read("check_frames.csv", optional=True):
+            sid = int(row["stack_id"])
+            frame = int(row.get("frame") or 0)
+            depth = int(row.get("depth") or 0)
+            by_stack.setdefault(sid, {}).setdefault(frame, {})[depth] = Frame(
+                row["function"], row["file"], int(row["line"] or 0),
+                row["inlined"] == "1", row.get("module", ""))
+        chains = {}
+        for sid, frames in by_stack.items():
+            flat = []
+            for fidx in sorted(frames):
+                inner = frames[fidx]
+                for d in sorted(inner):
+                    flat.append(inner[d])
+            chains[sid] = flat
+
+        summary = {}
+        for row in self._read("check_summary.csv", optional=True):
+            summary[row["key"]] = row["value"]
+        return CheckReport(sites, chains, summary)
 
     def chain_of(self, site):
         """The chain of a site, never empty.
