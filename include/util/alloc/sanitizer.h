@@ -692,6 +692,33 @@ uint64_t san_guarded_blocks() noexcept;
 
 /**
  * @brief
+ * \~english Blocks this mode RELEASED itself, the other half of the ledger.
+ * \~spanish Bloques que este modo SOLTO el, la otra mitad del libro.
+ * \~
+ *
+ * \~english
+ * A release handled at the guard level never reaches the allocator's lists, so
+ * its own `large_frees` does not move for it.  Adding the two is what makes
+ * "everything served was released" a question with an answer at every level:
+ * below the guard level this is zero and the sum is the allocator's figure,
+ * unchanged.  Pairs with @c san_guarded_blocks.
+ *
+ * \~spanish
+ * Una liberacion atendida en el nivel de guarda no llega nunca a las listas del
+ * asignador, asi que su `large_frees` no se mueve por ella.  Sumar las dos es
+ * lo que convierte "todo lo servido se solto" en una pregunta con respuesta en
+ * todos los niveles: por debajo del nivel de guarda esto vale cero y la suma es
+ * la cifra del asignador, sin cambios.  Va con @c san_guarded_blocks.  \~
+ *
+ * @return
+ * \~english how many, or 0 below the guard level.
+ * \~spanish cuantos, o 0 por debajo del nivel de guarda.
+ * \~
+ */
+uint64_t san_guarded_frees() noexcept;
+
+/**
+ * @brief
  * \~english The same count as @c san_guarded_blocks, split by PURPOSE.
  * \~spanish La misma cuenta que @c san_guarded_blocks, repartida por PROPOSITO.
  * \~
@@ -735,6 +762,48 @@ uint64_t san_guarded_blocks() noexcept;
 uint64_t san_guarded_by_tag(unsigned tag) noexcept;
 
 size_t san_guarded_size(const void *p) noexcept;
+
+/**
+ * @brief
+ * \~english Serves a block at @p align, when the checking mode is placing
+ *           blocks itself.
+ * \~spanish Sirve un bloque en @p align, cuando el modo de comprobacion coloca
+ *           los bloques el mismo.
+ * \~
+ *
+ * \~english
+ * FOR THE ALLOCATOR'S ALIGNED ENTRY, and it exists because that entry solves
+ * the same problem in a way this mode cannot follow: it takes an over-sized
+ * block and RAISES the pointer inside it, so what the caller ends up holding is
+ * not what was handed out.  A block this mode served is known by the address it
+ * gave, so a raised pointer is a stranger to it -- and a stranger reaching
+ * `host_free` is a panic about a block the allocator served itself.
+ *
+ * Here the alignment is honoured when the block is PLACED, so the address the
+ * caller holds is the one on record.  Called before the raising, and when it
+ * declines -- the mode is off, or below the guard level, or its table is full
+ * -- the caller does exactly what it did before.
+ *
+ * \~spanish
+ * PARA LA ENTRADA ALINEADA DEL ASIGNADOR, y existe porque esa entrada resuelve
+ * el mismo problema de una forma que este modo no puede seguir: coge un bloque
+ * de mas y SUBE el puntero dentro de el, asi que lo que acaba teniendo quien
+ * llama no es lo que se entrego.  Un bloque servido por este modo se conoce por
+ * la direccion que dio, asi que un puntero subido le es un desconocido -- y un
+ * desconocido llegando a `host_free` es un panico por un bloque que sirvio el
+ * propio asignador.
+ *
+ * Aqui la alineacion se respeta al COLOCAR el bloque, con lo que la direccion
+ * que tiene quien llama es la que esta apuntada.  Se llama antes de subir nada,
+ * y cuando dice que no -- el modo esta apagado, o por debajo del nivel de
+ * guarda, o su tabla llena -- quien llama hace exactamente lo de antes.  \~
+ *
+ * @param n     \~english useful bytes.  \~spanish bytes utiles.  \~
+ * @param align \~english a power of two.  \~spanish una potencia de dos.  \~
+ * @return \~english the block, or nullptr to mean "serve it the usual way".
+ *         \~spanish el bloque, o nullptr para decir "sirvelo como siempre".  \~
+ */
+void *san_alloc_aligned(size_t n, size_t align) noexcept;
 
 /**
  * @brief
@@ -805,11 +874,17 @@ bool san_realloc(void *p, size_t n, void **out) noexcept;
 [[gnu::always_inline]] inline uint64_t san_guarded_blocks() noexcept {
     return 0;
 }
+[[gnu::always_inline]] inline uint64_t san_guarded_frees() noexcept {
+    return 0;
+}
 [[gnu::always_inline]] inline uint64_t san_guarded_by_tag(unsigned) noexcept {
     return 0;
 }
 [[gnu::always_inline]] inline size_t san_guarded_size(const void *) noexcept {
     return 0;
+}
+[[gnu::always_inline]] inline void *san_alloc_aligned(size_t, size_t) noexcept {
+    return nullptr;
 }
 [[gnu::always_inline]] inline bool san_realloc(void *, size_t,
                                                void **) noexcept {

@@ -867,11 +867,53 @@ std::atomic<uint64_t> g_longest_life{0};
  * informe declarando tan tranquilo que todo sitio del programa era "Instant".
  * \~
  */
+/**
+ * @brief
+ * \~english Blocks THIS mode served, per thread, so a life can still be
+ *           measured where the allocator did not carve anything.
+ * \~spanish Bloques que sirvio ESTE modo, por hilo, para que una vida se pueda
+ *           medir alli donde el asignador no recorto nada.
+ * \~
+ *
+ * \~english
+ * ITS OWN, AND KEYED BY THE ALLOCATOR'S THREAD ID.  The allocator counts what
+ * it carved; at the guard level it carves nothing, so the count a life is
+ * measured against never moved and every block came out as having lived zero
+ * allocations.  Adding a field to the allocator's cache to fix it would be the
+ * checker charging the allocator for its own telemetry, which is the wrong way
+ * round -- so the count lives here and the id is the only thing borrowed.
+ *
+ * A plain array and not a thread variable, because on Windows a thread variable
+ * inside a `malloc` is a recursion waiting to happen -- the runtime's own
+ * emulation allocates the first time a thread touches one.  Sized by the same
+ * cap the allocator uses for its caches, so an id always fits.
+ *
+ * \~spanish
+ * PROPIA, E INDEXADA POR EL ID DE HILO DEL ASIGNADOR.  El asignador cuenta lo
+ * que recorto el; en el nivel de guarda no recorta nada, asi que la cuenta
+ * contra la que se mide una vida no se movia nunca y todos los bloques salian
+ * habiendo vivido cero reservas.  Anadir un campo a la cache del asignador para
+ * arreglarlo seria el comprobador cobrandole al asignador su propia telemetria,
+ * que es al reves de como tiene que ser -- asi que la cuenta vive aqui y lo
+ * unico prestado es el id.
+ *
+ * Un array y no una variable de hilo, porque en Windows una variable de hilo
+ * dentro de un `malloc` es una recursion esperando a pasar -- la emulacion del
+ * runtime reserva la primera vez que un hilo toca una.  Dimensionada con el
+ * mismo tope que usa el asignador para sus caches, asi que un id siempre cabe.
+ * \~
+ */
+std::atomic<uint32_t> g_guard_thread_allocs[util::kMaxThreads];
+
 [[gnu::always_inline]] inline uint32_t thread_allocs(
     const detail::ThreadCache *c) noexcept {
     if (!detail::have_cache(c)) return 0;
     uint64_t n = 0;
     for (unsigned i = 0; i < VESTA_ALLOC_TAG_SLOTS; ++i) n += c->stats.by_tag[i];
+    /* AND WHAT THIS MODE SERVED ITSELF.  Below the guard level the term is zero
+     * and this is the allocator's own figure, unchanged. */
+    if (c->id < util::kMaxThreads)
+        n += g_guard_thread_allocs[c->id].load(std::memory_order_relaxed);
     return uint32_t(n);
 }
 
@@ -1077,6 +1119,26 @@ struct Guarded {
     uint32_t alloc_stack;
     uint32_t free_stack;
     uint32_t state;
+    /* \~english WHAT A LIFE IS MEASURED AGAINST, and it has to live here because
+     * a guarded block has no shadow slot to keep it in.  Without the two, the
+     * strictest level was the one where nothing had a measurable life: the
+     * report said every site was instant, and the count of the longest life
+     * stayed at zero -- the checker's own telemetry going blind at its own
+     * strictest setting, and going blind WITHOUT saying so, which is the exact
+     * failure this library exists to make impossible.
+     *
+     * \~spanish CONTRA QUE SE MIDE UNA VIDA, y tiene que vivir aqui porque un
+     * bloque con guarda no tiene ranura de sombreado donde guardarlo.  Sin los
+     * dos, el nivel mas estricto era aquel en el que nada tenia vida medible:
+     * el informe decia que todo sitio era instantaneo, y la cuenta de la vida
+     * mas larga se quedaba a cero -- la telemetria del propio comprobador
+     * quedandose ciega en su ajuste mas estricto, y quedandose ciega SIN
+     * decirlo, que es justo el fallo que esta libreria existe para impedir.  \~
+     */
+    uint32_t seq;    ///< \~english its thread's count at birth.  \~spanish la
+                     ///< cuenta de su hilo al nacer.  \~
+    uint32_t thread; ///< \~english who allocated it.  \~spanish quien lo
+                     ///< reservo.  \~
 };
 
 /// \~english Open addressing, never evicting.  Full is COUNTED and the level
@@ -1090,6 +1152,93 @@ struct Guarded {
 /// \~
 constexpr uint32_t kGuardSlots = 1u << 16;
 Guarded *g_guarded = nullptr;
+
+/**
+ * @brief
+ * \~english Slots in the index that answers for an address INSIDE a block.
+ * \~spanish Ranuras del indice que contesta por una direccion DE DENTRO de un
+ *           bloque.
+ * \~
+ *
+ * \~english
+ * WHY A SECOND TABLE AND NOT A WIDER FIRST ONE.  The table above is keyed by
+ * the address handed out, which is the only thing a release or a size question
+ * normally carries.  But the allocator promises more than that for a block it
+ * got from the system: `direct_bytes` and `direct_take` answer for ANY address
+ * inside one, so `host_free(p + 4096)` releases the whole block and
+ * `host_usable_size(p + 4096)` counts what is left from there.
+ *
+ * A checking mode that broke that promise would not be catching a bug, it would
+ * be inventing one: correct code would stop the process with a panic about a
+ * block the allocator itself had served, and only when the mode was on.  A
+ * checker that accuses correct code is worse than no checker.
+ *
+ * So the address is turned into a GRANULE and looked up here.  The granule is
+ * @c os_reserve_granularity, and using anything else -- a written-down 4096, a
+ * written-down 64 KiB -- would break it: that value is exactly the alignment
+ * `os_reserve` hands back, which is what makes two facts true at once.  Every
+ * guarded block starts ON a granule, so masking an interior address reaches its
+ * first one in a single step; and no two reservations SHARE a granule, so one
+ * granule names one block and the index is a function, with no lists to walk
+ * and no collisions to resolve.  It is queried at run time in both systems --
+ * 64 KiB on Windows, asked of ntdll rather than assumed, and the page size on
+ * POSIX, which is 4096 on x86-64 and is NOT on several others.
+ *
+ * Sized for the whole of what the level can hold: @c kGuardSlots blocks, each
+ * of which may cover more than one granule where the granule is the page.  Full
+ * behaves like the table above -- the block is served without an entry and the
+ * refusal is counted -- because a silent hole in an index that exists to avoid
+ * a false accusation would be the false accusation coming back.
+ *
+ * \~spanish
+ * POR QUE UNA SEGUNDA TABLA Y NO UNA PRIMERA MAS ANCHA.  La tabla de arriba se
+ * indexa por la direccion entregada, que es lo unico que normalmente lleva una
+ * liberacion o una pregunta de tamano.  Pero el asignador promete mas que eso
+ * para un bloque que le dio el sistema: `direct_bytes` y `direct_take`
+ * contestan por CUALQUIER direccion de dentro, asi que `host_free(p + 4096)`
+ * suelta el bloque entero y `host_usable_size(p + 4096)` cuenta lo que queda
+ * desde ahi.
+ *
+ * Un modo de comprobacion que rompiera esa promesa no estaria cazando un fallo,
+ * estaria inventandolo: codigo correcto pararia el proceso con un panico sobre
+ * un bloque que habia servido el propio asignador, y solo con el modo puesto.
+ * Un comprobador que acusa a codigo correcto es peor que no tener comprobador.
+ *
+ * Asi que la direccion se convierte en un GRANULO y se busca aqui.  El granulo
+ * es @c os_reserve_granularity, y usar otra cosa -- un 4096 escrito a mano, un
+ * 64 KiB escrito a mano -- lo rompe: ese valor es exactamente la alineacion que
+ * devuelve `os_reserve`, que es lo que hace ciertas dos cosas a la vez.  Todo
+ * bloque con guarda empieza EN un granulo, asi que enmascarar una direccion
+ * interior alcanza el primero de un solo paso; y dos reservas nunca COMPARTEN
+ * granulo, asi que un granulo nombra un bloque y el indice es una funcion, sin
+ * listas que recorrer ni colisiones que resolver.  Se pregunta en ejecucion en
+ * los dos sistemas -- 64 KiB en Windows, pedidos a ntdll en vez de supuestos, y
+ * el tamano de pagina en POSIX, que es 4096 en x86-64 y NO lo es en varios
+ * otros.
+ *
+ * Dimensionado para todo lo que el nivel puede guardar: @c kGuardSlots bloques,
+ * cada uno de los cuales puede cubrir mas de un granulo alli donde el granulo
+ * es la pagina.  Lleno se comporta como la tabla de arriba -- el bloque se
+ * sirve sin ficha y la negativa se cuenta -- porque un hueco callado en un
+ * indice que existe para evitar una acusacion falsa seria la acusacion falsa
+ * volviendo.  \~
+ */
+constexpr uint32_t kIndexSlots = 1u << 18;
+
+/// \~english Granule -> entry, as slot number PLUS ONE so that zero is empty.
+/// \~spanish Granulo -> ficha, como numero de ranura MAS UNO para que el cero
+///           sea vacio.  \~
+std::atomic<uint32_t> *g_gindex = nullptr;
+
+/// \~english Granules an address is divided by; @c os_reserve_granularity.
+/// \~spanish Granulos en que se divide una direccion; @c
+///           os_reserve_granularity.  \~
+size_t g_granule = 0;
+
+/// \~english Interior lookups that found no room to be answerable.
+/// \~spanish Busquedas interiores que no encontraron sitio para poder
+///           contestarse.  \~
+std::atomic<uint64_t> g_index_full{0};
 std::atomic<uint64_t> g_guard_full{0};
 std::atomic<uint64_t> g_guard_bytes{0};
 
@@ -1147,6 +1296,34 @@ std::atomic<uint64_t> g_guard_bytes{0};
  * \~
  */
 std::atomic<uint64_t> g_guard_blocks{0};
+
+/**
+ * @brief
+ * \~english The other half: blocks this mode RELEASED itself.
+ * \~spanish La otra mitad: bloques que este modo SOLTO el.
+ * \~
+ *
+ * \~english
+ * FOR THE SAME REASON AS THE COUNT ABOVE, and it is only half a count without
+ * it.  A release that this level handles never reaches the allocator's lists,
+ * so `large_frees` does not move for it -- and a test asking "were the four
+ * hundred releases counted?" was reading one of the two ledgers and calling the
+ * difference a failure.  With this the question has an answer that holds at
+ * every level: served here plus served there, released here plus released
+ * there.  Switched off it is zero and the sum is the allocator's own figure,
+ * unchanged.
+ *
+ * \~spanish
+ * POR LA MISMA RAZON QUE LA CUENTA DE ARRIBA, y sin el aquella es media cuenta.
+ * Una liberacion que atiende este nivel no llega nunca a las listas del
+ * asignador, asi que `large_frees` no se mueve por ella -- y un test que
+ * preguntaba "se contaron las cuatrocientas devoluciones?" estaba leyendo uno
+ * de los dos libros y llamando fallo a la diferencia.  Con esto la pregunta
+ * tiene respuesta en todos los niveles: servidos aqui mas servidos alli,
+ * soltados aqui mas soltados alli.  Apagado vale cero y la suma es la cifra del
+ * asignador de siempre.  \~
+ */
+std::atomic<uint64_t> g_guard_frees{0};
 
 /**
  * @brief
@@ -1244,6 +1421,152 @@ std::atomic<uint64_t> g_guard_by_tag[VESTA_ALLOC_TAG_SLOTS];
  */
 constexpr uint32_t kGuardProbe = 8;
 
+/**
+ * @brief
+ * \~english How many refusals in a row are taken as "this table is done".
+ * \~spanish Cuantas negativas seguidas se toman como "esta tabla esta acabada".
+ * \~
+ *
+ * \~english
+ * AN ENTRY IS NEVER TAKEN BACK.  `guarded_free` decommits the pages and leaves
+ * the entry standing -- that is what lets a later touch be named as a use after
+ * free instead of being confused with whoever got the address next -- so the
+ * occupancy of this table only ever goes UP.  Which means a refusal is not a
+ * passing condition: once the windows fill, they stay full for the rest of the
+ * run.
+ *
+ * That is worth a latch because of what a refusal COSTS.  The block's address
+ * is what keys the entry, so it cannot be known before the mapping exists:
+ * `san_alloc_guarded` has to reserve and commit pages from the system, ask, and
+ * -- when the answer is no -- hand them straight back.  Three trips into the
+ * kernel to learn something a counter already knew.
+ *
+ * Measured, on this library's own `host_allocator` test at this level: 54.560
+ * blocks got an entry and 4.080.461 did not, and those refusals spent 101 of
+ * the run's 120 seconds inside the kernel, all of it under `os_free` reached
+ * from the ALLOCATION path.  With the latch the same run pays that toll @c
+ * kGuardGiveUp times instead of four million.
+ *
+ * Eight and not one: a single refusal says nothing, since a window can be full
+ * while the table is not.  Eight in a row say the neighbourhood is done.  And
+ * it must sit well under the natural gap between placements -- measured at one
+ * placement every 74 refusals, 55.308 against 4.07 million -- or the counter is
+ * cleared before it ever arrives and the step back never happens: at 64 this
+ * run still took 81 s, at 8 it takes 17 s.  See @c kGuardRetry.
+ *
+ * \~spanish
+ * UNA FICHA NO SE RECUPERA NUNCA.  `guarded_free` descompromete las paginas y
+ * deja la ficha puesta -- que es lo que permite que un toque posterior se
+ * llame uso despues de liberar en vez de confundirse con quien cogiera la
+ * direccion despues --, asi que la ocupacion de esta tabla solo SUBE.  Lo que
+ * significa que una negativa no es una condicion pasajera: cuando las ventanas
+ * se llenan, siguen llenas el resto de la corrida.
+ *
+ * Eso merece un pestillo por lo que CUESTA una negativa.  La direccion del
+ * bloque es la clave de la ficha, asi que no se puede saber antes de que exista
+ * el mapeo: `san_alloc_guarded` tiene que reservar y comprometer paginas del
+ * sistema, preguntar y -- cuando la respuesta es no -- devolverlas tal cual.
+ * Tres viajes al nucleo para enterarse de algo que un contador ya sabia.
+ *
+ * Medido, sobre el test `host_allocator` de esta misma libreria en este nivel:
+ * 54.560 bloques consiguieron ficha y 4.080.461 no, y esas negativas se
+ * llevaron 101 de los 120 segundos de la corrida dentro del nucleo, todos bajo
+ * `os_free` alcanzado desde el camino de RESERVA.  Con el pestillo la misma
+ * corrida paga ese peaje @c kGuardGiveUp veces en vez de cuatro millones.
+ *
+ * Ocho y no una: una negativa suelta no dice nada, porque una ventana puede
+ * estar llena sin que lo este la tabla.  Ocho seguidas dicen que el barrio esta
+ * acabado.  Y tiene que quedar MUY por debajo de la distancia natural entre
+ * colocaciones -- medida en una colocacion cada 74 negativas, 55.308 contra
+ * 4,07 millones --, o el contador se pone a cero antes de llegar y el paso
+ * atras no ocurre nunca: con 64 esta corrida seguia tardando 81 s, con 8 tarda
+ * 17 s.  Ver @c kGuardRetry.  \~
+ */
+constexpr uint32_t kGuardGiveUp = 8;
+
+/**
+ * @brief
+ * \~english How many allocations are waved through before trying again.
+ * \~spanish Cuantas reservas pasan de largo antes de volver a intentarlo.
+ * \~
+ *
+ * \~english
+ * BECAUSE GIVING UP FOR GOOD COSTS COVERAGE, and that was measured: a permanent
+ * latch took the same run from 54.560 guarded blocks down to 33.040.  A run of
+ * refusals proves the windows that were TRIED are full; it does not prove every
+ * window is, and the ones still open are worth an occasional ask.
+ *
+ * So the refusal is a step back, not a door closed: one allocation in @c
+ * kGuardRetry pays the round trip to find out, and a single placement clears
+ * the counter and puts the level back to normal.
+ *
+ * AND STEPPING BACK FURTHER BUYS COVERAGE, which is the opposite of what one
+ * would expect from skipping and is the whole reason for the size of this
+ * number.  A refused reservation hands its pages back, and the system returns
+ * THE SAME address to the next caller -- the same key, the same full window,
+ * refused again, for as long as the run lasts.  That is why 43 % of the table
+ * being blocked showed up as 98,7 % of attempts failing: the attempts were all
+ * the same doomed handful.  Waving allocations through lets everything else
+ * move the map, so the eventual retry lands somewhere new.
+ *
+ * The whole curve, same test, same machine, window of 8:
+ *
+ *       no step back at all       115.886 ms      54.560 blocks
+ *       give up 64 / retry 64      81.025 ms      55.702
+ *       give up  8 / retry 64      17.673 ms      54.814
+ *       give up  8 / retry 512      3.455 ms      54.178
+ *       give up  8 / retry 4096     1.502 ms      56.229   <- here
+ *       give up  8 / retry 32768    1.427 ms      55.439
+ *       permanent latch               681 ms      33.040
+ *
+ * Flat past this point, so there is nothing left to buy: 4096 is where the
+ * curve stops falling, and it covers MORE than the version that never stepped
+ * back at all.
+ *
+ * \~spanish
+ * PORQUE RENDIRSE DEL TODO CUESTA COBERTURA, y eso tambien esta medido: un
+ * pestillo permanente llevo la misma corrida de 54.560 bloques con guarda a
+ * 33.040.  Una racha de negativas demuestra que las ventanas que se PROBARON
+ * estan llenas; no demuestra que lo esten todas, y las que sigan abiertas
+ * merecen que se pregunte de vez en cuando.
+ *
+ * Asi que la negativa es un paso atras, no una puerta cerrada: una reserva de
+ * cada @c kGuardRetry paga el viaje para averiguarlo, y una sola colocacion
+ * pone el contador a cero y devuelve el nivel a la normalidad.
+ *
+ * Y RETIRARSE MAS COMPRA COBERTURA, que es lo contrario de lo que uno esperaria
+ * de saltarse intentos y es la razon entera del tamano de este numero.  Una
+ * reserva negada devuelve sus paginas, y el sistema le da LA MISMA direccion al
+ * siguiente que pregunte -- la misma clave, la misma ventana llena, negada otra
+ * vez, mientras dure la corrida.  Por eso un 43 % de la tabla bloqueada salia
+ * como un 98,7 % de intentos fallidos: los intentos eran todos el mismo punado
+ * de condenados.  Dejar pasar reservas permite que todo lo demas mueva el mapa,
+ * asi que el reintento cae en otro sitio.
+ *
+ * La curva entera, mismo test, misma maquina, ventana de 8:
+ *
+ *       sin ningun paso atras     115.886 ms      54.560 bloques
+ *       rendirse 64 / reintento 64 81.025 ms      55.702
+ *       rendirse  8 / reintento 64 17.673 ms      54.814
+ *       rendirse  8 / reint. 512    3.455 ms      54.178
+ *       rendirse  8 / reint. 4096   1.502 ms      56.229   <- aqui
+ *       rendirse  8 / reint. 32768  1.427 ms      55.439
+ *       pestillo permanente           681 ms      33.040
+ *
+ * Plana a partir de aqui, asi que no queda nada que comprar: 4096 es donde la
+ * curva deja de bajar, y cubre MAS que la version que no se retiraba nunca.  \~
+ */
+constexpr uint32_t kGuardRetry = 4096;
+
+/// \~english Refusals in a row; reset by any placement.  \~spanish Negativas
+/// seguidas; cualquier colocacion lo pone a cero.  \~
+std::atomic<uint32_t> g_guard_misses{0};
+
+/// \~english Allocations still to be waved through before asking again.
+/// \~spanish Reservas que faltan por dejar pasar antes de volver a preguntar.
+/// \~
+std::atomic<uint32_t> g_guard_skip{0};
+
 uint32_t guard_hash(const void *p) noexcept {
     uint64_t v = reinterpret_cast<uintptr_t>(p) >> 4;
     v *= 0x9E3779B97F4A7C15ull;
@@ -1286,10 +1609,117 @@ Guarded *guard_insert(const void *p) noexcept {
         if (g.p.load(std::memory_order_relaxed) == nullptr &&
             g.p.compare_exchange_strong(expected, p, std::memory_order_acq_rel,
                                         std::memory_order_relaxed))
+        {
+            /* It placed one, so the table is not done after all. */
+            g_guard_misses.store(0, std::memory_order_relaxed);
             return &g;
+        }
         i = (i + 1) & (kGuardSlots - 1);
     }
     g_guard_full.fetch_add(1, std::memory_order_relaxed);
+    if (g_guard_misses.fetch_add(1, std::memory_order_relaxed) + 1 >=
+        kGuardGiveUp) {
+        g_guard_misses.store(0, std::memory_order_relaxed);
+        g_guard_skip.store(kGuardRetry, std::memory_order_relaxed);
+    }
+    return nullptr;
+}
+
+/// \~english The slot for a granule, by the same multiplicative spread.
+/// \~spanish La ranura de un granulo, con el mismo reparto multiplicativo.  \~
+uint32_t index_hash(uintptr_t granule) noexcept {
+    uint64_t v = uint64_t(granule) * 0x9E3779B97F4A7C15ull;
+    return uint32_t(v >> 46) & (kIndexSlots - 1);
+}
+
+/**
+ * @brief
+ * \~english Registers every granule @p base covers as belonging to @p slot.
+ * \~spanish Apunta cada granulo que cubre @p base como perteneciente a @p slot.
+ * \~
+ *
+ * \~english
+ * EVERY GRANULE AND NOT JUST THE FIRST, because the alternative is walking
+ * backwards from an interior address until a start turns up, and how far back
+ * that is depends on the block -- unbounded in principle, thousands of steps
+ * for a big block where the granule is a page.  Writing them all costs once,
+ * at the only moment that already asked the system for pages; the lookup then
+ * costs one hash whatever the block's size.
+ *
+ * \~spanish
+ * CADA GRANULO Y NO SOLO EL PRIMERO, porque la alternativa es ir hacia atras
+ * desde una direccion interior hasta dar con un comienzo, y cuanto hay que
+ * retroceder depende del bloque -- ilimitado en principio, miles de pasos para
+ * un bloque grande alli donde el granulo es la pagina.  Escribirlos todos se
+ * paga una vez, en el unico momento que ya le habia pedido paginas al sistema;
+ * la busqueda cuesta entonces un hash sea cual sea el tamano del bloque.  \~
+ *
+ * @return \~english false when a granule found no room, and then the block
+ *         cannot be answered for from the inside.  \~spanish false cuando algun
+ *         granulo no encontro sitio, y entonces no se puede contestar por el
+ *         bloque desde dentro.  \~
+ */
+bool index_insert(const void *base, size_t total, uint32_t slot) noexcept {
+    if (g_gindex == nullptr || g_granule == 0) return false;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t first = a / g_granule;
+    const uintptr_t last = (a + total - 1) / g_granule;
+    for (uintptr_t g = first; g <= last; ++g) {
+        uint32_t i = index_hash(g);
+        bool placed = false;
+        for (uint32_t probe = 0; probe < kGuardProbe; ++probe) {
+            uint32_t expected = 0;
+            if (g_gindex[i].load(std::memory_order_relaxed) == 0 &&
+                g_gindex[i].compare_exchange_strong(
+                    expected, slot + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                placed = true;
+                break;
+            }
+            i = (i + 1) & (kIndexSlots - 1);
+        }
+        if (!placed) {
+            g_index_full.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief
+ * \~english The block an address falls INSIDE, or nullptr.
+ * \~spanish El bloque DENTRO del cual cae una direccion, o nullptr.
+ * \~
+ *
+ * \~english
+ * The granule names at most one block, so what comes back is either that block
+ * or nothing.  Whether @p q is really inside it is then a comparison against
+ * what the caller was promised -- the block, not the pages around it -- because
+ * a granule covers the guard page and the slack as well, and answering for
+ * those would be answering for memory nobody was given.
+ *
+ * \~spanish
+ * El granulo nombra como mucho un bloque, asi que lo que vuelve es ese bloque o
+ * nada.  Que @p q este de verdad dentro es entonces una comparacion contra lo
+ * que se le prometio a quien llama -- el bloque, no las paginas de alrededor --
+ * porque un granulo cubre tambien la pagina de guarda y la holgura, y contestar
+ * por ellas seria contestar por memoria que no se entrego a nadie.  \~
+ */
+Guarded *guard_locate(const void *q) noexcept {
+    if (g_gindex == nullptr || g_guarded == nullptr || g_granule == 0)
+        return nullptr;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(q);
+    uint32_t i = index_hash(a / g_granule);
+    for (uint32_t probe = 0; probe < kGuardProbe; ++probe) {
+        const uint32_t v = g_gindex[i].load(std::memory_order_acquire);
+        if (v == 0) return nullptr; // never used: nothing is further along
+        Guarded &g = g_guarded[v - 1];
+        const uintptr_t start =
+            reinterpret_cast<uintptr_t>(g.p.load(std::memory_order_acquire));
+        if (start != 0 && a >= start && a - start < g.req) return &g;
+        i = (i + 1) & (kIndexSlots - 1);
+    }
     return nullptr;
 }
 
@@ -1729,6 +2159,37 @@ bool ensure_config() noexcept {
                 if (t != nullptr) {
                     std::memset(t, 0, sizeof(Guarded) * kGuardSlots);
                     g_guarded = static_cast<Guarded *>(t);
+                    /* \~english And the index that answers from INSIDE a block.
+                     * The granule is read from the system here, once: it is the
+                     * alignment `os_reserve` gives back, and every guarded block
+                     * therefore starts on one.  Failing to get the index is not
+                     * failing the level -- blocks are still guarded, only an
+                     * interior address cannot be placed -- so it drops nothing.
+                     *
+                     * \~spanish Y el indice que contesta desde DENTRO de un
+                     * bloque.  El granulo se le pregunta al sistema aqui, una
+                     * vez: es la alineacion que devuelve `os_reserve`, y por eso
+                     * todo bloque con guarda empieza en uno.  No conseguir el
+                     * indice no es fallar el nivel -- los bloques se siguen
+                     * guardando, solo que una direccion interior no se puede
+                     * situar --, asi que no baja nada.  \~ */
+                    g_granule = os_reserve_granularity();
+                    void *x = os_alloc(
+                        sizeof(std::atomic<uint32_t>) * kIndexSlots,
+                        kOsReadWrite);
+                    if (x != nullptr) {
+                        std::memset(x, 0,
+                                    sizeof(std::atomic<uint32_t>) * kIndexSlots);
+                        g_gindex = static_cast<std::atomic<uint32_t> *>(x);
+                    } else {
+                        std::fprintf(
+                            stderr,
+                            "[allocator/check] no room for the index of "
+                            "guarded blocks: an address INSIDE one cannot be "
+                            "placed, so releasing a block from the middle -- "
+                            "which the allocator allows -- will be reported as "
+                            "a foreign pointer\n");
+                    }
                 } else {
                     std::fprintf(stderr,
                                  "[allocator/check] no room for the table of "
@@ -1824,7 +2285,8 @@ bool ensure_config() noexcept {
  * de arriba.  Declaradas aqui porque esa puerta se define antes, y antes se lee
  * mejor: es lo unico que el asignador conoce.  \~ */
 size_t san_grow(size_t n) noexcept;
-void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept;
+void *san_alloc_guarded(size_t n, size_t align, const void *pc,
+                        const void *fp) noexcept;
 void san_on_alloc(void *p, size_t req, const void *pc, const void *fp) noexcept;
 
 [[gnu::noinline]] void *san_alloc(size_t n) noexcept {
@@ -1861,9 +2323,72 @@ void san_on_alloc(void *p, size_t req, const void *pc, const void *fp) noexcept;
     if (!ensure_config() || detail::g_san_level == SanLevel::Off)
         return detail::alloc_body(n);
 
-    void *p = san_alloc_guarded(n, pc, fp);
+    void *p = san_alloc_guarded(n, kAlign, pc, fp);
     if (p == nullptr) p = detail::alloc_body(san_grow(n));
     san_on_alloc(p, n, pc, fp);
+    return p;
+}
+
+/**
+ * @brief
+ * \~english A guarded block placed at an alignment the caller chose.
+ * \~spanish Un bloque con guarda colocado en la alineacion que pidio quien
+ *           llama.
+ * \~
+ *
+ * \~english
+ * WHY THIS EXISTS AND AN INTERIOR-POINTER LOOKUP DOES NOT.  The allocator's
+ * aligned entry serves an over-sized block and RAISES the pointer inside it,
+ * because a class block cannot start wherever the caller wants.  That is right
+ * for the allocator and wrong for this level: an entry here is keyed by the
+ * address handed out, so a raised pointer is one this level has never heard of
+ * -- `ours` says no, and `host_free` panics over a block it served itself.
+ *
+ * This level has no such constraint.  It owns whole pages per block and picks
+ * where inside them the block sits, so it can honour the alignment when placing
+ * it and the address handed out stays the key.  Nothing downstream changes:
+ * release, usable size and ownership all still ask about the one pointer the
+ * caller holds.
+ *
+ * The alternative was an index that answers for any address INSIDE a block.
+ * It would have to be consulted on every release, including the overwhelming
+ * majority that are not guarded at all, and it buys nothing this does not --
+ * so the alignment travels down instead.
+ *
+ * \~spanish
+ * POR QUE EXISTE ESTO Y NO UNA BUSQUEDA POR PUNTERO DE DENTRO.  La entrada
+ * alineada del asignador sirve un bloque de mas y SUBE el puntero dentro de el,
+ * porque un bloque de clase no puede empezar donde quiera quien llama.  Eso es
+ * correcto para el asignador e incorrecto para este nivel: aqui una ficha se
+ * indexa por la direccion entregada, asi que un puntero subido es uno del que
+ * este nivel no ha oido hablar -- `ours` dice que no, y `host_free` entra en
+ * panico por un bloque que sirvio el mismo.
+ *
+ * Este nivel no tiene esa atadura.  Es dueno de paginas enteras por bloque y
+ * elige en que punto de ellas se pone el bloque, asi que puede respetar la
+ * alineacion al colocarlo y la direccion entregada sigue siendo la clave.  Nada
+ * de lo que viene despues cambia: soltar, tamano utilizable y pertenencia
+ * siguen preguntando por el unico puntero que tiene quien llama.
+ *
+ * La alternativa era un indice que contestara por cualquier direccion DE DENTRO
+ * de un bloque.  Habria que consultarlo en cada liberacion, incluida la inmensa
+ * mayoria que no lleva guarda, y no compra nada que esto no de -- asi que lo
+ * que baja es la alineacion.  \~
+ *
+ * @param n     \~english useful bytes.  \~spanish bytes utiles.  \~
+ * @param align \~english a power of two.  \~spanish potencia de dos.  \~
+ * @return \~english the block, or nullptr when this level is not serving it,
+ *         which means the caller does what it always did.
+ *         \~spanish el bloque, o nullptr cuando este nivel no lo sirve, que
+ *         significa que quien llama haga lo de siempre.  \~
+ */
+[[gnu::noinline]] void *san_alloc_aligned(size_t n, size_t align) noexcept {
+    const void *const pc = __builtin_return_address(0);
+    const void *const fp = __builtin_frame_address(0);
+    if (!ensure_config() || detail::g_san_level == SanLevel::Off)
+        return nullptr;
+    void *p = san_alloc_guarded(n, align, pc, fp);
+    if (p != nullptr) san_on_alloc(p, n, pc, fp);
     return p;
 }
 
@@ -1926,7 +2451,8 @@ size_t san_grow(size_t n) noexcept {
  * por lo que esto no es el defecto de nadie.
  * \~
  */
-void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
+void *san_alloc_guarded(size_t n, size_t align, const void *pc,
+                        const void *fp) noexcept {
     /* \~english The CONFIG and not the whole set-up: a guarded block does not
      * touch the shadow, so waiting for the shadow would keep the very first
      * allocation of the process -- and in a small program, every allocation --
@@ -1939,6 +2465,36 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     if (!ensure_config() || detail::g_san_level < SanLevel::Guard)
         return nullptr;
     if (g_guarded == nullptr || n == 0) return nullptr;
+
+    /* \~english BEFORE ASKING THE SYSTEM FOR ANYTHING.  Past this point the
+     * block gets its pages reserved and committed, and only then is there an
+     * address to key an entry by -- so a refusal from the table arrives with
+     * three trips into the kernel already paid and nothing to show for them.
+     * The entries are never taken back, so once the table has stopped placing
+     * anything it will not start again, and going on asking buys nothing.  The
+     * count below is the same one the report prints, so what the run could not
+     * cover is still said in full: what is dropped here is the waste, not the
+     * telling.  See @c kGuardGiveUp.
+     *
+     * \~spanish ANTES DE PEDIRLE NADA AL SISTEMA.  A partir de aqui el bloque
+     * consigue sus paginas reservadas y comprometidas, y solo entonces hay una
+     * direccion con la que dar de alta la ficha -- asi que una negativa de la
+     * tabla llega con tres viajes al nucleo ya pagados y nada que ensenar.  Las
+     * fichas no se recuperan nunca, asi que cuando la tabla ha dejado de
+     * colocar no va a volver a empezar, y seguir preguntando no compra nada.
+     * La cuenta de abajo es la misma que imprime el informe, asi que lo que la
+     * corrida no pudo cubrir se sigue diciendo entero: lo que se deja de hacer
+     * aqui es el desperdicio, no el aviso.  Ver @c kGuardGiveUp.  \~ */
+    uint32_t skip = g_guard_skip.load(std::memory_order_relaxed);
+    while (skip != 0 && !g_guard_skip.compare_exchange_weak(
+                            skip, skip - 1, std::memory_order_relaxed,
+                            std::memory_order_relaxed)) {
+        /* Somebody else took this one; `skip` now holds what is left. */
+    }
+    if (skip != 0) {
+        g_guard_full.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
 
     /* \~english THE THREAD STILL NEEDS ITS CACHE, even though this block will
      * not come out of it.  The allocator creates that cache lazily, on the
@@ -1981,8 +2537,23 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
      * que reserve y comprometa paginas.  \~ */
     const detail::ThreadCache *const tc = detail::ensure_cache();
 
+    if (align < kAlign) align = kAlign;
+    if ((align & (align - 1)) != 0) return nullptr; // not a power of two
+
     const size_t page = os_page_size();
-    const size_t data = (n + kCanaryBytes + page - 1) / page * page;
+    /* \~english The room the alignment needs.  The block is placed by moving it
+     * INSIDE these pages, so an alignment finer than a page always fits in what
+     * the rounding up already leaves over; a coarser one has to be asked for,
+     * or the move would push the block past the pages that were committed.
+     *
+     * \~spanish El sitio que pide la alineacion.  El bloque se coloca moviendolo
+     * DENTRO de estas paginas, asi que una alineacion mas fina que una pagina
+     * cabe siempre en lo que la redondeo al alza ya deja de sobra; una mas
+     * gruesa hay que pedirla, o el movimiento empujaria el bloque mas alla de
+     * las paginas comprometidas.  \~ */
+    const size_t slack = align > page ? align : 0;
+    if (n > size_t(-1) - kCanaryBytes - slack - page) return nullptr;
+    const size_t data = (n + kCanaryBytes + slack + page - 1) / page * page;
     const size_t total = data + page; // the guard
     if (data < n) return nullptr;     // wrapped: refuse rather than serve wrong
 
@@ -1995,15 +2566,33 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
      * pidio nunca, no porque algo se la quitara.  \~ */
     void *base = os_reserve(total);
     if (base == nullptr) return nullptr;
-    if (!os_commit(base, data, kOsReadWrite)) {
+
+    unsigned char *const start = static_cast<unsigned char *>(base);
+    const bool under = g_guard_edge == SanGuard::Underflow;
+    /* \~english WHICH PAGE IS LEFT OUT IS WHICH EDGE IS WATCHED.  Watching the
+     * end means the spare page goes last, so committing from the base is right.
+     * Watching the START means it goes FIRST, and committing from the base
+     * would commit the very page that has to stay missing -- the read before
+     * the block would go through, and the block's own last page would be the
+     * one left unmapped instead.  The guard would be at the wrong end and say
+     * nothing.
+     *
+     * \~spanish QUE PAGINA SE DEJA FUERA ES QUE BORDE SE VIGILA.  Vigilar el
+     * final quiere decir que la pagina de sobra va al final, asi que comprometer
+     * desde la base es correcto.  Vigilar el PRINCIPIO quiere decir que va
+     * DELANTE, y comprometer desde la base comprometeria justo la pagina que
+     * tiene que faltar -- la lectura de antes del bloque pasaria, y la que se
+     * quedaria sin mapear seria la ultima del propio bloque.  La guarda estaria
+     * en el extremo equivocado y no diria nada.  \~ */
+    unsigned char *const mapped = under ? start + page : start;
+    if (!os_commit(mapped, data, kOsReadWrite)) {
         os_free(base, total);
         return nullptr;
     }
 
-    unsigned char *const start = static_cast<unsigned char *>(base);
     unsigned char *p;
     size_t tail;
-    if (g_guard_edge == SanGuard::Underflow) {
+    if (under) {
         /* \~english The other edge: the block starts where the mapped pages
          * start, so reading or writing BEFORE it is what faults.  Then the
          * guard is the page before, and nothing watches the end.
@@ -2012,11 +2601,13 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
          * mapeadas, asi que lo que falla es leer o escribir ANTES de el.
          * Entonces la guarda es la pagina de delante, y nadie vigila el final.
          * \~ */
-        p = start + page;
+        const uintptr_t first = reinterpret_cast<uintptr_t>(mapped);
+        p = reinterpret_cast<unsigned char *>((first + align - 1) &
+                                              ~uintptr_t(align - 1));
         tail = 0;
     } else {
-        const uintptr_t end = reinterpret_cast<uintptr_t>(start) + data;
-        const uintptr_t want = (end - n) & ~uintptr_t(kAlign - 1);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(mapped) + data;
+        const uintptr_t want = (end - n) & ~uintptr_t(align - 1);
         p = reinterpret_cast<unsigned char *>(want);
         tail = size_t(end - want - n);
     }
@@ -2034,6 +2625,22 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     g->total = total;
     g->req = n;
     g->tail = tail;
+    /* Stamped where the block is BORN, which is the only place that knows.  See
+     * the two fields in `Guarded`. */
+    g->seq = thread_allocs(tc);
+    g->thread = detail::have_cache(tc) ? tc->id : 0;
+    /* AFTER the stamp, so the stamp is the count BEFORE this block and the next
+     * one reads one more.  See `g_guard_thread_allocs`. */
+    if (detail::have_cache(tc) && tc->id < util::kMaxThreads)
+        g_guard_thread_allocs[tc->id].fetch_add(1, std::memory_order_relaxed);
+    /* \~english BEFORE THE BLOCK LEAVES, so that an address inside it can be
+     * placed from the first instant it exists.  Written after the fields it
+     * points at, because the lookup reads them.
+     *
+     * \~spanish ANTES DE QUE EL BLOQUE SALGA, para que una direccion de dentro
+     * se pueda situar desde el primer instante en que existe.  Escrito despues
+     * de los campos a los que apunta, porque la busqueda los lee.  \~ */
+    index_insert(base, total, uint32_t(g - g_guarded));
     g->alloc_stack = intern_stack(frames, nf, walked);
     /* \~english AND HERE TOO, because at the guard level this is the ONLY place
      * that sees the block.  A guarded block lives on pages of its own, outside
@@ -2081,7 +2688,25 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
 /// @return true when the release was handled here and must not go any further.
 bool guarded_free(void *p, const void *fp) noexcept {
     Guarded *g = guard_find(p);
-    if (g == nullptr) return false;
+    if (g == nullptr) {
+        /* \~english OR AN ADDRESS INSIDE ONE.  `host_free` takes any address
+         * within a block the system served -- that is what `direct_take` does
+         * for the allocator -- so a release from the middle is correct code,
+         * and this level has to recognise it or stop the process over it.  The
+         * canary and the double-release verdict below then read the BLOCK's
+         * fields, which is what they were always about.
+         *
+         * \~spanish O UNA DIRECCION DE DENTRO.  `host_free` acepta cualquier
+         * direccion dentro de un bloque que sirvio el sistema -- eso es lo que
+         * hace `direct_take` para el asignador --, asi que soltar desde el medio
+         * es codigo correcto, y este nivel tiene que reconocerlo o parar el
+         * proceso por ello.  El canario y el veredicto de doble liberacion de
+         * abajo leen entonces los campos del BLOQUE, que es de lo que siempre
+         * iban.  \~ */
+        g = guard_locate(p);
+        if (g == nullptr) return false;
+        p = const_cast<void *>(g->p.load(std::memory_order_acquire));
+    }
 
     if (g->state == kStFreed) {
         verdict(Certainty::Proven, "released twice", p);
@@ -2111,6 +2736,31 @@ bool guarded_free(void *p, const void *fp) noexcept {
                    __builtin_frame_address(0), &walked);
     g->free_stack = intern_stack(frames, nf, walked);
     g->state = kStFreed;
+    /* Counted where it is DONE, so that the two ledgers add up to the whole.
+     * See `g_guard_frees`. */
+    g_guard_frees.fetch_add(1, std::memory_order_relaxed);
+
+    /* \~english WHAT THIS BLOCK TURNED OUT TO BE, the same question the shadow
+     * answers for the blocks it holds -- and here, where it dies, is the only
+     * place that knows.  Counted the same way and against the same counter, so
+     * a life measured at this level means what a life measured at any other one
+     * means.  Released on another thread it is counted as unknown rather than
+     * folded in, which `note_death` does from `same_thread`: subtracting one
+     * thread's counter from another's would give a number with the shape of a
+     * life that is not one.
+     *
+     * \~spanish LO QUE ESTE BLOQUE RESULTO SER, la misma pregunta que el
+     * sombreado contesta por los bloques que guarda el -- y aqui, donde muere,
+     * es el unico sitio que lo sabe.  Contado igual y contra el mismo contador,
+     * asi que una vida medida en este nivel significa lo mismo que una medida
+     * en cualquier otro.  Soltado en otro hilo se cuenta como desconocida en vez
+     * de mezclarse, cosa que hace `note_death` a partir de `same_thread`:
+     * restar el contador de un hilo al de otro daria un numero con forma de
+     * vida que no lo es.  \~ */
+    const detail::ThreadCache *const tc = detail::current_cache();
+    const uint32_t tid = detail::have_cache(tc) ? tc->id : 0;
+    note_death(g->alloc_stack, uint32_t(g->req), g->thread == tid, g->seq,
+               thread_allocs(tc));
 
     /* \~english DECOMMITTED, NOT FREED.  The pages go, so touching the block
      * from now on faults where it is touched; the range stays ours, so the
@@ -2124,7 +2774,21 @@ bool guarded_free(void *p, const void *fp) noexcept {
      * fallo siempre es sobre ESTE bloque.  Eso es lo que hace que un uso
      * despues de liberar apunte al codigo correcto -- y lo que hace caro este
      * nivel.  \~ */
-    os_decommit(const_cast<void *>(g->base), g->total - os_page_size());
+    /* \~english The pages to drop are the MAPPED ones, and which end they start
+     * at is the edge -- the same asymmetry that decides where the spare page
+     * goes when the block is served.  Handing the base in unconditionally would
+     * ask the system to drop the guard page and keep the block's last one.
+     *
+     * \~spanish Las paginas que se sueltan son las MAPEADAS, y en que extremo
+     * empiezan lo dice el borde -- la misma asimetria que decide donde va la
+     * pagina de sobra al servir el bloque.  Entregar la base sin mirar seria
+     * pedirle al sistema que soltara la de guarda y se quedara con la ultima
+     * del bloque.  \~ */
+    const size_t page = os_page_size();
+    unsigned char *const mapped =
+        static_cast<unsigned char *>(const_cast<void *>(g->base)) +
+        (g_guard_edge == SanGuard::Underflow ? page : 0);
+    os_decommit(mapped, g->total - page);
     return true;
 }
 
@@ -2409,7 +3073,27 @@ size_t san_guarded_size(const void *p) noexcept {
      * que prometer bytes ahi seria prometer memoria que falla al primer toque.
      * El veredicto de doble liberacion es cosa de `san_on_free`, no de esta --
      * esta solo dice cuanto se puede escribir AHORA.  \~ */
-    if (g == nullptr || g->state != kStAlive) return 0;
+    if (g == nullptr) {
+        /* \~english NOT THE ADDRESS HANDED OUT, so maybe one INSIDE the block:
+         * the allocator answers those for anything it got from the system, and
+         * counts what is left FROM there rather than the whole block.  This
+         * only runs once the exact question has already said no, and only on a
+         * pointer that is in neither region, so the ordinary path never pays
+         * for it.
+         *
+         * \~spanish NO LA DIRECCION ENTREGADA, asi que quiza una DE DENTRO del
+         * bloque: el asignador contesta por esas para todo lo que le dio el
+         * sistema, y cuenta lo que queda DESDE ahi en vez del bloque entero.
+         * Esto solo corre cuando la pregunta exacta ya ha dicho que no, y solo
+         * sobre un puntero que no esta en ninguna de las dos regiones, asi que
+         * el camino normal no lo paga nunca.  \~ */
+        const Guarded *in = guard_locate(p);
+        if (in == nullptr || in->state != kStAlive) return 0;
+        const uintptr_t start =
+            reinterpret_cast<uintptr_t>(in->p.load(std::memory_order_acquire));
+        return in->req - (reinterpret_cast<uintptr_t>(p) - start);
+    }
+    if (g->state != kStAlive) return 0;
     return g->req;
 }
 
@@ -2466,7 +3150,7 @@ bool san_realloc(void *p, size_t n, void **out) noexcept {
      * direccion vieja.  Hacerlo crecer por el asignador mandaria un puntero de
      * fuera de la region a `no_foreign_free` y pararia el proceso, que es
      * justamente el agujero que esto cierra.  \~ */
-    void *q = san_alloc_guarded(n, __builtin_return_address(0),
+    void *q = san_alloc_guarded(n, kAlign, __builtin_return_address(0),
                                 __builtin_frame_address(0));
     if (q == nullptr) {
         /* \~english NO GUARD LEFT, SO A PLAIN BLOCK -- and it has to be, which
@@ -2534,6 +3218,10 @@ bool san_realloc(void *p, size_t n, void **out) noexcept {
 
 uint64_t san_guarded_blocks() noexcept {
     return g_guard_blocks.load(std::memory_order_relaxed);
+}
+
+uint64_t san_guarded_frees() noexcept {
+    return g_guard_frees.load(std::memory_order_relaxed);
 }
 
 uint64_t san_guarded_by_tag(unsigned tag) noexcept {

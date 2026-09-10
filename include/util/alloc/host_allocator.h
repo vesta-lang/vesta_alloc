@@ -1885,6 +1885,16 @@ namespace detail {
     if (align <= kAlign) return host_alloc(n);
     if (__builtin_expect(align >= kChunkBytes, 0)) return nullptr;
 
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+    /* BEFORE THE RAISING, because the raising is what the checking mode cannot
+     * follow: it knows a block by the address it handed out, and what leaves
+     * here is that address plus an offset.  Asked at this level the mode places
+     * the block aligned to begin with, so the two are the same pointer again.
+     * Says no whenever it is not the one serving, and then nothing below
+     * changes.  See `san_alloc_aligned`. */
+    if (void *g = san_alloc_aligned(n, align)) return g;
+#endif
+
     /* The request has to reach the SPAN path, and what routes it there is the
      * size.  Asking for `n + align` covers the bytes lost to the offset; if
      * that still fits in a class, it is raised until it does not -- a class
