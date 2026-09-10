@@ -287,6 +287,76 @@ int __wrap_posix_memalign(void **out, size_t align, size_t n) {
 #if defined(_WIN32)
 
 /**
+ * @brief
+ * \~english Whether an ALIGNED pointer is one of ours, asked about the address
+ *           that will actually be used.
+ * \~spanish Si un puntero ALINEADO es nuestro, preguntado por la direccion que
+ *           se va a usar de verdad.
+ * \~
+ *
+ * \~english
+ * WRITTEN ONCE BECAUSE FOUR ENTRIES NEED IT AND ALL FOUR HAD IT WRONG.
+ * `_aligned_malloc` hands back an address raised to an alignment and keeps the
+ * real one in the word before it; every entry in this family then acts on that
+ * real one -- `host_free_aligned` releases `p[-1]`, `aligned_usable` measures
+ * from `p[-1]` -- while all four ASKED `ours(p)`, about a different address
+ * than the one they were about to use.
+ *
+ * It agreed until now because both sit inside the region, so the comparisons
+ * said yes either way.  They stop agreeing the moment a block comes from
+ * OUTSIDE it -- the checking mode's guard level does exactly that -- and then
+ * these refused blocks they were about to handle correctly, and
+ * `no_foreign_free` stopped the process.  Found with a debugger, twice: first
+ * in `__wrap__aligned_free`, then, once that one was fixed, in
+ * `__wrap__aligned_realloc`.  Fixing them one at a time is how the third and
+ * fourth would have been found the same way, later, by somebody else.
+ *
+ * A question about one address and an action on another is a bug whether or not
+ * anything notices, and this is the shape that hides it: the two agree for as
+ * long as something else stays true elsewhere.
+ *
+ * \~spanish
+ * ESCRITA UNA VEZ PORQUE LA NECESITAN CUATRO ENTRADAS Y LAS CUATRO LA TENIAN
+ * MAL.  `_aligned_malloc` devuelve una direccion subida a una alineacion y
+ * guarda la de verdad en la palabra de delante; todas las entradas de esta
+ * familia actuan luego sobre esa de verdad -- `host_free_aligned` suelta
+ * `p[-1]`, `aligned_usable` mide desde `p[-1]` -- mientras que las cuatro
+ * PREGUNTABAN `ours(p)`, por una direccion distinta de la que iban a usar.
+ *
+ * Coincidia hasta ahora porque las dos caen dentro de la region, asi que las
+ * comparaciones decian que si de cualquier forma.  Dejan de coincidir en cuanto
+ * un bloque viene de FUERA -- el nivel de guarda del modo comprobacion hace
+ * justo eso -- y entonces estas rechazaban bloques que iban a tratar bien, y
+ * `no_foreign_free` paraba el proceso.  Encontrado con un depurador, dos veces:
+ * primero en `__wrap__aligned_free` y, una vez arreglada esa, en
+ * `__wrap__aligned_realloc`.  Arreglarlas de una en una es como la tercera y la
+ * cuarta se habrian encontrado igual, mas tarde y por otro.
+ *
+ * Una pregunta sobre una direccion y una accion sobre otra es un fallo se note
+ * o no, y esta es la forma que lo esconde: coinciden mientras siga siendo
+ * cierta otra cosa en otro sitio.
+ * \~
+ */
+/* \~english IT READS `p[-1]`, WHICH THE OLD TEST DID NOT.  Safe for anything
+ * that can legitimately arrive here: these entries are only reached by a
+ * pointer that came out of an `_aligned_malloc` -- ours or the runtime's -- and
+ * both keep the base in the word before, so that word is inside a block the
+ * caller owns.  The functions below all read it one line later anyway.  What
+ * changes for a pointer that never came from there is the SHAPE of the
+ * complaint, not whether there is one: it was already undefined to pass it.
+ *
+ * \~spanish LEE `p[-1]`, COSA QUE LA COMPROBACION VIEJA NO HACIA.  Es seguro
+ * para todo lo que puede llegar aqui legitimamente: a estas entradas solo llega
+ * un puntero salido de un `_aligned_malloc` -- nuestro o del runtime -- y los
+ * dos guardan la base en la palabra de delante, asi que esa palabra esta dentro
+ * de un bloque que el llamante posee.  Las funciones de abajo la leen igual una
+ * linea despues.  Lo que cambia para un puntero que no vino de ahi es la FORMA
+ * de la queja, no que la haya: pasarlo ya era indefinido.  \~ */
+[[gnu::always_inline]] inline bool ours_aligned(void *p) noexcept {
+    return p != nullptr && ours(((void **)p)[-1]);
+}
+
+/**
  * @brief `_aligned_malloc`: PAIRED, and that is what makes it cheap.
  *
  * Windows never releases one of these with `free` -- `_aligned_free` is part of
@@ -322,7 +392,41 @@ void *__wrap__aligned_malloc(size_t n, size_t align) {
  */
 void __wrap__aligned_free(void *p) {
     if (p == nullptr) return;
-    if (!ours(p)) util::detail::no_foreign_free(p); // does not return
+    /* \~english ASKED ABOUT THE POINTER THIS IS GOING TO RELEASE, which is not
+     * the one the caller holds.  `_aligned_malloc` hands back an address raised
+     * to an alignment and keeps the real one in the word before it, so
+     * `host_free_aligned` releases `p[-1]` -- and asking `ours(p)` was asking
+     * about a different address than the one being acted on.
+     *
+     * It happened to agree until now, because both sit inside the region, so
+     * the two comparisons said yes either way.  They stop agreeing the moment a
+     * block is served from OUTSIDE the region -- the checking mode's guard
+     * level does exactly that -- and then this refused a block it was about to
+     * release correctly, and `no_foreign_free` stopped the process.  Found with
+     * a debugger, in `no_foreign_free <- __wrap__aligned_free <- main`.
+     *
+     * A question about one address and an action on another is a bug whether or
+     * not anything notices, and this is the shape that hides it: the two agree
+     * for as long as one thing stays true elsewhere.
+     *
+     * \~spanish PREGUNTADO POR EL PUNTERO QUE ESTO VA A SOLTAR, que no es el
+     * que tiene quien llama.  `_aligned_malloc` devuelve una direccion subida a
+     * una alineacion y guarda la de verdad en la palabra de delante, asi que
+     * `host_free_aligned` suelta `p[-1]` -- y preguntar `ours(p)` era preguntar
+     * por una direccion distinta de aquella sobre la que se actua.
+     *
+     * Coincidian hasta ahora porque las dos caen dentro de la region, asi que
+     * las dos comparaciones decian que si de cualquier forma.  Dejan de
+     * coincidir en cuanto un bloque se sirve DESDE FUERA de la region -- el
+     * nivel de guarda del modo comprobacion hace justo eso -- y entonces esto
+     * rechazaba un bloque que iba a soltar bien, y `no_foreign_free` paraba el
+     * proceso.  Encontrado con un depurador, en `no_foreign_free <-
+     * __wrap__aligned_free <- main`.
+     *
+     * Una pregunta sobre una direccion y una accion sobre otra es un fallo se
+     * note o no, y esta es la forma que lo esconde: coinciden mientras siga
+     * siendo cierta otra cosa en otro sitio.  \~ */
+    if (!ours_aligned(p)) util::detail::no_foreign_free(p); // does not return
     util::host_free_aligned(p);
 }
 
@@ -357,7 +461,7 @@ void *__wrap__aligned_realloc(void *p, size_t n, size_t align) {
         errno = EINVAL;
         return nullptr;
     }
-    if (!ours(p)) util::detail::no_foreign_free(p); // does not return
+    if (!ours_aligned(p)) util::detail::no_foreign_free(p); // does not return
     if (n == 0) {
         util::host_free_aligned(p);
         return nullptr;
@@ -383,7 +487,7 @@ void *__wrap__aligned_recalloc(void *p, size_t count, size_t size,
                                size_t align) {
     if (count != 0 && size > (size_t(-1) / count)) return nullptr;
     const size_t n = count * size;
-    const size_t old = (p != nullptr && ours(p)) ? aligned_usable(p) : 0;
+    const size_t old = ours_aligned(p) ? aligned_usable(p) : 0;
     void *q = __wrap__aligned_realloc(p, n, align);
     /* Only the TAIL is cleared: the head came from the old block and clearing
      * it would throw away what the caller asked to keep. */
@@ -401,7 +505,7 @@ size_t __wrap__aligned_msize(void *p, size_t align, size_t offset) {
         errno = EINVAL;
         return size_t(-1);
     }
-    if (!ours(p)) util::detail::no_foreign_free(p); // does not return
+    if (!ours_aligned(p)) util::detail::no_foreign_free(p); // does not return
     return aligned_usable(p);
 }
 
@@ -432,8 +536,94 @@ void *__wrap__aligned_offset_realloc(void *p, size_t n, size_t align,
     return nullptr;
 }
 
+/**
+ * @brief
+ * \~english `_msize`, which allocates nothing and still had to be taken.
+ * \~spanish `_msize`, que no reserva nada y aun asi habia que cogerla.
+ * \~
+ *
+ * \~english
+ * WHY A FUNCTION THAT ONLY ASKS IS IN AN ALLOCATOR'S LIST.  Because it puts the
+ * caller's pointer to the NT heap, and the heap checks: handed one of OUR
+ * blocks it does not answer wrong, it stops the process with
+ * STATUS_HEAP_CORRUPTION.  That is how a window died inside `CreateWindowExW`
+ * -- uxtheme loads lazily, its start-up allocates an exit table through our
+ * `malloc`, and `__dllonexit` then asks `_msize` how big it is.  Serving a
+ * block and leaving the questions ABOUT it to somebody else is being `malloc`
+ * by halves, and the halves are not only the verbs.
+ *
+ * THIS IS THE SECOND WAY IN, and it is not redundant with the first.  The patch
+ * over `msvcrt!_msize` catches what the C runtime asks INSIDE itself; this
+ * catches what our own link asks, and it is the only one left when the build
+ * goes out without the patch (`VESTA_ALLOC_HOOK_MSVCRT=OFF`).  Two shapes of
+ * call, two mechanisms -- the same split the aligned family below already has.
+ *
+ * A FOREIGN BLOCK GETS ZERO AND IS NOT PASSED ON, and here that IS a limit
+ * rather than a choice: there can be no `__real__msize` to hand it to.  Asking
+ * for one makes the linker pull the member of `libmsvcrt.a` that defines the
+ * thunk, and that member also defines `__imp__msize` -- the symbol defined
+ * below -- so the link fails on two definitions of one name.  The same trap as
+ * `__real__aligned_free`; see the top of this file.
+ *
+ * \~spanish
+ * POR QUE UNA FUNCION QUE SOLO PREGUNTA ESTA EN LA LISTA DE UN ASIGNADOR.
+ * Porque le plantea al monton NT el puntero de quien llama, y el monton
+ * comprueba: dandole uno de NUESTROS bloques no contesta mal, para el proceso
+ * con STATUS_HEAP_CORRUPTION.  Asi murio una ventana dentro de
+ * `CreateWindowExW` -- uxtheme se carga perezosamente, su arranque reserva una
+ * tabla de salida por nuestro `malloc`, y `__dllonexit` le pregunta entonces a
+ * `_msize` cuanto mide --.  Servir un bloque y dejarle a otro las preguntas
+ * SOBRE el es ser `malloc` a medias, y las mitades no son solo los verbos.
+ *
+ * ESTA ES LA SEGUNDA VIA, y no sobra con la primera.  El parche sobre
+ * `msvcrt!_msize` caza lo que el runtime de C pregunta POR DENTRO; esta caza lo
+ * que pregunta nuestro propio enlace, y es la unica que queda cuando la
+ * compilacion sale sin el parche (`VESTA_ALLOC_HOOK_MSVCRT=OFF`).  Dos formas
+ * de llamada, dos mecanismos -- el mismo reparto que ya tiene la familia
+ * alineada de mas abajo.
+ *
+ * UN BLOQUE AJENO RECIBE CERO Y NO SE REENVIA, y aqui eso SI es un limite y no
+ * una eleccion: no puede existir un `__real__msize` al que darselo.  Pedirlo
+ * hace que el enlazador saque el miembro de `libmsvcrt.a` que define el thunk,
+ * y ese miembro define tambien `__imp__msize` -- el simbolo que se define mas
+ * abajo --, asi que el enlace falla por dos definiciones de un nombre.  La
+ * misma trampa que `__real__aligned_free`; ver la cabecera de este fichero.
+ * \~
+ */
+size_t __wrap__msize(void *p) {
+    return vesta_interpose::usable_bytes(p);
+}
+
+/**
+ * @brief
+ * \~english `_expand`, the other one that puts a pointer to the NT heap.
+ * \~spanish `_expand`, la otra que le plantea un puntero al monton NT.
+ * \~
+ *
+ * \~english
+ * It calls `RtlSizeHeap` and then `RtlReAllocateHeap` with the in-place flag,
+ * both on the caller's pointer -- the same two steps that killed the window,
+ * one function over.  Which of msvcrt's entries needed taking was settled by
+ * sweeping its code for references to the heap import slots rather than by
+ * reading names: fourteen sites in six functions, of which these two were the
+ * ones missing.  See `msvcrt_hook.cpp`, where the sweep is written down.
+ *
+ * \~spanish
+ * Llama a `RtlSizeHeap` y luego a `RtlReAllocateHeap` con la bandera de hacerlo
+ * en el sitio, las dos sobre el puntero de quien llama -- los mismos dos pasos
+ * que mataron la ventana, una funcion mas alla.  Cuales de las entradas de
+ * msvcrt habia que coger se decidio BARRIENDO su codigo en busca de
+ * referencias a las ranuras de importacion del monton, y no leyendo nombres:
+ * catorce sitios en seis funciones, de las cuales estas dos eran las que
+ * faltaban.  Ver `msvcrt_hook.cpp`, donde queda escrito el barrido.
+ * \~
+ */
+void *__wrap__expand(void *p, size_t n) {
+    return vesta_interpose::expand_in_place(p, n);
+}
+
 /* --------------------------------------------------------------------------
- *  AND THE PART THAT MAKES THE TWO ABOVE REACHABLE AT ALL
+ *  AND THE PART THAT MAKES EVERYTHING ABOVE REACHABLE AT ALL
  *
  *  `--wrap` renames PENDING references, and on Windows the reference is not
  *  pending under the name it would rename.  The CRT header declares these two
@@ -479,6 +669,20 @@ void *(*__imp__aligned_offset_malloc)(size_t, size_t, size_t) =
     &__wrap__aligned_offset_malloc;
 void *(*__imp__aligned_offset_realloc)(void *, size_t, size_t, size_t) =
     &__wrap__aligned_offset_realloc;
+/* \~english AND THE TWO THAT ONLY ASK, which need this every bit as much: the
+ * relocations of a compiled object show `__imp__msize` and `__imp__expand`,
+ * never the plain names, so the renaming alone would rename nothing and the
+ * wrappers above would be code nobody reaches.  Checked the same way as the
+ * rest of this block, by compiling a caller and reading what it emitted.
+ *
+ * \~spanish Y LAS DOS QUE SOLO PREGUNTAN, que lo necesitan igual: las
+ * reubicaciones de un objeto compilado ensenan `__imp__msize` y
+ * `__imp__expand`, nunca los nombres pelados, asi que el renombrado por si solo
+ * no renombraria nada y los envoltorios de arriba serian codigo al que no llega
+ * nadie.  Comprobado igual que el resto de este bloque, compilando un llamante
+ * y leyendo lo que emitio.  \~ */
+size_t (*__imp__msize)(void *) = &__wrap__msize;
+void *(*__imp__expand)(void *, size_t) = &__wrap__expand;
 
 #endif // _WIN32
 

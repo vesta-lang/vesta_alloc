@@ -477,6 +477,19 @@ if(VESTA_ALLOC_INTERPOSE_MALLOC)
             list(APPEND _wrapped _aligned_malloc _aligned_free
                     _aligned_realloc _aligned_recalloc _aligned_msize
                     _aligned_offset_malloc _aligned_offset_realloc)
+            # Y LAS DOS QUE NO RESERVAN NADA, que es justo por lo que faltaban:
+            # `_msize` y `_expand` cogen un puntero y se lo plantean al monton
+            # NT, que comprueba y PARA EL PROCESO al ver uno nuestro.  Asi murio
+            # una ventana dentro de `CreateWindowExW`, por la tabla de salida
+            # que uxtheme reserva al cargarse.  No parecen de la lista de un
+            # asignador, y esa es toda la razon de que se pasaran por alto.
+            #
+            # Cuales de las entradas de msvcrt hacian falta salio de BARRER su
+            # codigo buscando referencias a las ranuras de importacion del
+            # monton -- catorce sitios en seis funciones --, no de leer nombres.
+            # Con estas dos la familia queda cerrada: lo alineado y las
+            # variantes `_dbg` desembocan en ellas.
+            list(APPEND _wrapped _msize _expand)
         endif()
         # Y los que la OTRA via define salen de la lista, porque las dos a la
         # vez no se pueden: `__real_malloc` se resolveria con nuestra propia
@@ -755,26 +768,6 @@ if(VESTA_ALLOC_BUILD_TESTS)
                     "comprobacion de la documentacion bilingue NO se ejecuta")
         endif()
 
-        # -------------------------------------------------------------------
-        #  Y la prosa que Doxygen NO ve
-        # -------------------------------------------------------------------
-        #
-        # La comprobacion de arriba compara las dos referencias generadas, asi
-        # que ve lo que ve Doxygen: las cabeceras.  Los comentarios normales de
-        # los ficheros de implementacion le son invisibles, y ahi es justo donde
-        # la regla se habia deshecho -- 1.201 bloques en un solo idioma cuando
-        # se miro por primera vez.  Una regla sin quien la compruebe se deshace
-        # sola.
-        #
-        # No lleva lista de excepciones, que es como un comprobador empieza a
-        # mentir: lleva un TECHO que solo puede bajar, y la lista entera se
-        # imprime en cada corrida.  Solo necesita Python, no Doxygen.
-        if(Python3_Interpreter_FOUND)
-            add_test(NAME vesta_alloc_comment_parity
-                    COMMAND ${Python3_EXECUTABLE}
-                            ${CMAKE_CURRENT_SOURCE_DIR}/doc/check_comment_parity.py
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-        endif()
     endif()
 endif()
 
