@@ -2802,6 +2802,19 @@ size_t host_usable_size(const void *p) noexcept {
             const ChunkHeader *bh = big_chunk_of(const_cast<void *>(p));
             return bh->magic == kChunkMagic ? kSizes[bh->cls] : 0;
         }
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+        /* \~english Y EL COMPROBADOR, que en su nivel de guarda sirve bloques
+         * en paginas propias: no estan en ninguna region ni en la tabla de
+         * directos, asi que sin preguntarle contestariamos CERO por un bloque
+         * que acabamos de entregar.  Sin la macro esta rama no existe.
+         *
+         * \~spanish AND THE CHECKER, which at its guard level serves blocks on
+         * pages of their own: they are in neither region and not in the direct
+         * table, so without asking it we would answer ZERO about a block we
+         * just handed out.  Without the macro this branch does not exist.
+         * \~ */
+        if (const size_t g = san_guarded_size(p)) return g;
+#endif
         /* Fuera de las dos: puede ser uno de los que sirve el sistema en
          * reserva propia, y esos si tienen tamano que dar.  Cero cuando no lo
          * es, que es lo mismo que se contestaba antes. */
@@ -2829,6 +2842,27 @@ void *host_realloc(void *p, size_t n) noexcept {
         return nullptr;
     }
     if (!in_region(p)) {
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+        /* \~english EL COMPROBADOR PRIMERO, y tiene que ser lo primero: un
+         * bloque suyo con guarda no esta en ninguna region ni en la tabla de
+         * directos, asi que sin esto caeria hasta `no_foreign_free` y PARARIA
+         * EL PROCESO por un bloque que este asignador acaba de entregar.  Eso
+         * es lo que mataba catorce de los diecisiete tests con el nivel de
+         * guarda puesto.  Sin la macro esta rama no existe: ni la llamada, ni
+         * el nombre.
+         *
+         * \~spanish THE CHECKER FIRST, and it has to be first: a guarded block
+         * of its own is in neither region and not in the direct table, so
+         * without this it would fall all the way to `no_foreign_free` and STOP
+         * THE PROCESS over a block this allocator had just handed out.  That is
+         * what killed fourteen of this library's seventeen tests with the guard
+         * level on.  Without the macro this branch does not exist: not the
+         * call, not the name.  \~ */
+        {
+            void *q = nullptr;
+            if (san_realloc(p, n, &q)) return q;
+        }
+#endif
         if (in_big_region(p)) {
             /* De la region grande.  No se estira en su sitio -- son bloques de
              * clase, no tramos --, asi que se copia y se suelta, que es lo que

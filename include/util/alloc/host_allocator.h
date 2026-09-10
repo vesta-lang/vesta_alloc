@@ -2568,6 +2568,34 @@ class SingleOwnerAllocator {
      * especializada deberia salir. */
     [[gnu::always_inline]] void free(void *p) noexcept {
         if (p == nullptr) return;
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+        /* \~english THE CHECKER, and it has to be here too.  This entry does
+         * not delegate to `host_free` -- measured, and for good reason, see the
+         * note above -- so without this line a block the checker served is
+         * released without the checker ever hearing about it.  At the guard
+         * level that block lives outside the region, so it falls to
+         * `host_free_outside` and `no_foreign_free` STOPS THE PROCESS over
+         * memory this library handed out.  Found with a debugger, not guessed:
+         * `no_foreign_free <- host_free_outside <- common_battery`.
+         *
+         * The allocator has THREE doors out and the checker was only on one.
+         * Without the macro this branch does not exist, so the measurement the
+         * note above defends is untouched.
+         *
+         * \~spanish EL COMPROBADOR, y tiene que estar aqui tambien.  Esta
+         * entrada no delega en `host_free` -- medido, y con razon, ver la nota
+         * de arriba --, asi que sin esta linea un bloque que sirvio el
+         * comprobador se suelta sin que el comprobador se entere.  En el nivel
+         * de guarda ese bloque vive fuera de la region, asi que cae a
+         * `host_free_outside` y `no_foreign_free` PARA EL PROCESO por memoria
+         * que entrego esta libreria.  Encontrado con un depurador, no supuesto:
+         * `no_foreign_free <- host_free_outside <- common_battery`.
+         *
+         * El asignador tiene TRES puertas de salida y el comprobador solo
+         * estaba en una.  Sin la macro esta rama no existe, asi que la medicion
+         * que defiende la nota de arriba se queda intacta.  \~ */
+        if (!san_on_free(p)) return;
+#endif
 
         /* Una rama por region, cada una acabando en el camino exacto con la
          * cabecera ya en la mano; las otras dos formas que se probaron salieron
@@ -2866,6 +2894,18 @@ class PerThreadAllocator {
      */
     [[gnu::always_inline]] static void free(void *p) noexcept {
         if (p == nullptr) return;
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+        /* \~english THE CHECKER, for the same reason as the other two doors:
+         * this one does not delegate to `host_free` either, so a block the
+         * checker served would be released behind its back.  See
+         * @c SingleOwnerAllocator::free, where the whole thing is written down.
+         *
+         * \~spanish EL COMPROBADOR, por lo mismo que en las otras dos puertas:
+         * esta tampoco delega en `host_free`, asi que un bloque que sirvio el
+         * comprobador se soltaria a sus espaldas.  Ver
+         * @c SingleOwnerAllocator::free, donde esta contado entero.  \~ */
+        if (!san_on_free(p)) return;
+#endif
         detail::ThreadCache *c = detail::per_thread_cache();
 
         /* ONE BRANCH PER REGION, each ending in the exact path with the header
