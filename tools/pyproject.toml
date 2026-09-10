@@ -1,0 +1,98 @@
+# VestaVM -- Distributed Virtual Machine
+#
+# Copyright (C) 2026 David Lopez.T (DesmonHak) (Castilla y Leon, ES)
+# License: MIT (see LICENSE).  Part of the VestaVM family.
+#
+# \~english
+# WHY THIS EXISTS.  `alloc_tree` already had `__init__.py` and `__main__.py`, so
+# `python -m alloc_tree` worked -- from inside this directory, and nowhere else.
+# That is the wrong place to be standing: the report is read where the PROBLEM
+# happened, and that is somebody else's machine, somebody else's checkout, or a
+# build server with no source tree at all.  This is what lets the tool be
+# installed once and then run from wherever the export is.
+#
+# \~spanish
+# POR QUE EXISTE.  `alloc_tree` ya tenia `__init__.py` y `__main__.py`, asi que
+# `python -m alloc_tree` funcionaba -- desde dentro de este directorio, y en
+# ningun otro sitio.  Y ese es el sitio equivocado para estar: el informe se lee
+# donde ocurrio el PROBLEMA, que es la maquina de otro, la copia de otro, o un
+# servidor de construccion sin arbol de fuentes.  Esto es lo que permite
+# instalar la herramienta una vez y ejecutarla desde donde este el volcado.
+# \~
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vesta-alloc-tree"
+version = "1.0.0"
+description = "Where a program's allocations are born, as a tree you can walk"
+readme = "alloc_tree/README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "David Lopez.T (DesmonHak)" }]
+keywords = ["vesta", "allocator", "profiling", "flamegraph"]
+
+# \~english
+# EMPTY ON PURPOSE, and this is the one decision in the file worth arguing.
+# Folding the tree and printing it -- the whole `--text` path, tree and five
+# tables -- uses the standard library alone, so the tool runs where NOTHING can
+# be installed.  That is not a nicety: it is the usual situation on the machine
+# a memory problem actually shows up on.  Making Jinja2 a hard dependency would
+# trade that away for a rendering step most readings never reach.
+#
+# \~spanish
+# VACIO A PROPOSITO, y es la unica decision del fichero que merece discutirse.
+# Plegar el arbol e imprimirlo -- todo el camino `--text`, el arbol y las cinco
+# tablas -- usa la biblioteca estandar y nada mas, asi que la herramienta corre
+# donde NO se puede instalar nada.  Y eso no es un detalle: es la situacion
+# habitual en la maquina donde un problema de memoria aparece de verdad.  Hacer
+# de Jinja2 una dependencia dura cambiaria eso por un paso de dibujado al que la
+# mayoria de las lecturas no llegan.
+# \~
+dependencies = []
+
+[project.optional-dependencies]
+# \~english The page, and only the page.  `pip install vesta-alloc-tree[page]`.
+#          See `requirements.txt` for why it is Jinja2 and not concatenation:
+#          it escapes by default, and this page is fed function names straight
+#          out of a symbol table -- one carrying a `<` would swallow the rest of
+#          the row, which does not look like an error, it looks like a shorter
+#          report.
+# \~spanish La pagina, y solo la pagina.  `pip install vesta-alloc-tree[page]`.
+#          Ver `requirements.txt` para por que es Jinja2 y no concatenar:
+#          escapa por defecto, y a esta pagina le llegan nombres de funcion
+#          sacados de una tabla de simbolos -- uno con un `<` se comeria el
+#          resto de la fila, que no parece un error: parece un informe mas
+#          corto.
+# \~
+page = ["jinja2>=3.0"]
+
+[project.scripts]
+# \~english The same entry point as `python -m alloc_tree`, under a name that
+#          does not need the module path.  Both stay: one for a machine where
+#          this is installed, the other for a checkout where it is not.
+# \~spanish El mismo punto de entrada que `python -m alloc_tree`, con un nombre
+#          que no obliga a saber la ruta del modulo.  Se quedan los dos: uno
+#          para una maquina donde esto esta instalado, el otro para una copia
+#          donde no.
+# \~
+alloc-tree = "alloc_tree.__main__:main"
+
+[tool.setuptools]
+packages = ["alloc_tree"]
+
+[tool.setuptools.package-data]
+# \~english THE TEMPLATES TRAVEL WITH THE MODULE, and they have to: `page.py`
+#          finds them with `os.path.dirname(__file__)/templates`, so an install
+#          that left them behind would not fail at install time -- it would
+#          fail the first time somebody asked for a page, on the machine where
+#          the problem is.
+# \~spanish LAS PLANTILLAS VIAJAN CON EL MODULO, y tienen que hacerlo: `page.py`
+#          las busca en `os.path.dirname(__file__)/templates`, asi que una
+#          instalacion que las dejara atras no fallaria al instalar -- fallaria
+#          la primera vez que alguien pidiera una pagina, en la maquina donde
+#          esta el problema.
+# \~
+alloc_tree = ["templates/*"]
