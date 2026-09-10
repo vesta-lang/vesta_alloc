@@ -1832,6 +1832,47 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
         return nullptr;
     if (g_guarded == nullptr || n == 0) return nullptr;
 
+    /* \~english THE THREAD STILL NEEDS ITS CACHE, even though this block will
+     * not come out of it.  The allocator creates that cache lazily, on the
+     * first call that goes through `alloc_body` -- and a guarded block never
+     * goes through it.  So a thread whose allocations are all served here never
+     * gets one, and everything that hangs off it goes quiet: `record_alloc_site`
+     * gives up, the tags stop counting, and the per-thread counters stay at
+     * zero.  The allocator's own report goes blind exactly when the strictest
+     * checking mode is on, and it goes blind WITHOUT SAYING SO -- the report
+     * still prints, with nothing in it.
+     *
+     * Measured rather than reasoned: `alloc_sites_skipped()` reads 0 at the
+     * poison level and 1 at this one, for the same program and the same
+     * allocation.  It is what makes five of this library's own tests fail here
+     * -- sites, tags, counters, call sites and the CSV export -- with one cause.
+     *
+     * `ensure_cache` is the allocator's own entry point for this and it is
+     * exported for exactly this reach, so nothing there changes.  It costs a
+     * slot read and a branch, on a path that has just asked the system to
+     * reserve and commit pages.
+     *
+     * \~spanish EL HILO SIGUE NECESITANDO SU CACHE, aunque este bloque no vaya
+     * a salir de ella.  El asignador la crea perezosamente, en la primera
+     * llamada que pasa por `alloc_body` -- y un bloque con guarda no pasa por
+     * ahi nunca.  Asi que un hilo cuyas reservas se sirvan todas aqui no llega
+     * a tener ninguna, y todo lo que cuelga de ella se calla:
+     * `record_alloc_site` se rinde, las etiquetas dejan de contar y los
+     * contadores por hilo se quedan a cero.  El informe del propio asignador se
+     * queda ciego justo cuando el modo mas estricto esta puesto, y se queda
+     * ciego SIN DECIRLO -- el informe sigue saliendo, vacio.
+     *
+     * Medido y no razonado: `alloc_sites_skipped()` da 0 en el nivel de veneno
+     * y 1 en este, con el mismo programa y la misma reserva.  Es lo que hace
+     * fallar aqui a cinco de los tests de esta libreria -- sitios, etiquetas,
+     * contadores, sitios de llamada y el volcado CSV -- con una sola causa.
+     *
+     * `ensure_cache` es la entrada del propio asignador para esto y esta
+     * exportada justo para este alcance, asi que alli no cambia nada.  Cuesta
+     * leer una ranura y una rama, en un camino que acaba de pedirle al sistema
+     * que reserve y comprometa paginas.  \~ */
+    (void)detail::ensure_cache();
+
     const size_t page = os_page_size();
     const size_t data = (n + kCanaryBytes + page - 1) / page * page;
     const size_t total = data + page; // the guard
