@@ -1150,6 +1150,59 @@ std::atomic<uint64_t> g_guard_blocks{0};
 
 /**
  * @brief
+ * \~english The same count, split by PURPOSE, exactly as the allocator splits
+ *           its own.
+ * \~spanish La misma cuenta, repartida por PROPOSITO, igual que reparte el
+ *           asignador la suya.
+ * \~
+ *
+ * \~english
+ * WHY IT CANNOT GO INTO THE ALLOCATOR'S TABLE, and here the data structure
+ * decides it rather than a preference.  Its own comment says so where the
+ * counting happens: "counting by tag IS counting: the total comes from summing
+ * this table".  `by_tag` and `served` are the SAME number sliced by purpose, so
+ * adding a guarded block to `by_tag` would add it to `served` through the back
+ * door -- the very thing kept out one layer up, arrived at sideways.
+ *
+ * So the split lives here too, and the identity refines from a total into a
+ * per-purpose one:
+ *
+ *     for each tag t:   entries(t)  ==  by_tag(t)  +  guard_by_tag(t)
+ *
+ * Summed over the sixteen it gives back the total identity, which stops being a
+ * separate rule and becomes the consequence of these.
+ *
+ * IT ONLY WORKS BECAUSE THE THREAD HAS ITS CACHE.  The tag is read from it, and
+ * until this mode started asking for the cache a guarded allocation had none --
+ * so this would have counted everything as "not known" and looked like it
+ * worked.  See the `ensure_cache` call in `san_alloc_guarded`.
+ *
+ * \~spanish
+ * POR QUE NO PUEDE IR A LA TABLA DEL ASIGNADOR, y aqui lo decide la estructura
+ * de datos y no una preferencia.  Su propio comentario lo dice donde se cuenta:
+ * "contar por etiqueta ES contar: el total sale de sumar esta tabla".  `by_tag`
+ * y `served` son el MISMO numero troceado por proposito, asi que sumar ahi un
+ * bloque con guarda seria sumarlo a `served` por la puerta de atras -- justo lo
+ * que se dejo fuera una capa mas arriba, entrando de lado.
+ *
+ * Asi que el reparto vive tambien aqui, y la identidad se refina de un total a
+ * un reparto:
+ *
+ *     por cada etiqueta t:   entradas(t)  ==  by_tag(t)  +  guard_by_tag(t)
+ *
+ * Sumada sobre las dieciseis devuelve la identidad del total, que deja de ser
+ * una regla aparte y pasa a ser la consecuencia de estas.
+ *
+ * SOLO FUNCIONA PORQUE EL HILO TIENE SU CACHE.  La etiqueta se lee de ella, y
+ * hasta que este modo empezo a pedirla una reserva con guarda no tenia ninguna
+ * -- asi que esto habria contado todo como "no se" y habria parecido que
+ * funcionaba.  Ver la llamada a `ensure_cache` en `san_alloc_guarded`.
+ * \~
+ */
+std::atomic<uint64_t> g_guard_by_tag[VESTA_ALLOC_TAG_SLOTS];
+
+/**
+ * @brief
  * \~english How far from its own slot an entry may be, looking and placing.
  * \~spanish A que distancia de su ranura puede estar una entrada, al buscar y
  *           al colocar.
@@ -1926,7 +1979,7 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
      * exportada justo para este alcance, asi que alli no cambia nada.  Cuesta
      * leer una ranura y una rama, en un camino que acaba de pedirle al sistema
      * que reserve y comprometa paginas.  \~ */
-    (void)detail::ensure_cache();
+    const detail::ThreadCache *const tc = detail::ensure_cache();
 
     const size_t page = os_page_size();
     const size_t data = (n + kCanaryBytes + page - 1) / page * page;
@@ -2004,6 +2057,20 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     /* And the BLOCK, which is what closes the identity with the allocator's own
      * count.  See `g_guard_blocks`. */
     g_guard_blocks.fetch_add(1, std::memory_order_relaxed);
+    /* \~english And under WHICH purpose, read from the cache this function made
+     * sure exists.  Without a cache the tag would be "not known" for every
+     * guarded block, and the split would look like it worked while saying
+     * nothing.  See `g_guard_by_tag`.
+     *
+     * \~spanish Y bajo QUE proposito, leido de la cache que esta misma funcion
+     * se ha asegurado de que exista.  Sin cache la etiqueta seria "no se" en
+     * todos los bloques con guarda, y el reparto pareceria funcionar sin decir
+     * nada.  Ver `g_guard_by_tag`.  \~ */
+    {
+        const unsigned tag = detail::have_cache(tc) ? unsigned(tc->tag) : 0u;
+        if (tag < VESTA_ALLOC_TAG_SLOTS)
+            g_guard_by_tag[tag].fetch_add(1, std::memory_order_relaxed);
+    }
 
     /* The gap between the end of the block and the guard, filled so that an
      * overflow too small to reach the page still leaves a mark. */
@@ -2467,6 +2534,14 @@ bool san_realloc(void *p, size_t n, void **out) noexcept {
 
 uint64_t san_guarded_blocks() noexcept {
     return g_guard_blocks.load(std::memory_order_relaxed);
+}
+
+uint64_t san_guarded_by_tag(unsigned tag) noexcept {
+    /* Out of range answers zero rather than reading past the table: a caller
+     * asking about a purpose that does not exist gets "none of those", which is
+     * true, instead of whatever byte followed. */
+    if (tag >= VESTA_ALLOC_TAG_SLOTS) return 0;
+    return g_guard_by_tag[tag].load(std::memory_order_relaxed);
 }
 
 uint64_t san_moved_bytes() noexcept {

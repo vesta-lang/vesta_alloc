@@ -690,6 +690,50 @@ uint64_t san_moved_bytes() noexcept;
  */
 uint64_t san_guarded_blocks() noexcept;
 
+/**
+ * @brief
+ * \~english The same count as @c san_guarded_blocks, split by PURPOSE.
+ * \~spanish La misma cuenta que @c san_guarded_blocks, repartida por PROPOSITO.
+ * \~
+ *
+ * \~english
+ * WHY THE SPLIT IS HERE AND NOT ADDED TO THE ALLOCATOR'S, and the data
+ * structure decides it: its own comment, where the counting happens, says
+ * "counting by tag IS counting: the total comes from summing this table".
+ * `by_tag` and `served` are the same number sliced by purpose, so adding a
+ * guarded block there would add it to `served` sideways.
+ *
+ * With this, the identity refines from a total into a per-purpose one, and the
+ * total becomes the consequence of the sixteen rather than a rule of its own:
+ *
+ *     for each tag t:   entries(t)  ==  by_tag(t)  +  san_guarded_by_tag(t)
+ *
+ * \~spanish
+ * POR QUE EL REPARTO ESTA AQUI Y NO SUMADO AL DEL ASIGNADOR, y lo decide la
+ * estructura de datos: su propio comentario, donde se cuenta, dice "contar por
+ * etiqueta ES contar: el total sale de sumar esta tabla".  `by_tag` y `served`
+ * son el mismo numero troceado por proposito, asi que sumar ahi un bloque con
+ * guarda seria sumarlo a `served` de lado.
+ *
+ * Con esto la identidad se refina de un total a un reparto, y el total pasa a
+ * ser la consecuencia de las dieciseis en vez de una regla propia:
+ *
+ *     por cada etiqueta t:   entradas(t)  ==  by_tag(t)  +
+ *                            san_guarded_by_tag(t)
+ * \~
+ *
+ * @param tag
+ * \~english the purpose, as @c AllocTag::raw gives it.
+ * \~spanish el proposito, tal como lo da @c AllocTag::raw.
+ * \~
+ * @return
+ * \~english how many, 0 below the guard level and 0 for a tag out of range.
+ * \~spanish cuantos, 0 por debajo del nivel de guarda y 0 si la etiqueta se
+ *           sale del rango.
+ * \~
+ */
+uint64_t san_guarded_by_tag(unsigned tag) noexcept;
+
 size_t san_guarded_size(const void *p) noexcept;
 
 /**
@@ -759,6 +803,9 @@ bool san_realloc(void *p, size_t n, void **out) noexcept;
  * con el segundo termino a cero.  Quien la consuma puede afirmarla sin
  * condiciones.  \~ */
 [[gnu::always_inline]] inline uint64_t san_guarded_blocks() noexcept {
+    return 0;
+}
+[[gnu::always_inline]] inline uint64_t san_guarded_by_tag(unsigned) noexcept {
     return 0;
 }
 [[gnu::always_inline]] inline size_t san_guarded_size(const void *) noexcept {

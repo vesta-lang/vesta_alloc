@@ -27,6 +27,9 @@
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
+/* Por `san_guarded_by_tag()`.  Sin el modo compilado la cabecera declara la
+ * version que contesta cero, asi que esto vale igual en los dos builds. */
+#include "util/alloc/sanitizer.h"
 
 #include <cstdio>
 #include <thread>
@@ -41,9 +44,39 @@ void check(bool ok, const char *what) {
 }
 
 /// Reservas contadas con @p t desde que se tomo @p base.
-uint64_t delta(const util::HostAllocStats &base, util::AllocTag t) {
-    const util::HostAllocStats now = util::host_alloc_stats();
-    return now.by_tag[t.raw()] - base.by_tag[t.raw()];
+/* LA FOTO SON LOS DOS QUE PUEDEN SERVIR, y por eso deja de ser solo las
+ * estadisticas del asignador.  Su `by_tag` cuenta los bloques que EL recorto
+ * bajo esa etiqueta; en el nivel de guarda del modo comprobacion el bloque sale
+ * de paginas propias del comprobador, asi que el asignador no lo vio y hace
+ * bien en no contarlo.  Pedirle solo a el la cuenta era preguntar "cuantos
+ * recorto" cuando lo que este test pregunta es "cuantos se pidieron bajo este
+ * proposito".
+ *
+ * Los DOS terminos se restan contra la misma foto: sumar el contador del
+ * comprobador en absoluto y el del asignador en diferencia daria una cuenta que
+ * crece con todo lo que el proceso hizo ANTES, y en un test que exige ">= 20"
+ * eso pasa desapercibido -- pasaria siempre.
+ *
+ * Sin el modo compilado el segundo termino es la version que contesta cero, asi
+ * que esto es literalmente lo de siempre y las comprobaciones de abajo no se
+ * tocan. */
+struct Shot {
+    util::HostAllocStats stats;
+    uint64_t guarded[VESTA_ALLOC_TAG_SLOTS];
+};
+
+Shot take() {
+    Shot s;
+    s.stats = util::host_alloc_stats();
+    for (unsigned i = 0; i < VESTA_ALLOC_TAG_SLOTS; ++i)
+        s.guarded[i] = util::san_guarded_by_tag(i);
+    return s;
+}
+
+uint64_t delta(const Shot &base, util::AllocTag t) {
+    const Shot now = take();
+    return (now.stats.by_tag[t.raw()] - base.stats.by_tag[t.raw()]) +
+           (now.guarded[t.raw()] - base.guarded[t.raw()]);
 }
 
 /**
@@ -77,7 +110,7 @@ int main() {
 
     // 1. Sin ambito: todo a "no se".
     {
-        const util::HostAllocStats base = util::host_alloc_stats();
+        const Shot base = take();
         allocate_some(20);
         check(delta(base, kUnknown) >= 20,
               "sin ambito, cuenta como \"no se\"");
@@ -87,7 +120,7 @@ int main() {
 
     // 2. Dentro de un ambito.
     {
-        const util::HostAllocStats base = util::host_alloc_stats();
+        const Shot base = take();
         {
             const util::AllocScope scope{kInstant};
             allocate_some(20);
@@ -99,7 +132,7 @@ int main() {
 
     // 3. Anidan y restauran.
     {
-        const util::HostAllocStats base = util::host_alloc_stats();
+        const Shot base = take();
         {
             const util::AllocScope outer{kLong};
             allocate_some(10);
@@ -120,7 +153,7 @@ int main() {
 
     // 4. Un hilo nuevo NO hereda.  Es la trampa que documenta el plan.
     {
-        const util::HostAllocStats base = util::host_alloc_stats();
+        const Shot base = take();
         {
             const util::AllocScope scope{kInstant};
             std::thread t([] { allocate_some(20); });
@@ -132,7 +165,7 @@ int main() {
 
     // 5. Pasandola a mano: lo que hace InPoolTaskScope.
     {
-        const util::HostAllocStats base = util::host_alloc_stats();
+        const Shot base = take();
         {
             const util::AllocScope scope{kLong};
             // Se lee en el hilo que reparte, NO dentro de la tarea.
@@ -161,7 +194,7 @@ int main() {
          * funcionando, que es justo lo que este caso existe para vigilar. */
         const uint64_t leak_small = delta(base, kUnknown);
 
-        const util::HostAllocStats base2 = util::host_alloc_stats();
+        const Shot base2 = take();
         {
             const util::AllocScope scope{kLong};
             const util::AllocTag parent_tag = util::AllocScope::current();
