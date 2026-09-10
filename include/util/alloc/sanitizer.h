@@ -526,6 +526,154 @@ uint64_t san_verdicts() noexcept;
  */
 uint64_t san_longest_life() noexcept;
 
+/**
+ * @brief
+ * \~english Every byte handed out so far, released or not.
+ * \~spanish Todos los bytes entregados hasta ahora, liberados o no.
+ * \~
+ *
+ * \~english
+ * Here for the same reason as @c san_longest_life: so a test can demand that
+ * this is MEASURED.  And it answers a question nothing else in this checker
+ * could: the shadow is indexed by ADDRESS, so it forgets a block the moment
+ * its address is used again, and by the end of a run it knows what LEAKED and
+ * not what a site ALLOCATED.  Those come apart hard.  A buffer that doubles
+ * twenty times and is released moves gigabytes and leaves nothing behind --
+ * invisible to the leak list, and the shape that decides a peak.
+ *
+ * Counted at BIRTH and not at death, which is the whole point: counting at
+ * death would leave out everything still alive at exit.
+ *
+ * A TOTAL AND NOT THE LARGEST SITE, which it was first: a maximum only moves
+ * when something beats it, so a test could not ask "did my two hundred blocks
+ * get counted" -- the answer was yes and the number had not budged, because
+ * this checker's own symbol resolution had already moved more.  A sum is
+ * monotonic, so a difference across a known amount of work is an assertion.
+ * Which site moved the most is a question the report answers, with the stack
+ * attached, which is where it is useful.
+ *
+ * @return the total, or 0 when nothing has been allocated yet.
+ *
+ * @code
+ *   const uint64_t before = util::san_moved_bytes();
+ *   for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(16));
+ *   // san_moved_bytes() >= before + 3200, even though nothing survived
+ * @endcode
+ *
+ * @code
+ *   // and a block past the small-class limit counts too, which is where the
+ *   // largest allocations of a real program live
+ *   const uint64_t before = util::san_moved_bytes();
+ *   util::host_free(util::host_alloc(64u << 20));
+ *   // san_moved_bytes() >= before + (64u << 20)
+ * @endcode
+ *
+ * \~spanish
+ * Esta aqui por lo mismo que @c san_longest_life: para que un test pueda exigir
+ * que esto se MIDE.  Y contesta una pregunta que ninguna otra cosa de este
+ * comprobador podia: el sombreado se indexa por DIRECCION, asi que olvida un
+ * bloque en cuanto su direccion se vuelve a usar, y al acabar una corrida sabe
+ * lo que se FUGO y no lo que un sitio RESERVO.  Y se separan mucho.  Un buffer
+ * que se duplica veinte veces y se libera mueve gigabytes y no deja nada
+ * detras -- invisible para la lista de fugas, y la forma que decide un pico.
+ *
+ * Se cuenta al NACER y no al morir, que es de lo que se trata: contar al morir
+ * dejaria fuera todo lo que sigue vivo al salir.
+ *
+ * @return el total mayor, o 0 si no se ha reservado nada todavia.
+ * \~
+ */
+uint64_t san_moved_bytes() noexcept;
+
+/**
+ * @brief
+ * \~english How much of @p p is usable, when the checker served it itself.
+ * \~spanish Cuanto de @p p se puede usar, cuando lo sirvio el comprobador.
+ * \~
+ *
+ * \~english
+ * WHY THE ALLOCATOR HAS TO ASK.  At the guard level a block lives on pages of
+ * its own, outside both regions and not in the direct table, so the allocator's
+ * own question -- `in_region || in_big_region || direct_bytes` -- answers NO
+ * for a block it just handed out through this mode.  Everything downstream of
+ * that answer then goes wrong: `host_realloc` sends it to `no_foreign_free` and
+ * stops the process, `host_usable_size` says zero, and the interposed `realloc`
+ * reports out of memory.
+ *
+ * That is not a corner: it is why the guard level killed fourteen of this
+ * library's seventeen tests.  Traced to `pthread_key_create` answering ENOMEM
+ * because its `realloc` was refused, then `emutls_init` calling `abort`.
+ *
+ * ONE FUNCTION FOR TWO QUESTIONS, deliberately: a non-zero answer means "mine",
+ * which is what `ours` needs, and the value itself is what `host_usable_size`
+ * needs.  Two entry points asking the same table twice is how they drift.
+ *
+ * \~spanish
+ * POR QUE TIENE QUE PREGUNTAR EL ASIGNADOR.  En el nivel de guarda un bloque
+ * vive en paginas propias, fuera de las dos regiones y sin estar en la tabla de
+ * directos, asi que la pregunta del propio asignador -- `in_region ||
+ * in_big_region || direct_bytes` -- contesta NO para un bloque que acaba de
+ * entregar por este modo.  Todo lo que cuelga de esa respuesta sale mal:
+ * `host_realloc` lo manda a `no_foreign_free` y para el proceso,
+ * `host_usable_size` dice cero, y el `realloc` interpuesto avisa de falta de
+ * memoria.
+ *
+ * No es un caso raro: es por lo que el nivel de guarda mataba catorce de los
+ * diecisiete tests de esta libreria.  Rastreado hasta `pthread_key_create`
+ * contestando ENOMEM porque le rechazaron su `realloc`, y de ahi `emutls_init`
+ * llamando a `abort`.
+ *
+ * UNA FUNCION PARA DOS PREGUNTAS, a proposito: una respuesta distinta de cero
+ * significa "es mio", que es lo que necesita `ours`, y el valor en si es lo que
+ * necesita `host_usable_size`.  Dos entradas preguntando dos veces a la misma
+ * tabla es como se separan.
+ * \~
+ *
+ * @return
+ * \~english usable bytes, or 0 when the checker did not serve @p p -- which
+ *           includes every level below the guard one.
+ * \~spanish bytes utilizables, o 0 si el comprobador no sirvio @p p -- lo que
+ *           incluye todos los niveles por debajo del de guarda.
+ * \~
+ */
+size_t san_guarded_size(const void *p) noexcept;
+
+/**
+ * @brief
+ * \~english Resizes @p p when the checker served it; says whether it did.
+ * \~spanish Redimensiona @p p si lo sirvio el comprobador; dice si lo hizo.
+ * \~
+ *
+ * \~english
+ * A guarded block cannot grow where it lies: its pages end at a guard that has
+ * to stay at the end, which is the whole mechanism.  So growing means taking a
+ * new one, copying, and releasing the old THROUGH THE CHECKER, so the watch on
+ * the old address survives -- release it through the allocator and the address
+ * is handed to somebody else, and a use-after-free stops pointing at the code
+ * that caused it.
+ *
+ * @param out where the new pointer goes.  Null means the resize did not happen
+ *            and @p p is still valid, which is what `realloc` promises.
+ * @return true when this call handled it, false when @p p is not the checker's
+ *         and the allocator should carry on.
+ *
+ * \~spanish
+ * Un bloque con guarda no puede crecer donde esta: sus paginas acaban en una
+ * guarda que tiene que quedarse al final, que es todo el mecanismo.  Asi que
+ * crecer es coger uno nuevo, copiar, y soltar el viejo POR EL COMPROBADOR, para
+ * que la vigilancia de la direccion vieja sobreviva -- soltarlo por el
+ * asignador entrega esa direccion a otro, y un uso despues de liberar deja de
+ * apuntar al codigo que lo causo.
+ *
+ * @param out donde va el puntero nuevo.  Nulo significa que el cambio de tamano
+ *            no ocurrio y @p p sigue siendo valido, que es lo que promete
+ *            `realloc`.
+ * @return true si esta llamada se ocupo, false si @p p no es del comprobador y
+ *         el asignador debe seguir.
+ * \~
+ */
+bool san_realloc(void *p, size_t n, void **out) noexcept;
+
 #else // the checker is not in this build / el comprobador no esta en este build
 
 /* \~english Empty and always inlined: with the macro off, `host_alloc` and
@@ -548,6 +696,14 @@ uint64_t san_longest_life() noexcept;
 [[gnu::always_inline]] inline bool san_on_free(void *) noexcept { return true; }
 [[gnu::always_inline]] inline uint64_t san_verdicts() noexcept { return 0; }
 [[gnu::always_inline]] inline uint64_t san_longest_life() noexcept { return 0; }
+[[gnu::always_inline]] inline uint64_t san_moved_bytes() noexcept { return 0; }
+[[gnu::always_inline]] inline size_t san_guarded_size(const void *) noexcept {
+    return 0;
+}
+[[gnu::always_inline]] inline bool san_realloc(void *, size_t,
+                                               void **) noexcept {
+    return false;
+}
 
 #endif // VESTA_ALLOC_SANITIZER
 

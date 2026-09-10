@@ -239,6 +239,63 @@ int main(int argc, char **argv) {
               "a block kept alive across 200 allocations measures at least 200");
     }
 
+    /* \~english WHAT A SITE MOVED, which is the figure the leak list cannot
+     * give.  Two hundred blocks are taken and RELEASED, so nothing survives:
+     * every other number in this checker is blind to them by the time the
+     * report runs -- the shadow is indexed by address and forgets a block as
+     * soon as its address is used again.  A site that allocated and freed
+     * gigabytes looks identical to one that never ran.
+     *
+     * That is the shape worth catching: a buffer that doubles until it is huge
+     * and is then released moves everything and leaks nothing.  So the demand
+     * here is that the total SURVIVES the blocks, and it is checked as a
+     * difference rather than an absolute -- the run-time allocates too, and an
+     * exact figure would fail the day the C++ library changes its mind.
+     *
+     * \~spanish LO QUE MOVIO UN SITIO, que es la cifra que la lista de fugas no
+     * puede dar.  Se cogen doscientos bloques y se SUELTAN, asi que no
+     * sobrevive ninguno: para cuando corre el informe, todos los demas numeros
+     * de este comprobador son ciegos para ellos -- el sombreado se indexa por
+     * direccion y olvida un bloque en cuanto su direccion se reutiliza --.  Un
+     * sitio que reservo y libero gigabytes tiene el mismo aspecto que uno que
+     * no se ejecuto nunca.
+     *
+     * Esa es la forma que merece la pena cazar: un buffer que se duplica hasta
+     * ser enorme y luego se libera lo mueve todo y no fuga nada.  Asi que aqui
+     * se exige que el total SOBREVIVA a los bloques, y se comprueba como
+     * diferencia y no como absoluto -- el runtime tambien reserva, y una cifra
+     * exacta fallaria el dia que la libreria de C++ cambie de idea.  \~ */
+    {
+        const uint64_t before = util::san_moved_bytes();
+        for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(512));
+        check(util::san_moved_bytes() >= before + 200u * 512u,
+              "lo que un sitio movio se sigue sabiendo despues de soltarlo "
+              "todo, que es lo que la lista de fugas no puede decir");
+    }
+
+    /* \~english AND A BLOCK PAST THE SMALL-CLASS LIMIT, which used to be
+     * dropped one line before its stack was walked.  It has no shadow slot, so
+     * it has no life and no leak verdict -- and none of that is needed to say
+     * how big it was.  Measured on a real compile, the blocks out here were
+     * forty-one operations and the three largest allocations in the program.
+     *
+     * \~spanish Y UN BLOQUE PASADO EL LIMITE DE CLASE PEQUENA, que antes se
+     * tiraba una linea antes de recorrer su pila.  No tiene ranura de sombra,
+     * asi que no tiene vida ni veredicto de fuga -- y nada de eso hace falta
+     * para decir cuanto media.  Medido en una compilacion de verdad, los
+     * bloques de aqui fuera eran cuarenta y una operaciones y las tres mayores
+     * reservas del programa.  \~ */
+    {
+        const uint64_t before = util::san_moved_bytes();
+        const size_t big = 64u << 20; // well past any size class
+        void *p = util::host_alloc(big);
+        check(p != nullptr, "una reserva grande se sirve");
+        util::host_free(p);
+        check(util::san_moved_bytes() >= before + big,
+              "y un bloque fuera de la region sombreada tambien se cuenta, "
+              "que es donde viven las reservas mayores del programa");
+    }
+
     /* \~english THE GUARD LEVEL, from a safe distance.  What it catches, it
      * catches by faulting, so the mistakes are made in a child and what is
      * asserted here is that the child did not survive them -- and, just as
