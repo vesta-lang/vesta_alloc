@@ -1095,6 +1095,61 @@ std::atomic<uint64_t> g_guard_bytes{0};
 
 /**
  * @brief
+ * \~english Blocks this mode served ITSELF, out of its own pages.
+ * \~spanish Bloques que este modo sirvio EL, de sus propias paginas.
+ * \~
+ *
+ * \~english
+ * WHY THE CHECKER COUNTS ITS OWN INSTEAD OF ADDING TO THE ALLOCATOR'S.  Because
+ * the two numbers do not mean the same thing and making them agree would throw
+ * one of them away.  `served` means "blocks this allocator carved out of a
+ * region"; a guarded block was not carved out of anything -- the pages came
+ * from the system and the allocator never saw it.  Adding to `served` would
+ * turn it into "blocks that happened", which is what the site table already
+ * counts, and the fact that most of a run came out of guard pages -- so its
+ * memory behaviour is NOT the program's usual one -- would stop being visible.
+ *
+ * WHAT IT BUYS is an identity instead of an approximation:
+ *
+ *     site entries  ==  allocator served  +  checker served
+ *
+ * That has to hold at EVERY level, and below the guard one this counter is zero
+ * so it degenerates into the equality the allocator already checked.  A test
+ * that was red here by construction becomes a test of something.
+ *
+ * The bytes and the refusals were already counted on this path; only the blocks
+ * were not.  It is one relaxed add, next to a call that has just asked the
+ * system to reserve and commit pages.
+ *
+ * \~spanish
+ * POR QUE EL COMPROBADOR CUENTA LOS SUYOS EN VEZ DE SUMARLOS A LOS DEL
+ * ASIGNADOR.  Porque los dos numeros no significan lo mismo y hacerlos cuadrar
+ * tiraria uno de los dos.  `served` significa "bloques que este asignador
+ * recorto de una region"; un bloque con guarda no se recorto de nada -- las
+ * paginas vinieron del sistema y el asignador no lo vio nunca.  Sumarlo a
+ * `served` lo convertiria en "bloques que ocurrieron", que es lo que ya cuenta
+ * la tabla de sitios, y dejaria de verse que la mayor parte de una corrida
+ * salio de paginas de guarda -- o sea que su comportamiento de memoria NO es el
+ * habitual del programa.
+ *
+ * LO QUE COMPRA es una identidad en vez de una aproximacion:
+ *
+ *     entradas de sitio  ==  servidas por el asignador  +  servidas por el
+ *                            comprobador
+ *
+ * Y eso tiene que cumplirse en TODOS los niveles: por debajo del de guarda este
+ * contador vale cero y degenera en la igualdad que el asignador ya comprobaba.
+ * Un test que aqui salia rojo por construccion pasa a comprobar algo.
+ *
+ * Los bytes y los rechazos ya se contaban en este camino; los bloques no.  Es
+ * una suma relajada, al lado de una llamada que acaba de pedirle al sistema que
+ * reserve y comprometa paginas.
+ * \~
+ */
+std::atomic<uint64_t> g_guard_blocks{0};
+
+/**
+ * @brief
  * \~english How far from its own slot an entry may be, looking and placing.
  * \~spanish A que distancia de su ranura puede estar una entrada, al buscar y
  *           al colocar.
@@ -1946,6 +2001,9 @@ void *san_alloc_guarded(size_t n, const void *pc, const void *fp) noexcept {
     g->free_stack = 0;
     g->state = kStAlive;
     g_guard_bytes.fetch_add(total, std::memory_order_relaxed);
+    /* And the BLOCK, which is what closes the identity with the allocator's own
+     * count.  See `g_guard_blocks`. */
+    g_guard_blocks.fetch_add(1, std::memory_order_relaxed);
 
     /* The gap between the end of the block and the guard, filled so that an
      * overflow too small to reach the page still leaves a mark. */
@@ -2407,6 +2465,10 @@ bool san_realloc(void *p, size_t n, void **out) noexcept {
     return true;
 }
 
+uint64_t san_guarded_blocks() noexcept {
+    return g_guard_blocks.load(std::memory_order_relaxed);
+}
+
 uint64_t san_moved_bytes() noexcept {
     /* \~english Worked out here rather than kept as a running maximum, and on
      * purpose: a maximum updated on every allocation would be state on the hot
@@ -2769,6 +2831,14 @@ bool write_check_csv(const char *dir) noexcept {
     if (FILE *f = csv_open(dir, "check_summary.csv")) {
         std::fprintf(f, "key,value\n");
         std::fprintf(f, "depot_slots,%u\n", kDepotSlots);
+        /* What THIS mode served, which the allocator's own counters cannot see:
+         * `site entries == allocator served + this`.  See `g_guard_blocks`. */
+        std::fprintf(f, "blocks_served_by_the_checker,%llu\n",
+                     (unsigned long long)g_guard_blocks.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "bytes_reserved_for_guards,%llu\n",
+                     (unsigned long long)g_guard_bytes.load(
+                         std::memory_order_relaxed));
         std::fprintf(f, "stacks_that_did_not_fit,%llu\n",
                      (unsigned long long)g_depot_full.load(
                          std::memory_order_relaxed));
@@ -2903,12 +2973,33 @@ void report() noexcept {
                      "and were served the ordinary way\n",
                      (unsigned long long)gfull, kGuardSlots);
     const uint64_t gb = g_guard_bytes.load(std::memory_order_relaxed);
+    const uint64_t gblocks = g_guard_blocks.load(std::memory_order_relaxed);
     if (gb != 0)
         std::fprintf(stderr,
                      "[allocator/check] %llu MiB of address space went to "
                      "guarded blocks and is NOT coming back: that is what buys "
                      "the fault happening where the mistake is\n",
                      (unsigned long long)(gb / (1024 * 1024)));
+    /* \~english WHO SERVED WHAT, said plainly.  The allocator's own counters
+     * only ever see what IT carved out of a region, so at this level most of a
+     * run is missing from them -- and that is not a discrepancy to excuse, it
+     * is the warning that this run's memory behaviour is not the program's
+     * usual one.  Whoever reads a profile taken here has to know that before
+     * drawing anything from it.
+     *
+     * \~spanish QUIEN SIRVIO QUE, dicho claro.  Los contadores del propio
+     * asignador solo ven lo que EL recorto de una region, asi que en este nivel
+     * la mayor parte de una corrida les falta -- y eso no es una discrepancia
+     * que disculpar, es el aviso de que el comportamiento de memoria de esta
+     * corrida no es el habitual del programa.  Quien lea un perfil tomado aqui
+     * tiene que saberlo antes de sacar nada de el.  \~ */
+    if (gblocks != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] %llu blocks were served BY THIS MODE, "
+                     "out of its own pages -- the allocator did not carve them "
+                     "and does not count them, so a profile taken here is not "
+                     "this program's usual one\n",
+                     (unsigned long long)gblocks);
 
     const uint64_t cross = g_cross_thread.load(std::memory_order_relaxed);
     if (cross != 0)

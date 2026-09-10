@@ -40,6 +40,11 @@
 #include "util/interpose/call_site.h"
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por `san_guarded_blocks()`.  Sin el modo compilado la cabecera declara la
+ * version vacia que contesta cero, asi que esto compila y vale igual en los dos
+ * builds -- que es la condicion para poder afirmar la igualdad sin preguntar
+ * antes en que build estamos. */
+#include "util/alloc/sanitizer.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +75,21 @@ struct Shot {
     uint64_t entries = 0;   ///< entradas por la puerta de `operator new`
     uint64_t served = 0;    ///< reservas que el asignador dice haber servido
     uint64_t recorded = 0;  ///< lo que quedo en la tabla de sitios
+    /**
+     * @brief Reservas que sirvio el modo COMPROBACION, de sus propias paginas.
+     *
+     * NO ES UNA COLUMNA MAS: es el segundo sumando de la igualdad que este test
+     * comprueba.  El `served` del asignador cuenta lo que EL recorto de una
+     * region, y en el nivel de guarda el bloque sale de paginas que el
+     * comprobador le pidio al sistema -- el asignador no lo vio y hace bien en
+     * no contarlo.  Sin este termino, la razon entre entradas y servidas era
+     * 8,77 en ese nivel, y no por un desvio: por estar comparando "lo que pidio
+     * el programa" con "lo que recorto el asignador", que ahi son dos cosas.
+     *
+     * Sin el modo compilado vale cero y la igualdad degenera exactamente en la
+     * de siempre.
+     */
+    uint64_t guarded = 0;
 };
 
 static util::AllocSite g_snap[4096];
@@ -82,6 +102,7 @@ Shot take() {
     const unsigned n = util::alloc_sites_snapshot(g_snap, 4096);
     for (unsigned i = 0; i < n; ++i)
         s.recorded += g_snap[i].count - g_snap[i].over;
+    s.guarded = util::san_guarded_blocks();
     return s;
 }
 
@@ -156,14 +177,24 @@ Shot take() {
     }
 }
 
+/* LA TABLA IMPRIME LO QUE SE COMPRUEBA, y no otra cosa parecida.  Antes la
+ * razon se sacaba solo de las servidas por el asignador, asi que en el nivel de
+ * guarda salia un 7,8 al lado de una comprobacion en verde: un test que pasa
+ * ensenando una cifra alarmante manda a investigar donde no hay nada, y la
+ * siguiente vez que la cifra signifique algo nadie la mirara.  La columna
+ * `guarda` es el otro sumando y solo aparece cuando lo hay. */
 void report(const char *que, const Shot &a, const Shot &b) {
     const long long entries = (long long)(b.entries - a.entries);
     const long long served = (long long)(b.served - a.served);
+    const long long guarded = (long long)(b.guarded - a.guarded);
     const long long recorded = (long long)(b.recorded - a.recorded);
-    std::printf("  %-18s entradas %8lld   servidas %8lld   apuntadas %8lld",
-                que, entries, served, recorded);
-    if (served != 0)
-        std::printf("   razon %.3f", double(entries) / double(served));
+    std::printf("  %-18s entradas %8lld   servidas %8lld", que, entries,
+                served);
+    if (guarded != 0) std::printf(" + %lld con guarda", guarded);
+    std::printf("   apuntadas %8lld", recorded);
+    if (served + guarded != 0)
+        std::printf("   razon %.3f",
+                    double(entries) / double(served + guarded));
     std::printf("\n");
 }
 
@@ -249,21 +280,34 @@ int main() {
     report("CON HILOS", hilos_a, hilos_b);
 
     const long long h_entries = (long long)(hilos_b.entries - hilos_a.entries);
-    const long long h_served = (long long)(hilos_b.served - hilos_a.served);
+    const long long h_served = (long long)(hilos_b.served - hilos_a.served) +
+                               (long long)(hilos_b.guarded - hilos_a.guarded);
     const double h_razon =
         h_served == 0 ? 0.0 : double(h_entries) / double(h_served);
     check(h_served > 0, "la tanda con hilos tambien reservo");
     check(h_razon > 0.98 && h_razon < 1.02,
-          "y con hilos cada entrada sigue siendo UNA reserva servida");
+          "y con hilos cada entrada la sirve UNO de los dos");
     if (!(h_razon > 0.98 && h_razon < 1.02))
         std::printf("  razon %.3f con hilos frente a la de un hilo: AHI esta la "
                     "diferencia\n",
                     h_razon);
 
     const long long entries = (long long)(total_b.entries - total_a.entries);
-    const long long served = (long long)(total_b.served - total_a.served);
+    /* LOS DOS QUE PUEDEN SERVIR, sumados, que es lo que convierte esto en una
+     * IDENTIDAD y no en una aproximacion:
+     *
+     *     entradas  ==  servidas por el asignador  +  servidas por el
+     *                   comprobador
+     *
+     * Pedir solo las del asignador era comparar "lo que pidio el programa" con
+     * "lo que recorto el asignador", y en el nivel de guarda eso son dos cosas
+     * distintas: 28.317 contra 3.230, razon 8,77 -- rojo por construccion, no
+     * por un fallo.  Sin el modo compilado el segundo sumando vale cero y esto
+     * es exactamente la comprobacion de siempre. */
+    const long long served = (long long)(total_b.served - total_a.served) +
+                             (long long)(total_b.guarded - total_a.guarded);
 
-    /* LA COMPROBACION.  No se exige igualdad exacta: leer las dos cifras no es
+    /* LA COMPROBACION.  No se exige igualdad exacta: leer las cifras no es
      * atomico y entre una y otra el propio test reserva para su vector de
      * resultados.  Se exige que no haya un DESVIO, que es lo que se vio en el
      * compilador: alli las entradas eran 2,25 veces las servidas.  Un 2% de
@@ -271,7 +315,7 @@ int main() {
     const double razon = served == 0 ? 0.0 : double(entries) / double(served);
     check(served > 0, "el banco paso de verdad por el asignador");
     check(razon > 0.98 && razon < 1.02,
-          "cada entrada por `operator new` es UNA reserva servida");
+          "cada entrada por `operator new` la sirve UNO de los dos");
 
     if (!(razon > 0.98 && razon < 1.02))
         std::printf("  razon %.3f: con un solo hilo TAMBIEN descuadra, asi que "

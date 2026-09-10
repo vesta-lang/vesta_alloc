@@ -636,6 +636,60 @@ uint64_t san_moved_bytes() noexcept;
  *           incluye todos los niveles por debajo del de guarda.
  * \~
  */
+/**
+ * @brief
+ * \~english How many blocks this mode served ITSELF, out of its own pages.
+ * \~spanish Cuantos bloques sirvio ESTE modo, de sus propias paginas.
+ * \~
+ *
+ * \~english
+ * THE HALF THE ALLOCATOR CANNOT COUNT.  Its own `served` counts blocks it
+ * carved out of a region; at the guard level the block comes from pages the
+ * checker asked the system for, so the allocator never saw it and rightly does
+ * not count it.  That is not a gap to paper over: it is the difference between
+ * "what the program asked for" and "what this allocator carved", and it is the
+ * number that tells you a run's memory behaviour is not the program's usual
+ * one.
+ *
+ * So the checker counts its own, and the two close an IDENTITY rather than an
+ * approximation:
+ *
+ *     site entries  ==  allocator served  +  san_guarded_blocks()
+ *
+ * It holds at every level.  Below the guard one this is zero and it degenerates
+ * into the equality the allocator already checked, which is what makes it worth
+ * asserting instead of the ratio it replaced -- a ratio that was false here by
+ * construction and could only be answered by weakening the test.
+ *
+ * \~spanish
+ * LA MITAD QUE EL ASIGNADOR NO PUEDE CONTAR.  Su `served` cuenta bloques que
+ * recorto de una region; en el nivel de guarda el bloque sale de paginas que el
+ * comprobador le pidio al sistema, asi que el asignador no lo vio y hace bien
+ * en no contarlo.  Eso no es un hueco que tapar: es la diferencia entre "lo que
+ * pidio el programa" y "lo que recorto este asignador", y es el numero que te
+ * dice que el comportamiento de memoria de una corrida no es el habitual del
+ * programa.
+ *
+ * Asi que el comprobador cuenta los suyos, y los dos cierran una IDENTIDAD en
+ * vez de una aproximacion:
+ *
+ *     entradas de sitio  ==  servidas por el asignador  +
+ *                            san_guarded_blocks()
+ *
+ * Se cumple en todos los niveles.  Por debajo del de guarda esto vale cero y
+ * degenera en la igualdad que el asignador ya comprobaba, que es lo que la hace
+ * digna de afirmarse en lugar de la razon a la que sustituye -- una razon que
+ * aqui era falsa por construccion y solo se podia contestar debilitando el
+ * test.
+ * \~
+ *
+ * @return
+ * \~english how many, or 0 below the guard level.
+ * \~spanish cuantos, o 0 por debajo del nivel de guarda.
+ * \~
+ */
+uint64_t san_guarded_blocks() noexcept;
+
 size_t san_guarded_size(const void *p) noexcept;
 
 /**
@@ -697,6 +751,16 @@ bool san_realloc(void *p, size_t n, void **out) noexcept;
 [[gnu::always_inline]] inline uint64_t san_verdicts() noexcept { return 0; }
 [[gnu::always_inline]] inline uint64_t san_longest_life() noexcept { return 0; }
 [[gnu::always_inline]] inline uint64_t san_moved_bytes() noexcept { return 0; }
+/* \~english Zero, and that is the RIGHT answer rather than a stub: without this
+ * mode nobody serves a block but the allocator, so the identity above holds
+ * with the second term at zero.  A consumer can assert it unconditionally.
+ * \~spanish Cero, y es la respuesta CORRECTA y no un tapon: sin este modo nadie
+ * sirve un bloque salvo el asignador, asi que la identidad de arriba se cumple
+ * con el segundo termino a cero.  Quien la consuma puede afirmarla sin
+ * condiciones.  \~ */
+[[gnu::always_inline]] inline uint64_t san_guarded_blocks() noexcept {
+    return 0;
+}
 [[gnu::always_inline]] inline size_t san_guarded_size(const void *) noexcept {
     return 0;
 }
