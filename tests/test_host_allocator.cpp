@@ -18,6 +18,9 @@
  * asi que la prueba es tambien de integracion.
  */
 #include "util/alloc/host_allocator.h"
+/* Por el nivel del modo de comprobacion.  Sin el modo compilado la cabecera
+ * declara las versiones que contestan cero. */
+#include "util/alloc/sanitizer.h"
 #include "util/mem/vesta_memcpy.h"
 #include "util/mem/vesta_memset.h"
 
@@ -43,9 +46,36 @@ const char *opaque(const char *p) noexcept {
     return p;
 }
 
+int g_skipped = 0;
+
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
     if (!ok) ++g_failures;
+}
+
+/**
+ * @brief Una fila que solo tiene sentido si el asignador REUSA lo que suelta.
+ *
+ * El nivel de guarda del modo de comprobacion no vuelve a entregar jamas un
+ * bloque que se solto: sus paginas se descomprometen y el rango se guarda, que
+ * es exactamente lo que hace que un uso despues de liberar falle en el sitio
+ * del fallo y no en cualquier otro.  Asi que ahi la respuesta a "vuelve a
+ * salir el mismo?" es que no POR DISENO, y una fila que lo exija no esta
+ * midiendo al asignador.
+ *
+ * Se declara y se cuenta APARTE, nunca como aprobada: sumar una comprobacion
+ * saltada a los aciertos convierte "aqui no se mira" en "aqui esta bien".
+ */
+void check_allocator_reuses(bool ok, const char *what) {
+    if (util::detail::g_san_level >= util::SanLevel::Guard) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion no vuelve a "
+                    "entregar un bloque soltado, que es como caza el uso "
+                    "despues de liberar\n",
+                    what);
+        ++g_skipped;
+        return;
+    }
+    check(ok, what);
 }
 
 } // namespace
@@ -95,7 +125,8 @@ int main() {
         void *a = util::host_alloc(64);
         util::host_free(a);
         void *b = util::host_alloc(64);
-        check(a == b, "el bloque recien soltado se vuelve a entregar");
+        check_allocator_reuses(a == b,
+                               "el bloque recien soltado se vuelve a entregar");
         util::host_free(b);
     }
 
@@ -130,7 +161,8 @@ int main() {
         const auto after = util::host_alloc_stats().chunks;
         for (void *p : again)
             util::host_free(p);
-        check(after - before <= 8, "lo soltado por otro hilo se reaprovecha");
+        check_allocator_reuses(after - before <= 8,
+                               "lo soltado por otro hilo se reaprovecha");
     }
 
     // --- comparacion con el sistema --------------------------------------
@@ -316,6 +348,10 @@ int main() {
         "  reservas=%llu  sueltas=%llu  ajenas=%llu  trozos=%llu\n",
         (unsigned long long)s.small_allocs, (unsigned long long)s.small_frees,
         (unsigned long long)s.remote_frees, (unsigned long long)s.chunks);
+    /* Saltadas APARTE, nunca sumadas a los aciertos. */
+    if (g_skipped != 0)
+        std::printf("%d SALTADAS por el nivel del modo de comprobacion\n",
+                    g_skipped);
     std::printf("%s\n", g_failures == 0 ? "TODO OK" : "HAY FALLOS");
     return g_failures == 0 ? 0 : 1;
 }

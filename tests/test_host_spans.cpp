@@ -29,6 +29,10 @@
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_c.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por los contadores del comprobador y por el nivel en vigor.  Sin el modo
+ * compilado la cabecera declara las versiones que contestan cero, asi que este
+ * fichero vale igual en los dos builds. */
+#include "util/alloc/sanitizer.h"
 #include "util/mem/vesta_memset.h"
 
 #include <cstdio>
@@ -37,10 +41,60 @@
 namespace {
 
 int failures = 0;
+int skipped = 0;
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
     if (!ok) ++failures;
+}
+
+/// El modo de comprobacion COLOCA los bloques el mismo (nivel de guarda).
+bool mode_places_blocks() {
+    return util::detail::g_san_level >= util::SanLevel::Guard;
+}
+
+/// El modo de comprobacion CAMBIA el tamano de lo pedido (canario y por
+/// encima), con lo que la clase o el tramo a los que va a parar un bloque
+/// pueden no ser los del tamano que se escribio.
+bool mode_changes_sizes() {
+    return util::detail::g_san_level >= util::SanLevel::Canary;
+}
+
+/**
+ * @brief Una fila que solo tiene sentido si el modo no esta colocando bloques.
+ *
+ * DE DONDE sale un bloque -- de la region de 64 KiB, de un tramo, del sistema
+ * -- y si soltarlo lo devuelve para volver a entregarlo son propiedades DEL
+ * ASIGNADOR.  En el nivel de guarda el comprobador sirve cada bloque de paginas
+ * propias y no vuelve a entregar ninguna, asi que la respuesta a esas preguntas
+ * es que no -- por diseno del nivel, no porque el asignador falle.
+ *
+ * Se DECLARA aqui, y cuando el nivel la invalida se cuenta APARTE.  Lo que no
+ * vale es darla por buena: una comprobacion saltada sumada a los aciertos
+ * convierte "aqui no se mira" en "aqui esta bien", que es como una red deja de
+ * serlo sin que nadie se entere.
+ */
+void check_allocator_placed(bool ok, const char *what) {
+    if (mode_places_blocks()) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion coloca los "
+                    "bloques, asi que esto no habla del asignador\n",
+                    what);
+        ++skipped;
+        return;
+    }
+    check(ok, what);
+}
+
+/// Lo mismo para una fila que depende del TAMANO exacto que se pidio.
+void check_exact_size(bool ok, const char *what) {
+    if (mode_changes_sizes()) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion anade bytes "
+                    "detras de lo pedido\n",
+                    what);
+        ++skipped;
+        return;
+    }
+    check(ok, what);
 }
 
 /// Escribe un patron reconocible en todo el bloque y comprueba que sigue ahi.
@@ -112,6 +166,14 @@ int main() {
     // 2. Se reusan: pedir y soltar en bucle no debe consumir region sin fin.
     {
         const util::HostAllocStats before = util::host_alloc_stats();
+        /* LOS DOS LIBROS, restados contra la MISMA foto.  El asignador cuenta lo
+         * que recorto el; el nivel de guarda del modo comprobacion sirve de
+         * paginas propias y lo cuenta EL, asi que preguntarle solo al primero
+         * era leer medio libro y llamar fallo a la diferencia.  Sin el modo
+         * compilado el segundo termino vale cero y esto es la cuenta de
+         * siempre. */
+        const uint64_t guarded_before = util::san_guarded_blocks();
+        const uint64_t guarded_frees_before = util::san_guarded_frees();
         for (int vuelta = 0; vuelta < 200; ++vuelta) {
             // Las dos POR ENCIMA del tope de las clases; ver la nota de arriba.
             void *a = util::host_alloc(util::kMaxSmall + 1);
@@ -125,9 +187,13 @@ int main() {
         // pedido esos dos.  Se deja margen por si otro hilo pide a la vez.
         check(fresh < 4u * 1024u * 1024u,
               "reservar y soltar en bucle REUSA en vez de pedir mas region");
-        check(after.large_allocs - before.large_allocs == 400,
+        check((after.large_allocs - before.large_allocs) +
+                      (util::san_guarded_blocks() - guarded_before) ==
+                  400,
               "las 400 grandes se contaron como tales");
-        check(after.large_frees - before.large_frees == 400,
+        check((after.large_frees - before.large_frees) +
+                      (util::san_guarded_frees() - guarded_frees_before) ==
+                  400,
               "y las 400 devoluciones tambien");
     }
 
@@ -149,7 +215,8 @@ int main() {
             primero = otra;
         }
         util::host_free(primero);
-        check(mismo, "un tramo pequeno vuelve al hilo que lo solto, sin cerrojo");
+        check_allocator_placed(
+            mismo, "un tramo pequeno vuelve al hilo que lo solto, sin cerrojo");
 
         /* Y un tamano por encima de lo que se guarda tiene que seguir yendo por
          * el camino compartido: guardarlo todo retendria memoria en cada hilo.
@@ -170,8 +237,9 @@ int main() {
         // si se hubiera ido al sistema, `large_allocs` no habria subido.
         void *p = util::host_alloc(200000);
         const util::HostAllocStats t = util::host_alloc_stats();
-        check(t.large_allocs > s.large_allocs,
-              "una reserva grande la sirve el asignador, no el sistema");
+        check_allocator_placed(
+            t.large_allocs > s.large_allocs,
+            "una reserva grande la sirve el asignador, no el sistema");
         util::host_free(p);
     }
 
@@ -215,14 +283,20 @@ int main() {
 
     // 5. La etiqueta desde C.
     {
+        const util::AllocTag t{util::AllocUse::Instant, util::AllocShape::Fixed};
         const util::HostAllocStats before = util::host_alloc_stats();
+        /* Esta NO se salta: la pregunta -- se conto la reserva bajo SU
+         * proposito -- tiene respuesta en todos los niveles, solo que el libro
+         * donde esta apuntada cambia.  Los dos terminos, contra la misma foto. */
+        const uint64_t guarded_before = util::san_guarded_by_tag(t.raw());
         const unsigned previous = vesta_host_push_tag(1, 1); // instantaneo/fijo
         void *p = vesta_host_alloc(64);
         vesta_host_pop_tag(previous);
         util::host_free(p);
-        const util::AllocTag t{util::AllocUse::Instant, util::AllocShape::Fixed};
         const util::HostAllocStats after = util::host_alloc_stats();
-        check(after.by_tag[t.raw()] > before.by_tag[t.raw()],
+        check((after.by_tag[t.raw()] - before.by_tag[t.raw()]) +
+                      (util::san_guarded_by_tag(t.raw()) - guarded_before) >
+                  0,
               "C: la etiqueta puesta desde C cuenta donde toca");
         check(util::AllocScope::current().unknown(),
               "C: y al quitarla vuelve a \"no se\"");
@@ -242,8 +316,8 @@ int main() {
 
         void *p = util::host_alloc(n);
         check(p != nullptr, "grande: se sirve una reserva mayor que un tramo");
-        check(util::host_direct_allocs() > d0,
-              "grande: y la sirve el SISTEMA, no la region");
+        check_allocator_placed(util::host_direct_allocs() > d0,
+                               "grande: y la sirve el SISTEMA, no la region");
         if (p != nullptr) {
             check((reinterpret_cast<uintptr_t>(p) & (util::kAlign - 1)) == 0,
                   "grande: sale alineada");
@@ -352,8 +426,9 @@ int main() {
          * medio proyecto sin que ningun test se enterara. */
         const uint64_t d1 = util::host_direct_allocs();
         void *justo = util::host_alloc(util::kMaxSpanBytes);
-        check(justo != nullptr && util::host_direct_allocs() == d1,
-              "grande: justo por debajo de la raya lo sirve la REGION");
+        check_exact_size(justo != nullptr && util::host_direct_allocs() == d1,
+                         "grande: justo por debajo de la raya lo sirve la "
+                         "REGION");
         util::host_free(justo);
     }
 
@@ -431,8 +506,9 @@ int main() {
          * test dejaria de probar lo que dice en cuanto se moviera una de las
          * dos constantes, y sin avisar. */
         void *const dato = util::host_alloc(util::kMaxSmall);
-        check(dato != nullptr && util::in_big_region(dato),
-              "codigo: hay un dato en la region grande al que llegar");
+        check_exact_size(dato != nullptr && util::in_big_region(dato),
+                         "codigo: hay un dato en la region grande al que "
+                         "llegar");
 
         const size_t ventana = (size_t(1) << 31) - (128u << 20);
         bool colocado = false;
@@ -441,8 +517,8 @@ int main() {
             1u << 20, util::kOsReadWriteExec, dato, ventana, &colocado));
 
         check(code != nullptr, "codigo: se sirven paginas ejecutables");
-        check(util::host_region_pages() > antes,
-              "codigo: y salen de NUESTRA reserva, no del sistema");
+        check_exact_size(util::host_region_pages() > antes,
+                         "codigo: y salen de NUESTRA reserva, no del sistema");
         check(colocado, "codigo: colocadas dentro de la ventana pedida");
 
         if (code != nullptr) {
@@ -507,6 +583,12 @@ int main() {
         util::host_free_pages(dato, 4096);
     }
 
+    /* Las saltadas se dicen APARTE y nunca se suman a los aciertos: "aqui no se
+     * mira" y "aqui esta bien" son cosas distintas, y confundirlas es como una
+     * red deja de serlo sin que nadie lo note. */
+    if (skipped != 0)
+        std::printf("%d SALTADAS por el nivel del modo de comprobacion\n",
+                    skipped);
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -41,6 +41,9 @@
  */
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por el nivel del modo de comprobacion y por su ficha de bloque.  Sin el modo
+ * compilado la cabecera declara las versiones que contestan cero. */
+#include "util/alloc/sanitizer.h"
 #include "util/mem/vesta_memcpy.h"
 #include "util/mem/vesta_memset.h"
 
@@ -52,10 +55,64 @@
 namespace {
 
 int g_failures = 0;
+int g_skipped = 0;
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
     if (!ok) ++g_failures;
+}
+
+/// Si un bloque salio de ESTA libreria, por la puerta que sea.  El nivel de
+/// guarda del modo de comprobacion sirve de paginas propias, que no estan en
+/// ninguna de las dos regiones y son igual de nuestras.
+bool ours(const void *p) {
+    if (util::in_region(p) || util::in_big_region(p)) return true;
+    return util::san_guarded_size(p) != 0;
+}
+
+/// El modo de comprobacion COLOCA los bloques el mismo (nivel de guarda).
+bool mode_places_blocks() {
+    return util::detail::g_san_level >= util::SanLevel::Guard;
+}
+
+/// El modo de comprobacion CAMBIA el tamano de lo pedido (canario y arriba).
+bool mode_changes_sizes() {
+    return util::detail::g_san_level >= util::SanLevel::Canary;
+}
+
+/**
+ * @brief Una fila que dice EN QUE REGION cae un bloque.
+ *
+ * Cual de las dos regiones sirve un tamano es una propiedad del reparto del
+ * asignador.  El canario anade bytes detras de lo pedido, asi que un tamano
+ * escrito justo en una frontera cruza al otro lado; y en el nivel de guarda el
+ * bloque no sale de ninguna de las dos.  En los dos casos la fila deja de
+ * hablar del asignador.
+ *
+ * Se declara y se cuenta APARTE, nunca como aprobada: sumar una comprobacion
+ * saltada a los aciertos convierte "aqui no se mira" en "aqui esta bien".
+ */
+void check_exact_size(bool ok, const char *what) {
+    if (mode_changes_sizes()) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion anade bytes "
+                    "detras de lo pedido y mueve la frontera\n",
+                    what);
+        ++g_skipped;
+        return;
+    }
+    check(ok, what);
+}
+
+/// Lo mismo para una fila que exige que el bloque salga de una REGION.
+void check_allocator_placed(bool ok, const char *what) {
+    if (mode_places_blocks()) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion sirve de paginas "
+                    "propias, fuera de las dos regiones\n",
+                    what);
+        ++g_skipped;
+        return;
+    }
+    check(ok, what);
 }
 
 /// Devuelve la misma direccion, pero el compilador deja de saber de donde sale.
@@ -170,9 +227,16 @@ int main() {
             if ((reinterpret_cast<uintptr_t>(r) & 31u) != 0) alineado = false;
 
             if (util::host_alloc_active()) {
-                if (!util::in_region(original_of(p))) del_asignador = false;
-                if (!util::in_region(original_of(q))) del_asignador = false;
-                if (!util::in_region(original_of(r))) del_asignador = false;
+                /* NUESTRO no quiere decir "de la region": el nivel de guarda del
+                 * modo comprobacion es tambien esta libreria, y sirve de paginas
+                 * propias.  Preguntar solo por la region era preguntar por un
+                 * mecanismo cuando la fila habla de la PROCEDENCIA -- y hacia
+                 * fallar aqui a bloques que acabamos de entregar.  Sin el modo
+                 * compilado el segundo termino contesta cero y esto es la
+                 * comprobacion de siempre. */
+                if (!ours(original_of(p))) del_asignador = false;
+                if (!ours(original_of(q))) del_asignador = false;
+                if (!ours(original_of(r))) del_asignador = false;
             }
             l.push_back(p);
             g.push_back(q);
@@ -255,8 +319,12 @@ int main() {
             peq.push_back(s);
             gra.push_back(b);
         }
-        check(pequenas_ok, "una reserva pequena sale de la region de 64 KiB");
-        check(grandes_ok, "una grande sale de la region de 1 MiB, no de la otra");
+        check_allocator_placed(pequenas_ok,
+                               "una reserva pequena sale de la region de 64 "
+                               "KiB");
+        check_exact_size(grandes_ok,
+                         "una grande sale de la region de 1 MiB, no de la "
+                         "otra");
         check(tamanos_ok, "y de las dos se sabe el tamano utilizable");
 
         for (void *p : peq)
@@ -267,11 +335,16 @@ int main() {
         // Soltar y volver a pedir: si la liberacion hubiera ido por la mascara
         // equivocada, el bloque no volveria a la lista de su clase.
         void *again = util::host_alloc(util::kMaxSmall);
-        check(again != nullptr && util::in_big_region(again),
-              "y vuelve a su lista al soltarlo");
+        check_exact_size(again != nullptr && util::in_big_region(again),
+                         "y vuelve a su lista al soltarlo");
         util::host_free(again);
     }
 
+    /* Saltadas APARTE, nunca sumadas a los aciertos: "aqui no se mira" y "aqui
+     * esta bien" son cosas distintas. */
+    if (g_skipped != 0)
+        std::printf("%d SALTADAS por el nivel del modo de comprobacion\n",
+                    g_skipped);
     std::printf("%s\n", g_failures == 0 ? "TODO OK" : "HAY FALLOS");
     return g_failures == 0 ? 0 : 1;
 }

@@ -39,6 +39,9 @@
 
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por el nivel del modo de comprobacion.  Sin el modo compilado la cabecera
+ * declara las versiones que contestan cero. */
+#include "util/alloc/sanitizer.h"
 
 #include <atomic>
 #include <cstdint>
@@ -50,10 +53,33 @@
 namespace {
 
 int failures = 0;
+int skipped = 0;
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FALLO", what);
     if (!ok) ++failures;
+}
+
+/**
+ * @brief Una fila que depende de DONDE coloca el asignador sus tramos.
+ *
+ * En el nivel de guarda del modo de comprobacion cada bloque sale de una
+ * reserva propia del sistema, asi que dos que se piden seguidos no tienen por
+ * que quedar pegados -- y no quedarlo no dice nada del asignador, que ahi no ha
+ * colocado nada.
+ *
+ * Se declara y se cuenta APARTE, nunca como aprobada.
+ */
+void check_allocator_placed(bool ok, const char *what) {
+    if (util::detail::g_san_level >= util::SanLevel::Guard) {
+        std::printf("  [SALTA] %s -- el modo de comprobacion sirve cada bloque "
+                    "de una reserva propia, asi que no los coloca el "
+                    "asignador\n",
+                    what);
+        ++skipped;
+        return;
+    }
+    check(ok, what);
 }
 
 // -------------------------------------------------------------------------
@@ -365,7 +391,8 @@ void check_coalescing() {
     const uintptr_t ua = reinterpret_cast<uintptr_t>(a);
     const uintptr_t ub = reinterpret_cast<uintptr_t>(b);
     const bool adjacent = (ub == ua + size_t(k) * util::kChunkBytes);
-    check(adjacent, "salen pegados, que es lo que hace posible fusionar");
+    check_allocator_placed(adjacent,
+                           "salen pegados, que es lo que hace posible fusionar");
 
     util::host_free(b); // el de la derecha primero
     util::host_free(a); // al soltar este se absorbe al de al lado
@@ -447,6 +474,10 @@ int main(int argc, char **argv) {
         std::printf("  aviso: %llu reservas sin sitio (region llena)\n",
                     (unsigned long long)g_oom.load());
 
+    /* Saltadas APARTE, nunca sumadas a los aciertos. */
+    if (skipped != 0)
+        std::printf("%d SALTADAS por el nivel del modo de comprobacion\n",
+                    skipped);
     std::printf(failures == 0 ? "TODO OK\n" : "%d FALLOS\n", failures);
     return failures == 0 ? 0 : 1;
 }

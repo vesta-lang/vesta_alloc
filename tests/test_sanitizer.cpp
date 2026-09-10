@@ -46,11 +46,39 @@
 namespace {
 
 int failures = 0;
+int skipped = 0;
 
 void check(bool ok, const char *what) {
     std::printf("  [%s] %s\n", ok ? "OK  " : "FAIL", what);
     if (!ok) ++failures;
 }
+
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+/**
+ * @brief A row that only means anything from @p needed upwards.
+ *
+ * THE LEVELS ARE A LADDER AND EACH RUNG BUYS ONE THING.  Poisoning on release
+ * is what makes a write after free show up when the block is handed out again;
+ * below that rung nothing poisons, so the write leaves no mark and there is
+ * nothing to catch.  A row demanding it at the canary level is not finding a
+ * hole in the checker, it is asking for a rung that was not asked for.
+ *
+ * So the row DECLARES the level it needs, and when the level in force is lower
+ * it is counted APART.  Never as a pass: a skipped check added to the passes
+ * turns "not looked at here" into "fine here", which is how a net stops being
+ * one without anybody noticing.
+ */
+void check_from_level(util::SanLevel needed, bool ok, const char *what) {
+    if (util::detail::g_san_level < needed) {
+        std::printf("  [SKIP] %s -- needs level %u and level %u is in force\n",
+                    what, unsigned(needed),
+                    unsigned(util::detail::g_san_level));
+        ++skipped;
+        return;
+    }
+    check(ok, what);
+}
+#endif
 
 /* \~english Out of line and never inlined, so each mistake has a frame of its
  * own and the report can be read.  A checker whose findings all point at `main`
@@ -174,17 +202,40 @@ int main(int argc, char **argv) {
     void *twice = util::host_alloc(32);
     util::host_free(twice);
     util::host_free(twice); // on purpose
-    check(util::san_verdicts() > before_double,
-          "a block released twice is caught, in the act");
+    check_from_level(util::SanLevel::Track, util::san_verdicts() > before_double,
+                     "a block released twice is caught, in the act");
 
     const uint64_t before_over = util::san_verdicts();
     unsigned char *over =
         static_cast<unsigned char *>(allocate_to_overflow(24));
     std::memset(over, 0x11, 24 + 2); // two bytes too many, on purpose
     util::host_free(over);
-    check(util::san_verdicts() > before_over,
-          "a write past the end is caught when the block is released");
+    check_from_level(util::SanLevel::Canary, util::san_verdicts() > before_over,
+                     "a write past the end is caught when the block is "
+                     "released");
 
+    /* \~english AND ONLY BELOW THE GUARD LEVEL, because up there this very
+     * mistake is caught AT THE INSTANT: the released block's pages are gone, so
+     * the write below would kill THIS process -- which is the level doing its
+     * job, not a failure.  What the guard level catches is proved further down,
+     * in a child, from a safe distance.  Here the block is still mapped and the
+     * poison is what remembers, so the mistake is made now and read when the
+     * block is handed out again.
+     *
+     * \~spanish Y SOLO POR DEBAJO DEL NIVEL DE GUARDA, porque alli arriba este
+     * mismo fallo se caza AL INSTANTE: las paginas del bloque soltado ya no
+     * estan, asi que la escritura de abajo mataria ESTE proceso -- que es el
+     * nivel haciendo su trabajo, no un fallo.  Lo que caza el nivel de guarda
+     * se demuestra mas abajo, en un hijo y a distancia.  Aqui el bloque sigue
+     * mapeado y quien se acuerda es el veneno, asi que el fallo se comete ahora
+     * y se lee al volver a entregar el bloque.  \~ */
+    if (util::detail::g_san_level >= util::SanLevel::Guard) {
+        std::printf("  [SKIP] a write after release is caught when the block "
+                    "is handed out again -- at level %u it is caught at the "
+                    "instant instead, which the child half proves\n",
+                    unsigned(util::detail::g_san_level));
+        ++skipped;
+    } else {
     const uint64_t before_uaf = util::san_verdicts();
     unsigned char *after = static_cast<unsigned char *>(util::host_alloc(48));
     util::host_free(after);
@@ -201,9 +252,11 @@ int main(int argc, char **argv) {
      * quede escrito donde se nota.  \~ */
     after[16] = 0x77;
     void *reused = util::host_alloc(48); // the poison is checked here
-    check(util::san_verdicts() > before_uaf,
-          "a write after release is caught when the block is handed out again");
+    check_from_level(util::SanLevel::Poison, util::san_verdicts() > before_uaf,
+                     "a write after release is caught when the block is handed "
+                     "out again");
     util::host_free(reused);
+    }
 
     /* \~english The leak is LAST because it is the only one reported at exit:
      * what it proves is checked by eye in the report, and here we only make
@@ -235,8 +288,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(16));
         util::host_free(kept);
         const uint64_t now = util::san_longest_life();
-        check(now >= 200 && now > before,
-              "a block kept alive across 200 allocations measures at least 200");
+        check_from_level(util::SanLevel::Track, now >= 200 && now > before,
+                         "a block kept alive across 200 allocations measures "
+                         "at least 200");
     }
 
     /* \~english WHAT A SITE MOVED, which is the figure the leak list cannot
@@ -268,9 +322,11 @@ int main(int argc, char **argv) {
     {
         const uint64_t before = util::san_moved_bytes();
         for (int i = 0; i < 200; ++i) util::host_free(util::host_alloc(512));
-        check(util::san_moved_bytes() >= before + 200u * 512u,
-              "lo que un sitio movio se sigue sabiendo despues de soltarlo "
-              "todo, que es lo que la lista de fugas no puede decir");
+        check_from_level(util::SanLevel::Track,
+                         util::san_moved_bytes() >= before + 200u * 512u,
+                         "lo que un sitio movio se sigue sabiendo despues de "
+                         "soltarlo todo, que es lo que la lista de fugas no "
+                         "puede decir");
     }
 
     /* \~english AND A BLOCK PAST THE SMALL-CLASS LIMIT, which used to be
@@ -291,9 +347,11 @@ int main(int argc, char **argv) {
         void *p = util::host_alloc(big);
         check(p != nullptr, "una reserva grande se sirve");
         util::host_free(p);
-        check(util::san_moved_bytes() >= before + big,
-              "y un bloque fuera de la region sombreada tambien se cuenta, "
-              "que es donde viven las reservas mayores del programa");
+        check_from_level(util::SanLevel::Track,
+                         util::san_moved_bytes() >= before + big,
+                         "y un bloque fuera de la region sombreada tambien se "
+                         "cuenta, que es donde viven las reservas mayores del "
+                         "programa");
     }
 
     /* \~english THE GUARD LEVEL, from a safe distance.  What it catches, it
@@ -315,6 +373,10 @@ int main(int argc, char **argv) {
     check(run_child(argv[0], "guard-afterfree") != 0,
           "and so does a read of a block that was already released");
 
+    /* Apart, never added to the passes: "not looked at here" and "fine here"
+     * are different things. */
+    if (skipped != 0)
+        std::printf("%d SKIPPED because the level in force is lower\n", skipped);
     std::printf(failures == 0 ? "TODO OK\n" : "HAY FALLOS\n");
     return failures == 0 ? 0 : 1;
 #endif
