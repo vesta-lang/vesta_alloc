@@ -31,6 +31,9 @@
 #include "util/report/alloc_sites.h"
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por `san_guarded_by_tag()`.  Sin el modo compilado la cabecera declara la
+ * version que contesta cero, asi que esto vale igual en los dos builds. */
+#include "util/alloc/sanitizer.h"
 #include "util/os/os_memory.h"
 
 #include <cstdio>
@@ -218,13 +221,28 @@ int main() {
         const util::AllocTag t{util::AllocUse::Instant, util::AllocShape::Fixed};
         const uint64_t untagged_before = untagged_now();
         const util::HostAllocStats before = util::host_alloc_stats();
+        /* Se toma con la MISMA foto que el de arriba: el contador del
+         * comprobador es absoluto, y restarlo contra otro instante daria una
+         * cuenta que arrastra todo lo anterior -- y en una comprobacion de
+         * ">= 1000" eso pasaria siempre. */
+        const uint64_t guarded_before = util::san_guarded_by_tag(t.raw());
         {
             const util::AllocScope scope(t);
             for (int i = 0; i < 1000; ++i)
                 util::host_free(util::host_alloc(48));
         }
         const util::HostAllocStats after = util::host_alloc_stats();
-        check(after.by_tag[t.raw()] - before.by_tag[t.raw()] >= 1000,
+        /* LOS DOS QUE PUEDEN SERVIR.  El `by_tag` del asignador cuenta lo que
+         * EL recorto bajo esa etiqueta; en el nivel de guarda del modo
+         * comprobacion el bloque sale de paginas propias suyas, asi que el
+         * asignador no lo vio y hace bien en no contarlo.  Lo que esta linea
+         * pregunta es cuantas se PIDIERON bajo ese proposito, que son los dos
+         * sumandos.  Sin el modo compilado el segundo contesta cero y esto es
+         * lo de siempre. */
+        const uint64_t tagged =
+            (after.by_tag[t.raw()] - before.by_tag[t.raw()]) +
+            (util::san_guarded_by_tag(t.raw()) - guarded_before);
+        check(tagged >= 1000,
               "con ambito abierto, la reserva se cuenta bajo SU etiqueta");
         check(untagged_now() - untagged_before < 1000,
               "y no engorda el monton de \"no se\"");

@@ -24,6 +24,9 @@
 
 #include "util/alloc/host_allocator.h"
 #include "util/alloc/host_allocator_layout.h"
+/* Por `san_guarded_size()`, el tercer termino de `ours`.  Sin el modo compilado
+ * la cabecera declara la version que contesta cero. */
+#include "util/alloc/sanitizer.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -112,10 +115,35 @@ void check(bool ok, const char *what) {
  * mira la libreria DESDE FUERA y no incluye lo privado de `src/interpose/`.
  * Que sea una copia se paga cuando la regla cambia: al empezar a servir del
  * sistema lo que pasa de un tramo, esta se quedo en dos comparaciones y la fila
- * de abajo lo dijo -- que es exactamente para lo que sirve. */
+ * de abajo lo dijo -- que es exactamente para lo que sirve.
+ *
+ * Y SE HA VUELTO A PAGAR, por lo mismo y con el mismo aviso: el nivel de guarda
+ * del modo comprobacion sirve bloques de paginas propias, fuera de las dos
+ * regiones y sin estar en la tabla de directos, asi que las tres comprobaciones
+ * de aqui decian que NO de bloques que esta libreria acababa de entregar --
+ * ocho filas seguidas.  El tercer termino es el que falta.  Sin el modo
+ * compilado contesta cero y esto son las dos comparaciones de siempre. */
 bool ours(const void *p) {
     if (util::in_region(p) || util::in_big_region(p)) return true;
+    if (util::san_guarded_size(p) != 0) return true;
     return util::detail::direct_bytes(p) != 0;
+}
+
+/* PARA UN PUNTERO DE `_aligned_malloc`, QUE NO ES EL DEL BLOQUE.  Esa entrada
+ * devuelve una direccion subida a la alineacion y guarda la de verdad en la
+ * palabra de delante, asi que preguntar `ours(p)` es preguntar por una
+ * direccion distinta de la del bloque.
+ *
+ * Coincidia mientras las dos cayeran dentro de la region: las dos comparaciones
+ * decian que si de cualquier forma.  Deja de coincidir en cuanto un bloque se
+ * sirve DESDE FUERA de ella, que es lo que hace el nivel de guarda -- y
+ * entonces estas filas negaban bloques que la libreria acababa de entregar.
+ *
+ * Es la MISMA leccion que `vesta_interpose::ours_aligned`, que existe por
+ * haberla aprendido en el codigo de produccion: una pregunta sobre una
+ * direccion y una accion sobre otra es un fallo se note o no. */
+bool ours_aligned(const void *p) {
+    return p != nullptr && ours(static_cast<void *const *>(p)[-1]);
 }
 
 /// Donde va a parar un puntero que hay que impedir que el optimizador borre.
@@ -271,8 +299,16 @@ void aligned_entries_are_freed_by_plain_free() {
         if ((reinterpret_cast<uintptr_t>(p) & (a - 1)) != 0) all_aligned = false;
         if (!ours(p)) all_ours = false;
         /* Con 16 basta lo que el asignador ya da, asi que ese va por el camino
-         * barato y NO es un tramo.  Por encima si tiene que serlo. */
-        if (a > util::kAlign && util::chunk_of(p)->magic != util::kSpanMagic)
+         * barato y NO es un tramo.  Por encima tiene que venir de algo que
+         * `free` sepa reconocer, que es lo que esta fila dice.
+         *
+         * Normalmente ese algo es un TRAMO y lo dice su cabecera.  En el nivel
+         * de guarda el bloque sale de paginas propias del comprobador: no hay
+         * cabecera que mirar, y mirarla seria peor que inutil -- la direccion
+         * enmascarada no tiene por que estar mapeada --, asi que lo que lo hace
+         * reconocible es su ficha.  Se pregunta primero por esa. */
+        if (a > util::kAlign && util::san_guarded_size(p) == 0 &&
+            util::chunk_of(p)->magic != util::kSpanMagic)
             all_span = false;
         if (util::host_usable_size(p) < 300) all_span = false;
         std::memset(p, 0x33, 300); // que se pueda escribir lo pedido
@@ -348,7 +384,8 @@ void realloc_of_an_aligned_block() {
 /// el par CASA y que uno ajeno se devuelve al suyo.
 void windows_aligned_pair() {
     void *p = _aligned_malloc(200, 64);
-    check(p != nullptr && (reinterpret_cast<uintptr_t>(p) & 63) == 0 && ours(p),
+    check(p != nullptr && (reinterpret_cast<uintptr_t>(p) & 63) == 0 &&
+              ours_aligned(p),
           "_aligned_malloc alinea y es nuestro");
     std::memset(p, 0x77, 200);
     _aligned_free(p);
@@ -372,7 +409,7 @@ void windows_aligned_family() {
     std::memcpy(p, "esto tiene que sobrevivir al crecimiento", 40);
 
     char *q = static_cast<char *>(_aligned_realloc(p, 4096, 64));
-    check(q != nullptr && ours(q) &&
+    check(q != nullptr && ours_aligned(q) &&
               (reinterpret_cast<uintptr_t>(q) & 63) == 0 &&
               std::memcmp(q, "esto tiene que sobrevivir al crecimiento", 40) == 0,
           "_aligned_realloc crece, sigue alineado y conserva los datos");
@@ -381,7 +418,7 @@ void windows_aligned_family() {
     _aligned_free(q);
 
     void *fresh = _aligned_realloc(nullptr, 128, 32);
-    check(fresh != nullptr && ours(fresh) &&
+    check(fresh != nullptr && ours_aligned(fresh) &&
               (reinterpret_cast<uintptr_t>(fresh) & 31) == 0,
           "_aligned_realloc(NULL, ...) reserva, como manda el contrato");
     _aligned_free(fresh);
@@ -394,7 +431,7 @@ void windows_aligned_family() {
           "lo que no sabemos servir se rechaza en la llamada, no se deja "
           "pasar al runtime");
     void *at_zero = _aligned_offset_malloc(64, 32, 0);
-    check(at_zero != nullptr && ours(at_zero),
+    check(at_zero != nullptr && ours_aligned(at_zero),
           "y con desplazamiento cero, que es lo mismo que sin el, si se sirve");
     _aligned_free(at_zero);
 }
