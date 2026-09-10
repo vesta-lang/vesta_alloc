@@ -47,6 +47,16 @@
 #define _GNU_SOURCE 1
 #endif
 #include <dlfcn.h>
+/* \~english And the header that DECLARES `malloc_usable_size`, which is a glibc
+ * extension and does not live in `<cstdlib>`.  Included by its name on purpose,
+ * the same as the Windows pair further down: calling it the way everybody calls
+ * it is part of what is being checked.
+ *
+ * \~spanish Y la cabecera que DECLARA `malloc_usable_size`, que es una
+ * extension de glibc y no vive en `<cstdlib>`.  Se incluye por su nombre a
+ * proposito, igual que el par de Windows mas abajo: llamarla como la llama todo
+ * el mundo es parte de lo que se comprueba.  \~ */
+#include <malloc.h>
 namespace {
 void *__real_malloc(size_t n) {
     static auto fn = reinterpret_cast<void *(*)(size_t)>(dlsym(RTLD_NEXT, "malloc"));
@@ -420,6 +430,59 @@ void reaches_inside_the_c_library() {
     check(b != nullptr && ours(b), "y tambien cuando lo que reserva es grande");
     std::free(b);
 }
+
+/**
+ * @brief
+ * \~english The size of a block is answered here too, and this one fails MUTE.
+ * \~spanish El tamano de un bloque tambien se contesta aqui, y este falla MUDO.
+ * \~
+ *
+ * \~english
+ * THE SAME HOLE AS `_msize` ON WINDOWS, AND WORSE TO FIND.  There the C
+ * runtime asks the NT heap, which checks and stops the process, so the mistake
+ * announces itself with `0xC0000374`.  glibc does not check: it reads the eight
+ * bytes in front of the block and returns them.  For one of ours those bytes
+ * are not a size, so the answer is a NUMBER -- plausible, wrong, and then
+ * written into.
+ *
+ * So what is pinned here is not "it does not crash" but that the answer is
+ * USABLE: everything it says fits is written, and read back.  A garbage size
+ * passes the first check and dies on the second.
+ *
+ * \~spanish
+ * EL MISMO HUECO QUE `_msize` EN WINDOWS, Y PEOR DE ENCONTRAR.  Alli el runtime
+ * de C le pregunta al monton NT, que comprueba y para el proceso, asi que la
+ * equivocacion se anuncia sola con `0xC0000374`.  glibc no comprueba: lee los
+ * ocho bytes de delante del bloque y los devuelve.  Para uno de los nuestros
+ * esos bytes no son un tamano, asi que la respuesta es un NUMERO -- verosimil,
+ * equivocado, y acto seguido se escribe en el.
+ *
+ * Por eso lo que se fija aqui no es "que no reviente" sino que la respuesta
+ * SIRVA: se escribe todo lo que dice que cabe, y se vuelve a leer.  Un tamano
+ * de basura pasa la primera comprobacion y muere en la segunda.
+ * \~
+ */
+void the_size_of_a_block_is_answered_here() {
+    unsigned char *p = static_cast<unsigned char *>(std::malloc(100));
+    check(p != nullptr && ours(p), "el bloque de partida es NUESTRO");
+
+    const size_t room = ::malloc_usable_size(p);
+    check(room >= 100,
+          "`malloc_usable_size` contesta por el, y no leyendo una cabecera de "
+          "glibc que nadie escribio");
+
+    std::memset(p, 0x5C, room);
+    for (size_t i = 0; i < room; ++i)
+        if (p[i] != 0x5C) {
+            check(false, "y lo que dice que cabe se puede escribir entero");
+            std::free(p);
+            return;
+        }
+    check(true, "y lo que dice que cabe se puede escribir entero");
+    std::free(p);
+
+    check(::malloc_usable_size(nullptr) == 0, "y de un nulo no dice nada");
+}
 #endif
 
 /// Que `new` siga yendo donde iba.  Interponer las entradas de C no puede
@@ -429,6 +492,118 @@ void new_still_lands_here() {
     check(ours(p), "y `new` sigue cayendo en el mismo asignador");
     delete[] p;
 }
+
+/* \~english NOT guarded by the hook, and that is the point: `_msize` and
+ * `_expand` are taken by BOTH mechanisms -- the patch over msvcrt's entry, and
+ * the renaming plus the `__imp__` pointers -- so what is checked here has to
+ * hold with either one in force.  Guarding it by the hook left the renamed
+ * path with no test at all, which is how a mechanism quietly stops working.
+ *
+ * \~spanish NO va detras del gancho, y eso es lo importante: `_msize` y
+ * `_expand` las cogen LOS DOS mecanismos -- el parche sobre la entrada de
+ * msvcrt, y el renombrado mas los punteros `__imp__` --, asi que lo que se
+ * comprueba aqui tiene que valer con cualquiera de los dos puesto.  Ponerlo
+ * detras del gancho dejaba el camino renombrado sin prueba ninguna, que es
+ * como un mecanismo deja de funcionar sin que se note.  \~ */
+#if defined(_WIN32)
+/**
+ * @brief
+ * \~english The questions ABOUT a block are answered here too, not by the heap.
+ * \~spanish Las preguntas SOBRE un bloque tambien se contestan aqui, no en el
+ *           monton.
+ * \~
+ *
+ * \~english
+ * THIS IS A REGRESSION TEST AND THE REGRESSION KILLED THE PROCESS.  A window
+ * died inside `CreateWindowExW` with `0xC0000374`, and the chain was uxtheme
+ * loading lazily, its start-up registering an exit function, `__dllonexit`
+ * asking `_msize` how big the atexit table was, and `_msize` handing OUR
+ * pointer to `RtlSizeHeap`.  Which is to say: the first line below is the whole
+ * test.  Before the fix it does not fail -- it takes the process down.
+ *
+ * That is also why it cannot be written as "check that `_msize` is hooked": a
+ * function that only allocates nothing is easy to leave out of an allocator's
+ * hook list precisely because it does not look like it belongs, so what is
+ * pinned here is the CONSEQUENCE -- ask a question about one of our blocks
+ * through the C runtime and come back alive with a usable answer.
+ *
+ * \~spanish
+ * ESTO ES UNA PRUEBA DE REGRESION Y LA REGRESION MATABA EL PROCESO.  Una
+ * ventana moria dentro de `CreateWindowExW` con `0xC0000374`, y la cadena era
+ * uxtheme cargandose perezosamente, su arranque registrando una funcion de
+ * salida, `__dllonexit` preguntandole a `_msize` cuanto media la tabla de
+ * salida, y `_msize` dandole NUESTRO puntero a `RtlSizeHeap`.  O sea: la
+ * primera linea de abajo es la prueba entera.  Antes del arreglo no falla --
+ * se lleva el proceso por delante.
+ *
+ * Por eso tampoco se puede escribir como "comprobar que `_msize` esta
+ * enganchada": una funcion que no reserva nada es facil de dejar fuera de la
+ * lista de ganchos de un asignador justamente porque no parece de ahi, asi que
+ * lo que se fija aqui es la CONSECUENCIA -- preguntar por uno de nuestros
+ * bloques a traves del runtime de C y volver vivo y con una respuesta que
+ * sirve.
+ * \~
+ */
+void questions_about_a_block_are_answered_here() {
+    void *p = std::malloc(100);
+    check(p != nullptr && ours(p), "el bloque de partida es NUESTRO");
+
+    /* \~english THE LINE THAT KILLED IT.  Written the way anybody writes it,
+     * which is what makes it a test of the mechanism rather than of a name:
+     * the CRT header declares `_msize` as an import, so this compiles to an
+     * indirect call through `__imp__msize` -- landing either on the pointer
+     * this library defines, or, if the call gets through, on msvcrt's entry
+     * with the patch on it.  With neither, the pointer reaches `RtlSizeHeap`
+     * and the system stops the process for heap corruption.
+     *
+     * \~spanish LA LINEA QUE MATABA.  Escrita como la escribe cualquiera, que
+     * es lo que la convierte en una prueba del mecanismo y no de un nombre: la
+     * cabecera del CRT declara `_msize` como importada, asi que esto compila a
+     * una llamada indirecta por `__imp__msize` -- que cae o en el puntero que
+     * define esta libreria, o, si la llamada llega a salir, en la entrada de
+     * msvcrt con el parche encima.  Sin ninguno de los dos, el puntero llega a
+     * `RtlSizeHeap` y el sistema para el proceso por corrupcion del monton.
+     * \~ */
+    const size_t room = _msize(p);
+    check(room >= 100, "y `_msize` contesta por el, sin ir al monton del NT");
+    /* \~english That the answer be USABLE, which is not the same as it
+     * existing: everything it said fits is written.  A made-up size passes the
+     * check above and blows up here.
+     *
+     * \~spanish Que la respuesta SIRVA, que es distinto de que exista: se
+     * escribe todo lo que dijo que cabia.  Un tamano inventado pasaria la
+     * comprobacion de arriba y reventaria aqui.  \~ */
+    std::memset(p, 0x5C, room);
+    check(true, "y lo que dice que cabe se puede escribir entero");
+
+    /* `_expand` es la otra que le pregunta al monton.  Lo que ya cabe, cabe; */
+    check(_expand(p, 64) == p, "`_expand` a algo que ya cabe no mueve nada");
+    /* y lo que no, contesta que no pudo, que es su respuesta de siempre y lo
+     * que todo llamante correcto sabe manejar. */
+    check(_expand(p, 8u << 20) == nullptr,
+          "y a lo que no cabe contesta que no pudo, en vez de estirarlo por su "
+          "cuenta");
+    std::free(p);
+
+    /* \~english AND THE EXACT SHAPE OF `__dllonexit`: ask the size and, with
+     * that answer, grow the block.  The two halves have to land in the same
+     * allocator, or the second works from what the first said about a block
+     * that is not its own.
+     *
+     * \~spanish Y LA FORMA EXACTA DE `__dllonexit`: preguntar el tamano y, con
+     * esa respuesta, hacer crecer el bloque.  Las dos mitades tienen que caer
+     * en el mismo asignador o la segunda trabaja sobre lo que dijo la primera
+     * de un bloque que no es suyo.  \~ */
+    char *table = static_cast<char *>(std::malloc(32));
+    std::memcpy(table, "una tabla de salida", 20);
+    const size_t held = _msize(table);
+    char *grown = static_cast<char *>(std::realloc(table, held * 4));
+    check(grown != nullptr && ours(grown) &&
+              std::memcmp(grown, "una tabla de salida", 20) == 0,
+          "preguntar el tamano y crecer con el se queda entero de este lado");
+    std::free(grown);
+}
+#endif
 
 } // namespace
 
@@ -445,8 +620,12 @@ int main() {
     windows_aligned_pair();
     windows_aligned_family();
 #endif
+#if defined(_WIN32)
+    questions_about_a_block_are_answered_here();
+#endif
 #if defined(VESTA_ALLOC_DEFINE_MALLOC)
     reaches_inside_the_c_library();
+    the_size_of_a_block_is_answered_here();
 #endif
     new_still_lands_here();
 

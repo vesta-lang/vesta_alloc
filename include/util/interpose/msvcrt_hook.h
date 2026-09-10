@@ -69,26 +69,46 @@ namespace util {
 
 /**
  * @brief
- * \~english Redirects the C runtime's `malloc`, `calloc`, `realloc` and `free`.
- * \~spanish Redirige el `malloc`, `calloc`, `realloc` y `free` del runtime de C.
+ * \~english Redirects the C runtime's memory family, and the environment with
+ *           it.
+ * \~spanish Redirige la familia de memoria del runtime de C, y el entorno con
+ *           ella.
  * \~
  *
  * \~english
  * Idempotent: asking twice does nothing the second time.
  *
+ * WHICH FUNCTIONS.  The four that allocate -- `malloc`, `calloc`, `realloc`,
+ * `free` -- and the two that only ASK about a block, `_msize` and `_expand`.
+ * Those last two allocate nothing, which is exactly why they were missed: they
+ * still hand the caller's pointer to the NT heap, and doing that with one of
+ * our blocks stops the process for heap corruption.  Serving a block and
+ * leaving the questions about it to somebody else is being `malloc` by halves.
+ * Nothing else in msvcrt reaches the heap except through those six; the sweep
+ * that establishes it is written down in the implementation.
+ *
  * \~spanish
  * Idempotente: pedirlo dos veces no hace nada la segunda.
  *
+ * QUE FUNCIONES.  Las cuatro que reservan -- `malloc`, `calloc`, `realloc`,
+ * `free` -- y las dos que solo PREGUNTAN por un bloque, `_msize` y `_expand`.
+ * Esas dos ultimas no reservan nada, que es justo por lo que se pasaron por
+ * alto: aun asi le dan al monton NT el puntero de quien llama, y hacerlo con
+ * uno de nuestros bloques para el proceso por corrupcion del monton.  Servir un
+ * bloque y dejarle a otro las preguntas sobre el es ser `malloc` a medias.
+ * Nada mas de msvcrt llega al monton si no es por esas seis; el barrido que lo
+ * establece esta escrito en la implementacion.
+ *
  * \~
  * @return
- * \~english false if msvcrt is not loaded, or if any of the four jumps would
- *           not go in.  It is SAID and not swallowed -- a hook that went in
- *           halfway is worse than one that did not go in at all, because half
- *           the pairs would be split between two allocators.
- * \~spanish false si msvcrt no esta cargada, o si alguno de los cuatro saltos
- *           no pudo entrar.  Se DICE y no se traga: un gancho que entro a
- *           medias es peor que uno que no entro, porque la mitad de los pares
- *           quedarian repartidos entre dos asignadores.
+ * \~english false if msvcrt is not loaded, or if any of the jumps would not go
+ *           in.  It is SAID and not swallowed -- a hook that went in halfway is
+ *           worse than one that did not go in at all, because half the pairs
+ *           would be split between two allocators.
+ * \~spanish false si msvcrt no esta cargada, o si alguno de los saltos no pudo
+ *           entrar.  Se DICE y no se traga: un gancho que entro a medias es
+ *           peor que uno que no entro, porque la mitad de los pares quedarian
+ *           repartidos entre dos asignadores.
  * \~
  *
  * @par Threads
@@ -120,8 +140,8 @@ bool install_msvcrt_hook() noexcept;
  *
  * \~
  * @return
- * \~english true when the four jumps went in.
- * \~spanish true cuando los cuatro saltos entraron.
+ * \~english true when every jump went in.
+ * \~spanish true cuando entraron todos los saltos.
  * \~
  */
 bool msvcrt_hook_installed() noexcept;

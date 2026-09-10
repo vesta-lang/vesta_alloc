@@ -121,6 +121,25 @@ namespace vesta_interpose {
 [[gnu::always_inline]] inline bool ours(const void *p) noexcept {
     if (__builtin_expect(util::in_region(p) || util::in_big_region(p), 1))
         return true;
+#if defined(VESTA_ALLOC_SANITIZER) && VESTA_ALLOC_SANITIZER
+    /* \~english AND THE CHECKER'S OWN, on the cold branch and only when the
+     * mode was built in.  At the guard level a block sits on pages of its own,
+     * outside both regions and not in the direct table, so the two comparisons
+     * above say NO about something this library served -- and then `free` and
+     * `realloc` treat it as somebody else's.  It is asked HERE, after both
+     * comparisons have already failed, so the common case still runs exactly
+     * what it ran before.  Without the macro this branch does not exist.
+     *
+     * \~spanish Y LOS DEL COMPROBADOR, en la rama fria y solo cuando el modo se
+     * compilo.  En el nivel de guarda un bloque esta en paginas propias, fuera
+     * de las dos regiones y sin estar en la tabla de directos, asi que las dos
+     * comparaciones de arriba dicen que NO de algo que sirvio esta libreria --
+     * y entonces `free` y `realloc` lo tratan como ajeno.  Se pregunta AQUI,
+     * despues de que las dos comparaciones ya hayan fallado, asi que el caso
+     * comun sigue ejecutando exactamente lo que ejecutaba.  Sin la macro esta
+     * rama no existe.  \~ */
+    if (util::san_guarded_size(p) != 0) return true;
+#endif
     return util::detail::direct_bytes(p) != 0;
 }
 
@@ -143,6 +162,92 @@ namespace vesta_interpose {
  */
 [[gnu::always_inline]] inline bool pow2(size_t a) noexcept {
     return a != 0 && (a & (a - 1)) == 0;
+}
+
+/**
+ * @brief
+ * \~english How much of @p p may be written, for the entries that only ASK.
+ * \~spanish Cuanto de @p p se puede escribir, para las entradas que solo
+ *           PREGUNTAN.
+ * \~
+ *
+ * \~english
+ * WHY THIS IS SHARED AND NOT WRITTEN TWICE.  Both ways of getting in front of
+ * the C runtime need this answer -- the patch over `msvcrt!_msize` and the
+ * renamed `__wrap__msize` -- and they need the SAME one.  A block does not
+ * change size depending on which door the question came through, and two
+ * copies of a rule about how much memory somebody may write into is the kind
+ * of drift that is found by the corruption rather than by reading.
+ *
+ * WHY ZERO FOR A BLOCK THAT IS NOT OURS, and not `-1`, which is what the C
+ * runtime returns when it cannot answer.  Because of what the caller does with
+ * it.  `__dllonexit` compares the answer UNSIGNED against how much of its table
+ * is in use: `-1` reads as an enormous number, the table looks infinitely
+ * roomy, and the next entry is written past its end.  Zero reads as "full",
+ * which sends the caller down its grow path, where `realloc` refuses a foreign
+ * block out loud.  A wrong answer either way -- there is no right one for a
+ * block we did not make -- so it is the one that cannot be turned into an
+ * out-of-bounds write.  It is also what @c host_usable_size already says about
+ * a pointer that did not come from here.
+ *
+ * \~spanish
+ * POR QUE ESTO SE COMPARTE Y NO SE ESCRIBE DOS VECES.  Las dos vias de ponerse
+ * delante del runtime de C necesitan esta respuesta -- el parche sobre
+ * `msvcrt!_msize` y el renombrado `__wrap__msize` -- y la necesitan IGUAL.  Un
+ * bloque no cambia de tamano segun la puerta por la que entro la pregunta, y
+ * dos copias de una regla sobre cuanta memoria puede escribir alguien son de
+ * las que se separan y se descubren por la corrupcion, no leyendo.
+ *
+ * POR QUE CERO PARA UN BLOQUE QUE NO ES NUESTRO, y no `-1`, que es lo que
+ * devuelve el runtime de C cuando no puede contestar.  Por lo que hace quien
+ * llama con ese valor.  `__dllonexit` compara la respuesta SIN SIGNO contra
+ * cuanto de su tabla esta en uso: `-1` se lee como un numero enorme, la tabla
+ * parece infinitamente holgada, y la entrada siguiente se escribe pasado su
+ * final.  El cero se lee como "llena", que manda a quien llama a su camino de
+ * crecer, donde `realloc` rechaza en voz alta un bloque ajeno.  Una respuesta
+ * equivocada en los dos casos -- no hay ninguna correcta para un bloque que no
+ * hicimos --, asi que se elige la que no se puede convertir en una escritura
+ * fuera de sitio.  Es ademas lo que @c host_usable_size ya dice de un puntero
+ * que no salio de aqui.
+ * \~
+ */
+[[gnu::always_inline]] inline size_t usable_bytes(const void *p) noexcept {
+    if (p == nullptr || !ours(p)) return 0;
+    return util::host_usable_size(p);
+}
+
+/**
+ * @brief
+ * \~english Whether @p p already holds @p n bytes where it lies.
+ * \~spanish Si @p p ya tiene @p n bytes donde esta.
+ * \~
+ *
+ * \~english
+ * The answer behind `_expand`, and the easy one of the two: growing WITHOUT
+ * MOVING is something this allocator does not do, and returning null when it
+ * cannot is not a failure but that function's ordinary answer -- every correct
+ * caller falls back to `realloc`.  So a block of ours that already has room
+ * expanded in place, which is the truth; anything else says it could not.
+ *
+ * A block that is not ours takes the same road, for the same reason as
+ * @c usable_bytes: we cannot measure it, and guessing is what corrupts.
+ *
+ * \~spanish
+ * La respuesta que hay detras de `_expand`, y la facil de las dos: crecer SIN
+ * MOVERSE es algo que este asignador no hace, y devolver nulo cuando no puede
+ * no es un fallo sino la respuesta corriente de esa funcion -- todo llamante
+ * correcto recurre entonces a `realloc`.  Asi que un bloque nuestro que ya
+ * tiene sitio se expandio donde estaba, que es la verdad; cualquier otro dice
+ * que no pudo.
+ *
+ * Un bloque que no es nuestro va por el mismo camino, por lo mismo que en
+ * @c usable_bytes: no lo podemos medir, y adivinar es lo que corrompe.
+ * \~
+ */
+[[gnu::always_inline]] inline void *expand_in_place(void *p,
+                                                    size_t n) noexcept {
+    if (p == nullptr || !ours(p)) return nullptr;
+    return n <= util::host_usable_size(p) ? p : nullptr;
 }
 
 /**

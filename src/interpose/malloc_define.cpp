@@ -222,6 +222,38 @@ ReallocFn real_realloc() noexcept {
 }
 
 /**
+ * @brief
+ * \~english The C library's own `malloc_usable_size`, found the same way.
+ * \~spanish El `malloc_usable_size` de la propia libreria de C, encontrado
+ *           igual.
+ * \~
+ *
+ * \~english
+ * Only ever reached for a block the loader made before we were anybody.  Unlike
+ * the Windows side, where the runtime's entry has been overwritten and there is
+ * nothing left to call, here the real one is still there and still knows the
+ * answer -- so a foreign block gets a TRUE size instead of a defensible refusal.
+ *
+ * \~spanish
+ * Solo se llega para un bloque que hizo el cargador antes de que fueramos
+ * nadie.  A diferencia del lado de Windows, donde la entrada del runtime esta
+ * pisada y no queda nada a lo que llamar, aqui la de verdad sigue ahi y sigue
+ * sabiendo la respuesta -- asi que un bloque ajeno recibe un tamano CIERTO en
+ * vez de una negativa defendible.
+ * \~
+ */
+using UsableFn = size_t (*)(void *);
+std::atomic<UsableFn> g_real_usable{nullptr};
+
+UsableFn real_usable_size() noexcept {
+    UsableFn f = g_real_usable.load(std::memory_order_acquire);
+    if (f != nullptr) return f;
+    f = reinterpret_cast<UsableFn>(::dlsym(RTLD_NEXT, "malloc_usable_size"));
+    g_real_usable.store(f, std::memory_order_release);
+    return f;
+}
+
+/**
  * @brief A pointer arriving at `realloc` that nobody can account for.
  *
  * The sibling of `no_foreign_free`, and separate from it so the message names
@@ -395,6 +427,81 @@ void free(void *p) {
         return;
     }
     util::detail::no_foreign_free(p); // does not return
+}
+
+/**
+ * @brief
+ * \~english `malloc_usable_size`, which is the question rather than the deed.
+ * \~spanish `malloc_usable_size`, que es la pregunta y no el hecho.
+ * \~
+ *
+ * \~english
+ * WHY A FUNCTION THAT ALLOCATES NOTHING IS IN AN ALLOCATOR'S LIST.  Because it
+ * READS the block, and the header it reads is the one the allocator that made
+ * the block wrote.  Ours have no glibc header, so leaving this to the C library
+ * means it reads the eight bytes in front of one of our blocks -- which are not
+ * a size, they are whatever happens to be there -- and answers with them.  It
+ * does not fault: it returns a number, and a wrong size that looks right is the
+ * worst answer this project admits.  The caller then writes that many bytes.
+ *
+ * It is the same mistake as leaving `realloc` to the C library while serving
+ * `malloc`, which is what killed the compiler on Linux, and the same one that
+ * `_msize` was making on Windows -- there it does fault, because the NT heap
+ * checks and stops the process.  Being `malloc` by halves corrupts, and the
+ * halves are not only the verbs.
+ *
+ * WHY IT IS NOT GUARDED BY A CONFIGURATION SWITCH.  Defining this symbol only
+ * has an effect where the symbol exists, and this whole file only compiles for
+ * the ELF path, where it does.
+ *
+ * \~spanish
+ * POR QUE UNA FUNCION QUE NO RESERVA NADA ESTA EN LA LISTA DE UN ASIGNADOR.
+ * Porque LEE el bloque, y la cabecera que lee es la que escribio el asignador
+ * que hizo ese bloque.  Los nuestros no tienen cabecera de glibc, asi que
+ * dejarle esto a la libreria de C significa que lee los ocho bytes de delante
+ * de uno de nuestros bloques -- que no son un tamano, son lo que hubiera ahi --
+ * y contesta con ellos.  No falla: devuelve un numero, y un tamano equivocado
+ * con pinta de correcto es la peor respuesta que este proyecto admite.  Quien
+ * llama escribe entonces esos bytes.
+ *
+ * Es la misma equivocacion que dejarle `realloc` a la libreria de C sirviendo
+ * `malloc`, que es lo que mato al compilador en Linux, y la misma que hacia
+ * `_msize` en Windows -- alli si falla, porque el monton NT comprueba y para el
+ * proceso.  Ser `malloc` a medias corrompe, y las mitades no son solo los
+ * verbos.
+ *
+ * POR QUE NO VA DETRAS DE UN INTERRUPTOR DE CONFIGURACION.  Definir este
+ * simbolo solo tiene efecto donde el simbolo existe, y este fichero entero solo
+ * se compila para el camino de ELF, donde existe.
+ * \~
+ *
+ * @param p
+ * \~english a block from any of the three sources, or null.
+ * \~spanish un bloque de cualquiera de las tres procedencias, o nulo.
+ * \~
+ * @return
+ * \~english how much may be written, which may be more than was asked for.
+ * \~spanish cuanto se puede escribir, que puede ser mas de lo que se pidio.
+ * \~
+ */
+size_t malloc_usable_size(void *p) {
+    if (p == nullptr) return 0;
+    if (__builtin_expect(ours(p), 1)) return util::host_usable_size(p);
+    if (vesta_interpose::from_bootstrap(p))
+        return vesta_interpose::bootstrap_size(p);
+    /* \~english Foreign, and here that has an honest answer: the C library's
+     * own entry is still reachable because we did not overwrite it, only got
+     * in front of it.  Zero if even that cannot be found -- which is what a
+     * caller reads as "do not write anything", the only safe thing to say
+     * about a block nobody can measure.
+     *
+     * \~spanish Ajeno, y aqui eso tiene respuesta honesta: la entrada de la
+     * propia libreria de C sigue alcanzable porque no la pisamos, solo nos
+     * pusimos delante.  Cero si ni eso se encuentra -- que es lo que quien
+     * llama lee como "no escribas nada", lo unico seguro que se puede decir de
+     * un bloque que nadie puede medir.  \~ */
+    const UsableFn f = real_usable_size();
+    return f != nullptr ? f(p) : 0;
 }
 
 } // extern "C"

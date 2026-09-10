@@ -62,6 +62,34 @@
  * before the first instruction of the program: a bounded number that does not
  * grow, and most of which lives until the process ends anyway.  Counted, not
  * ignored -- a leak nobody measures cannot be told apart from no leak.
+ *
+ * ------------------------------------------------------------------------
+ * WHICH FUNCTIONS, AND HOW THAT LIST WAS ARRIVED AT
+ * ------------------------------------------------------------------------
+ *
+ * Not by picking the ones whose names sound like memory.  The section of code
+ * of msvcrt.dll was swept for every reference to the heap import slots, which
+ * is where a pointer actually reaches the NT heap.  There are FOURTEEN such
+ * sites, in six functions:
+ *
+ *     malloc  calloc  realloc  free      the ones that allocate
+ *     _msize  _expand                    the ones that only ASK
+ *     _heapchk  _heapwalk  _chsize       never see a pointer of ours
+ *
+ * The last three walk that heap, or use it for a buffer they make and release
+ * themselves; nothing of ours can arrive at them.  The other six are the list,
+ * and the middle two are the ones this file was missing: they allocate nothing
+ * at all, so they do not look like an allocator's business, and both hand the
+ * caller's pointer to `RtlSizeHeap`.  That is what stopped a process inside
+ * `CreateWindowExW` -- see `vesta_crt_msize`, which carries the trace.
+ *
+ * Everything else in the family reaches the heap THROUGH those six and needs
+ * no jump of its own: `_aligned_malloc` and `_aligned_offset_malloc` call
+ * `malloc`, `_aligned_free` calls `free`, `_aligned_realloc` goes through
+ * `_msize` and `_expand`, `_strdup` and `_getcwd` allocate with `malloc`, and
+ * `_msize_dbg` and `_expand_dbg` are one-instruction jumps into the real ones.
+ * Patching a function that merely calls a patched function would destroy
+ * fourteen bytes of somebody else's prologue to change nothing.
  */
 
 #if defined(_WIN32)
@@ -134,15 +162,39 @@ void __cdecl run_exit_list() noexcept {
 }
 
 /**
- * @brief Says, once, that something arrived here that cannot be served.
+ * @brief
+ * \~english Says, once, that something arrived here that cannot be served.
+ * \~spanish Dice, una vez, que llego aqui algo que no se puede servir.
+ * \~
  *
+ * \~english
  * Once and not every time: this runs on a path the runtime may be walking
  * during start-up or shutdown, and a message per event would turn a bounded
  * oddity into a flood that hides everything else.  The COUNT keeps the
  * magnitude; the message is only there so nobody has to go looking for it.
+ *
+ * ONCE PER REASON, and the flag comes from the caller for that alone.  It used
+ * to be a single flag shared by the whole file, so the first thing to happen
+ * silenced every other reason for the rest of the process -- and the reasons
+ * are what this function exists to say.  A diagnostic that reports the first
+ * cause and hides the second is the failure mode this library chases
+ * everywhere else.
+ *
+ * \~spanish
+ * Una vez y no cada vez: esto corre por un camino que el runtime puede estar
+ * recorriendo al arrancar o al cerrar, y un mensaje por evento convertiria una
+ * rareza acotada en una riada que tapa todo lo demas.  La CUENTA guarda la
+ * magnitud; el mensaje solo esta para que nadie tenga que ir a buscarlo.
+ *
+ * UNA VEZ POR MOTIVO, y la bandera la trae quien llama solo para eso.  Antes
+ * era una sola bandera compartida por el fichero entero, asi que lo primero que
+ * pasara callaba todos los demas motivos durante el resto del proceso -- y los
+ * motivos son justo lo que esta funcion existe para decir.  Un diagnostico que
+ * avisa de la primera causa y esconde la segunda es el modo de fallo que esta
+ * libreria persigue en todo lo demas.
+ * \~
  */
-void say_once(const char *what) {
-    static std::atomic<bool> said{false};
+void say_once(std::atomic<bool> &said, const char *what) {
     if (said.exchange(true, std::memory_order_relaxed)) return;
     std::fprintf(stderr, "[allocator] %s\n", what);
 }
@@ -190,15 +242,182 @@ void *vesta_crt_calloc(size_t count, size_t size) {
 void *vesta_crt_realloc(void *p, size_t n) {
     if (p != nullptr && !ours(p)) {
         g_foreign.fetch_add(1, std::memory_order_relaxed);
-        say_once("a `realloc` arrived for a block the C runtime made before "
+        static std::atomic<bool> said{false};
+        say_once(said,
+                 "a `realloc` arrived for a block the C runtime made before "
                  "this allocator was in force. Its size is only known to the "
                  "heap that made it, and guessing is what corrupts memory, so "
                  "the call reports failure and the block is left untouched.");
         return nullptr;
     }
+    /* \~english NOTE for whoever follows the `_msize` trail below: this entry
+     * is what `__dllonexit` uses to GROW the table whose size it just asked
+     * for.  It reaches here -- checked in the disassembly, msvcrt's internal
+     * `realloc` helper calls the exported entry, which is the one patched --
+     * so the pair "ask the size, then grow" stays inside this allocator from
+     * end to end.
+     *
+     * \~spanish NOTA para quien siga el rastro de `_msize` de mas abajo: esta
+     * entrada es la que usa `__dllonexit` para HACER CRECER la tabla cuyo
+     * tamano acaba de preguntar.  Llega aqui -- comprobado en el
+     * desensamblado, el ayudante interno de `realloc` de msvcrt llama a la
+     * entrada exportada, que es la parcheada --, asi que el par "preguntar el
+     * tamano y crecer" se queda dentro de este asignador de punta a punta.
+     * \~ */
     void *q = util::host_realloc(p, n);
     note_site(__builtin_return_address(0), n);
     return q;
+}
+
+/**
+ * @brief
+ * \~english `_msize`, which is the door the heap corruption came through.
+ * \~spanish `_msize`, que es la puerta por la que entraba la corrupcion del
+ *           monton.
+ * \~
+ *
+ * \~english
+ * HOW IT WAS FOUND, because the report named nobody.  A window died inside
+ * `CreateWindowExW` with `0xC0000374`, STATUS_HEAP_CORRUPTION, and the frames
+ * were bare offsets: `uxtheme +0x28480 ... msvcrt +0x3a553 ... msvcrt +0x2a8e0
+ * ... ntdll +0x2422f`.  Resolved against the binaries they are `_initterm
+ * +0x43`, `__dllonexit +0x30` and `RtlSizeHeap +0xcf` -- and `__dllonexit
+ * +0x30` is the instruction AFTER `call _msize`, so `_msize` is the one in the
+ * middle.  It was read off the disassembly, not guessed from the names.
+ *
+ * WHAT WAS HAPPENING.  uxtheme is loaded LAZILY, from inside
+ * `CreateWindowExW`, long after the jumps went in -- so the atexit table its
+ * start-up code allocates with `malloc` is OURS.  Then `__dllonexit` asks how
+ * big that table is, and `_msize` hands our pointer to `RtlSizeHeap`, which
+ * reads NT heap metadata that nobody ever wrote.  The system is right to stop
+ * the process: the block really is not in that heap.
+ *
+ * This is the Windows twin of the ELF bug: being `malloc` by halves corrupts.
+ * Serving the allocation and leaving the question about it to somebody else is
+ * the same mistake as serving `malloc` and leaving `realloc` to the C library.
+ *
+ * THE ANSWER ITSELF IS NOT HERE.  It is @c vesta_interpose::usable_bytes, next
+ * to the reason a foreign block gets zero rather than the `-1` msvcrt would
+ * give -- and it is shared because the renamed `__wrap__msize` has to answer
+ * the same thing.  What stays here is the counting and the message, which are
+ * this door's and not the answer's.
+ *
+ * \~spanish
+ * COMO SE ENCONTRO, porque el informe no nombraba a nadie.  Una ventana moria
+ * dentro de `CreateWindowExW` con `0xC0000374`, STATUS_HEAP_CORRUPTION, y los
+ * marcos eran desplazamientos pelados: `uxtheme +0x28480 ... msvcrt +0x3a553
+ * ... msvcrt +0x2a8e0 ... ntdll +0x2422f`.  Resueltos contra los binarios son
+ * `_initterm +0x43`, `__dllonexit +0x30` y `RtlSizeHeap +0xcf` -- y
+ * `__dllonexit +0x30` es la instruccion de DESPUES de `call _msize`, asi que
+ * `_msize` es la de en medio.  Salio de leer el desensamblado, no de adivinar
+ * por los nombres.
+ *
+ * QUE PASABA.  uxtheme se carga PEREZOSAMENTE, desde dentro de
+ * `CreateWindowExW`, mucho despues de que entraran los saltos -- asi que la
+ * tabla de salida que su codigo de arranque reserva con `malloc` es NUESTRA.
+ * Entonces `__dllonexit` pregunta cuanto mide esa tabla, y `_msize` le da
+ * nuestro puntero a `RtlSizeHeap`, que lee metadatos del monton NT que nadie
+ * escribio nunca.  El sistema hace bien en parar el proceso: el bloque
+ * realmente no esta en ese monton.
+ *
+ * Es el gemelo en Windows del fallo de ELF: ser `malloc` a medias corrompe.
+ * Servir la reserva y dejarle a otro la pregunta SOBRE ella es la misma
+ * equivocacion que servir `malloc` y dejarle `realloc` a la libreria de C.
+ *
+ * LA RESPUESTA EN SI NO ESTA AQUI.  Es @c vesta_interpose::usable_bytes, junto
+ * al motivo de que un bloque ajeno reciba cero y no el `-1` que daria msvcrt --
+ * y se comparte porque el renombrado `__wrap__msize` tiene que contestar lo
+ * mismo.  Lo que se queda aqui es la cuenta y el mensaje, que son de esta
+ * puerta y no de la respuesta.
+ * \~
+ *
+ * @param p
+ * \~english a block, ours or not.
+ * \~spanish un bloque, nuestro o no.
+ * \~
+ * @return
+ * \~english usable bytes, which may be more than were asked for; 0 for null or
+ *           for a block this allocator did not make.
+ * \~spanish bytes utilizables, que pueden ser mas de los que se pidieron; 0 si
+ *           es nulo o si el bloque no lo hizo este asignador.
+ * \~
+ */
+size_t vesta_crt_msize(void *p) {
+    if (p == nullptr || ours(p)) return vesta_interpose::usable_bytes(p);
+    g_foreign.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> said{false};
+    say_once(said,
+             "an `_msize` arrived for a block the C runtime made before this "
+             "allocator was in force. Only the heap that made it knows its "
+             "size, and asking that heap about a pointer that might not be "
+             "its own is what stops the process for heap corruption, so the "
+             "call answers zero and the caller grows the block instead.");
+    return 0;
+}
+
+/**
+ * @brief
+ * \~english `_expand`, the other one that asks the NT heap about a pointer.
+ * \~spanish `_expand`, la otra que le pregunta al monton NT por un puntero.
+ * \~
+ *
+ * \~english
+ * IT IS HERE FOR THE SAME REASON AND NOT BECAUSE OF A CRASH.  Sweeping msvcrt's
+ * whole code section for references to the heap import slots turns up fourteen
+ * sites in six functions: `malloc`, `calloc`, `realloc` and `free`, which are
+ * already patched; `_heapchk`, `_heapwalk` and `_chsize`, which walk that heap
+ * or use it for a buffer of their own and never see a pointer of ours; and
+ * these two.  `_expand` calls `RtlSizeHeap` and then `RtlReAllocateHeap` with
+ * the in-place flag, both on the caller's pointer -- the same two steps that
+ * killed the window, one function over.  With these two in, the family is
+ * CLOSED: the aligned entries and the `_dbg` variants reach the heap only
+ * through `malloc`, `free`, `_msize` and `_expand`, so nothing else needs a
+ * jump written over it.
+ *
+ * WHAT IT ANSWERS is @c vesta_interpose::expand_in_place, shared with the
+ * renamed twin for the same reason as above.
+ *
+ * \~spanish
+ * ESTA AQUI POR LO MISMO Y NO POR UNA CAIDA.  Barrer la seccion de codigo
+ * entera de msvcrt buscando referencias a las ranuras de importacion del monton
+ * da catorce sitios en seis funciones: `malloc`, `calloc`, `realloc` y `free`,
+ * ya parcheadas; `_heapchk`, `_heapwalk` y `_chsize`, que recorren ese monton o
+ * lo usan para un buffer propio y no ven jamas un puntero nuestro; y estas dos.
+ * `_expand` llama a `RtlSizeHeap` y luego a `RtlReAllocateHeap` con la bandera
+ * de hacerlo en el sitio, las dos sobre el puntero de quien llama -- los mismos
+ * dos pasos que mataron la ventana, una funcion mas alla.  Con estas dos
+ * puestas la familia queda CERRADA: las entradas alineadas y las variantes
+ * `_dbg` solo llegan al monton por `malloc`, `free`, `_msize` y `_expand`, asi
+ * que no hace falta escribir un salto encima de ninguna otra.
+ *
+ * QUE CONTESTA es @c vesta_interpose::expand_in_place, compartida con el
+ * gemelo renombrado por lo mismo que arriba.
+ * \~
+ *
+ * @param p
+ * \~english the block to resize in place.
+ * \~spanish el bloque a redimensionar en el sitio.
+ * \~
+ * @param n
+ * \~english the size wanted.
+ * \~spanish el tamano que se quiere.
+ * \~
+ * @return
+ * \~english @p p when it already holds @p n bytes, null otherwise.
+ * \~spanish @p p cuando ya tiene @p n bytes, nulo si no.
+ * \~
+ */
+void *vesta_crt_expand(void *p, size_t n) {
+    if (p == nullptr || ours(p)) return vesta_interpose::expand_in_place(p, n);
+    g_foreign.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> said{false};
+    say_once(said,
+             "an `_expand` arrived for a block the C runtime made before this "
+             "allocator was in force. Growing it where it lies would mean "
+             "asking a heap about a pointer that might not be its own, so the "
+             "call reports it could not, which is what `_expand` says when it "
+             "cannot and what every caller already handles.");
+    return nullptr;
 }
 
 /**
@@ -217,7 +436,9 @@ int __cdecl vesta_crt_atexit(ExitFn fn) {
     if (fn == nullptr) return -1;
     const unsigned i = g_exit_count.fetch_add(1, std::memory_order_acq_rel);
     if (i >= kExitSlots) {
-        say_once("more exit functions were registered than the list holds; "
+        static std::atomic<bool> said{false};
+        say_once(said,
+                 "more exit functions were registered than the list holds; "
                  "the ones past the limit will not run. Raise kExitSlots.");
         return -1;
     }
@@ -640,11 +861,30 @@ bool install_msvcrt_hook() noexcept {
         const char *name;
         const void *ours;
     };
-    const Entry entries[14] = {
+    const Entry entries[16] = {
         {"malloc", reinterpret_cast<const void *>(&vesta_crt_malloc)},
         {"calloc", reinterpret_cast<const void *>(&vesta_crt_calloc)},
         {"realloc", reinterpret_cast<const void *>(&vesta_crt_realloc)},
         {"free", reinterpret_cast<const void *>(&vesta_crt_free)},
+        /* \~english AND THE TWO THAT ONLY ASK QUESTIONS -- which is the whole
+         * point of them being here.  Neither allocates anything, so neither
+         * looks like it belongs in an allocator's hook list; both take a
+         * pointer and put it to the NT heap, and that is what killed a window
+         * inside `CreateWindowExW`.  Serving a block and letting somebody else
+         * answer questions ABOUT it is being `malloc` by halves.  With these
+         * two the family is closed: everything else in msvcrt that reaches the
+         * heap reaches it through one of the six.
+         *
+         * \~spanish Y LAS DOS QUE SOLO PREGUNTAN -- que es justamente por lo
+         * que estan aqui.  Ninguna reserva nada, asi que ninguna parece de la
+         * lista de ganchos de un asignador; las dos cogen un puntero y se lo
+         * plantean al monton NT, y eso es lo que mato una ventana dentro de
+         * `CreateWindowExW`.  Servir un bloque y dejar que otro conteste
+         * preguntas SOBRE el es ser `malloc` a medias.  Con estas dos la
+         * familia queda cerrada: todo lo demas de msvcrt que llega al monton
+         * llega por una de las seis.  \~ */
+        {"_msize", reinterpret_cast<const void *>(&vesta_crt_msize)},
+        {"_expand", reinterpret_cast<const void *>(&vesta_crt_expand)},
         /* Y EL REGISTRO DE SALIDA, que no reserva pero es quien HACIA reservar:
          * su tabla crece con `realloc`, nacio antes del parche, y era el unico
          * bloque ajeno que llegaba a un camino caliente.  Ver la lista propia,
