@@ -77,12 +77,26 @@ unsigned fake_resolver(const void *pc, util::AllocFrame *out, unsigned max) {
 
 /// Turns every name upper-case.  No pretende ser un desmanglador: lo que se
 /// comprueba es que el gancho SE LLAMA y que lo que devuelve es lo que sale.
+/* UN BUFFER, NO UN `std::string`, y la razon la encontro el nivel de guarda.
+ *
+ * Este gancho lo llama tambien el informe del comprobador, que corre al SALIR.
+ * Con un `static std::string` dentro, para entonces su destructor ya paso y
+ * escribir en el es un uso despues de destruir: en los niveles de abajo el
+ * bloque sigue mapeado y no se nota, y en el de guarda sus paginas ya no estan y
+ * el proceso muere ahi -- que es el nivel haciendo exactamente su trabajo.
+ *
+ * Un array de caracteres no tiene destructor que pueda haber corrido ni reserva
+ * que pueda haberse soltado.  Lo que no cabe se recorta, que es lo que un
+ * formateador de nombres puede permitirse. */
 const char *shouty_formatter(const char *raw) {
-    static std::string held;
-    held.assign(raw);
-    for (char &c : held)
-        if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
-    return held.c_str();
+    static char held[512];
+    size_t i = 0;
+    for (; raw[i] != '\0' && i + 1 < sizeof held; ++i)
+        held[i] = (raw[i] >= 'a' && raw[i] <= 'z')
+                      ? char(raw[i] - 'a' + 'A')
+                      : raw[i];
+    held[i] = '\0';
+    return held;
 }
 
 /// Un lector de CSV que respeta las comillas, que es lo unico que el escritor

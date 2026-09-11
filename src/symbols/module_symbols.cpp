@@ -126,22 +126,57 @@ HMODULE module_at(const void *pc) {
  * loaded -- and a module that allocated memory is loaded for good.
  */
 const char *remember_path(HMODULE mod) {
+    /* \~english THE PATH IS A BUFFER AND NOT A `std::string`, and that is the
+     * whole point of this note.
+     *
+     * Whoever asks here is, among others, the checker's report -- and that runs
+     * from the exit list, AFTER static destruction.  With a `std::string` in
+     * this table its destructor has already run by then, so what is handed back
+     * points at a block the allocator has already taken: at the ordinary levels
+     * it is still mapped and reads fine, which is why it went unnoticed, and at
+     * the guard level its pages are gone and the process dies inside the report.
+     *
+     * Found exactly that way, and it is worth saying that the level did its job
+     * -- it caught a use after free that had been there all along, in the code
+     * that was supposed to help explain other bugs.
+     *
+     * An array of characters has no destructor that can have run and no
+     * allocation that can have been given back.  It costs `64 * 520` bytes of
+     * the binary, in a translation unit that only exists to put names on things.
+     *
+     * \~spanish LA RUTA ES UN BUFFER Y NO UN `std::string`, y esa es toda la
+     * razon de esta nota.
+     *
+     * Quien pregunta aqui es, entre otros, el informe del comprobador -- y ese
+     * corre desde la lista de salida, DESPUES de la destruccion de estaticos.
+     * Con un `std::string` en esta tabla, para entonces su destructor ya paso,
+     * asi que lo que se devuelve apunta a un bloque que el asignador ya recogio:
+     * en los niveles normales sigue mapeado y se lee bien, que es por lo que no
+     * se noto, y en el de guarda sus paginas ya no estan y el proceso muere
+     * dentro del informe.
+     *
+     * Encontrado justo asi, y conviene decir que el nivel hizo su trabajo --
+     * cazo un uso despues de liberar que llevaba ahi desde siempre, en el codigo
+     * que estaba para ayudar a explicar otros fallos.
+     *
+     * Un array de caracteres no tiene destructor que pueda haber corrido ni
+     * reserva que pueda haberse devuelto.  Cuesta `64 * 520` bytes del binario,
+     * en una unidad que solo existe para ponerle nombre a las cosas.  \~ */
     struct Entry {
         HMODULE mod;
-        std::string path;
+        char path[MAX_PATH * 2];
     };
     static Entry table[64];
     static unsigned used = 0;
     for (unsigned i = 0; i < used; ++i)
-        if (table[i].mod == mod) return table[i].path.c_str();
+        if (table[i].mod == mod) return table[i].path;
 
-    char buf[MAX_PATH * 2];
-    const DWORD n = GetModuleFileNameA(mod, buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return nullptr;
     if (used >= 64) return nullptr; // more modules than a report needs to name
+    const DWORD n = GetModuleFileNameA(mod, table[used].path,
+                                       sizeof(table[used].path));
+    if (n == 0 || n >= sizeof(table[used].path)) return nullptr;
     table[used].mod = mod;
-    table[used].path.assign(buf, n);
-    return table[used++].path.c_str();
+    return table[used++].path;
 }
 
 } // namespace

@@ -20,6 +20,7 @@
 #include "self_symbols_internal.h"
 
 #include "util/alloc/host_allocator.h" // AllocScope: esto declara lo que reserva
+#include "util/mem/vesta_memcpy.h" // la copia es la NUESTRA, tambien aqui dentro
 #include "util/os/os_memory.h"
 #include "util/symbols/self_image.h"     // la ruta del propio binario, que ya sabe dar
 
@@ -27,6 +28,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -148,8 +150,21 @@ const Table *table() noexcept {
 const Table *table_for(const char *path) noexcept {
     if (path == nullptr || *path == '\0') return nullptr;
 
+    /* LA CLAVE ES UN BUFFER Y NO UN `std::string`, y no es una preferencia.
+     *
+     * Esta cache la lee el informe del comprobador, que corre desde la lista de
+     * salida: DESPUES de que los destructores de los estaticos hayan pasado.
+     * Con un `std::string` aqui, para entonces su buffer ya se devolvio, y
+     * compararlo es leer un bloque que el asignador ya recogio -- en los niveles
+     * normales sigue mapeado y no se nota, y en el de guarda sus paginas ya no
+     * estan y el proceso muere DENTRO del informe que iba a explicar el fallo.
+     *
+     * Un array de caracteres no tiene destructor que pueda haber corrido.  Es la
+     * misma correccion que `remember_path`, y las dos salieron del mismo sitio:
+     * el nivel de guarda cazando un uso despues de liberar que llevaba ahi desde
+     * siempre, en el codigo de diagnostico. */
     struct Entry {
-        std::string path;
+        char path[520];
         const Table *table; ///< nulo tambien se recuerda: no se reintenta
     };
     /* Un maximo, y no una lista que crece: esto corre mientras se escribe un
@@ -160,8 +175,13 @@ const Table *table_for(const char *path) noexcept {
     static unsigned used = 0;
 
     for (unsigned i = 0; i < used; ++i)
-        if (cache[i].path == path) return cache[i].table;
+        if (std::strcmp(cache[i].path, path) == 0) return cache[i].table;
     if (used >= kMaxModules) return nullptr;
+    /* Una ruta que no cabe no se cachea, en vez de cachearse recortada: dos
+     * modulos con el mismo prefijo largo compartirian entrada y uno contestaria
+     * por el otro. */
+    const size_t plen = std::strlen(path);
+    if (plen + 1 > sizeof(cache[0].path)) return nullptr;
 
     const Table *built = nullptr;
     Table *mine = nullptr;
@@ -191,7 +211,7 @@ const Table *table_for(const char *path) noexcept {
     }
     delete mine;
 
-    cache[used].path = path;
+    util::vesta_memcopy(cache[used].path, path, plen + 1);
     cache[used].table = built;
     ++used;
     return built;
