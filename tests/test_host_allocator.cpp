@@ -277,7 +277,19 @@ int main() {
                 opaque(reinterpret_cast<const char *>(p) - sizeof(void *)));
             void *header = nullptr;
             util::vesta_memcopy(&header, src);
-            if (util::host_alloc_active() && !util::in_region(header))
+            /* NUESTRO no quiere decir "de la region".  El nivel de guarda del
+             * modo comprobacion es tambien esta libreria y sirve de paginas
+             * propias, asi que preguntar solo por la region hacia fallar esta
+             * fila por bloques que la libreria acababa de entregar -- y de forma
+             * INTERMITENTE, porque solo pasaba con los bloques que conseguian
+             * ficha de guarda, que son los que caben mientras la tabla no se
+             * llena.  Un rojo que aparece una vez de cada tres es peor que uno
+             * fijo: se repite la corrida, sale verde y se archiva como ruido.
+             *
+             * Sin el modo compilado el segundo termino contesta cero y esto es
+             * la comprobacion de siempre. */
+            if (util::host_alloc_active() && !util::in_region(header) &&
+                util::san_guarded_size(header) == 0)
                 del_asignador = false;
             vesta_memset(p->b, uint8_t(i & 0xFF), sizeof(p->b));
             vesta_memset(q->b, uint8_t(i & 0xFF), sizeof(q->b));
