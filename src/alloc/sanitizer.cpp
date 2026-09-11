@@ -830,6 +830,138 @@ struct Life {
 
 Life *g_life = nullptr;
 
+/**
+ * @brief
+ * \~english One PAIR: the site that handed a block out and the site that gave
+ *           it back.
+ * \~spanish Un PAR: el sitio que entrego un bloque y el que lo devolvio.
+ * \~
+ *
+ * \~english
+ * WHAT A PAIR ANSWERS THAT A SITE ON ITS OWN CANNOT: whether a site has ONE
+ * owner.  Per-site figures say how much a place allocates and how long its
+ * blocks live; neither says who ends up responsible for them.  A site whose
+ * blocks always come back through the same place has an owner and can be sent
+ * to an arena of its own; a site whose blocks come back through fifteen is
+ * shared, and belongs on the common path.
+ *
+ * That distinction is the one thing routing needs and the only one nothing here
+ * measured -- and it is worth saying plainly that the answer this produces is
+ * "yes, one owner" or "no, several", never "probably": NOT being able to show a
+ * site has a single owner is not showing that it has several, and a site that
+ * is not known stays where it is.
+ *
+ * The other half comes free with it: where ownership CROSSES a boundary --
+ * allocated by the parser, released by the emitter -- which is a thing nobody
+ * can see today at all.
+ *
+ * \~spanish
+ * LO QUE CONTESTA UN PAR Y NO PUEDE CONTESTAR UN SITIO SOLO: si un sitio tiene
+ * UN dueño.  Las cifras por sitio dicen cuanto reserva un sitio y cuanto viven
+ * sus bloques; ninguna dice quien acaba respondiendo por ellos.  Un sitio cuyos
+ * bloques vuelven siempre por el mismo sitio tiene dueño y se puede mandar a
+ * una arena propia; uno cuyos bloques vuelven por quince es compartido, y su
+ * lugar es el camino comun.
+ *
+ * Esa distincion es lo unico que el encaminado necesita y lo unico que aqui no
+ * se medía -- y conviene decir claro que lo que esto produce es "si, un dueño"
+ * o "no, varios", nunca "seguramente": NO poder demostrar que un sitio tiene un
+ * solo dueño no es demostrar que tiene varios, y un sitio que no se sabe se
+ * queda donde esta.
+ *
+ * La otra mitad viene de regalo: donde la propiedad CRUZA una frontera --
+ * reservado por el analizador, soltado por el emisor --, que es algo que hoy no
+ * se ve de ninguna manera.  \~
+ */
+struct Pair {
+    /// \~english `(alloc << 32) | free`; 0 = free slot.  \~spanish `(reserva <<
+    /// 32) | liberacion`; 0 = ranura libre.  \~
+    std::atomic<uint64_t> key;
+    uint64_t blocks; ///< \~english how many went this way.  \~spanish cuantos
+                     ///< fueron por aqui.  \~
+    uint64_t bytes;  ///< \~english and how much they were.  \~spanish y cuanto
+                     ///< median.  \~
+};
+
+/**
+ * @brief
+ * \~english Slots for the pairs.  Same size and same discipline as the depot.
+ * \~spanish Ranuras de los pares.  Mismo tamano y misma disciplina que el
+ *           deposito.
+ * \~
+ *
+ * \~english
+ * SIZED FROM A MEASUREMENT, not from a guess.  A real compile through the whole
+ * pipeline interned 3.575 distinct stacks, 5,5 % of the depot, without
+ * overflowing -- so a site can be one of at most that many on either side.  And
+ * there is a hard ceiling above that: a pair only exists when a block is
+ * RELEASED, so distinct pairs can never outnumber releases.
+ *
+ * What that does not settle is a big compile, where releases run into the
+ * millions.  Distinct pairs saturate long before that -- nearly everything
+ * comes back through a handful of generic places -- but "nearly" is not a
+ * measurement, which is why @c g_pair_full exists and is printed.  A table that
+ * quietly stops recording turns "these are the pairs" into "these are the pairs
+ * that fit", and the two read exactly the same.
+ *
+ * \~spanish
+ * DIMENSIONADO CON UNA MEDIDA, no con una suposicion.  Una compilacion real con
+ * la tuberia entera interno 3.575 pilas distintas, el 5,5 % del deposito, sin
+ * desbordarlo -- asi que un sitio solo puede ser uno de esos, a cada lado.  Y
+ * por encima hay un techo duro: un par solo existe cuando un bloque se SUELTA,
+ * asi que los pares distintos no pueden ser mas que las liberaciones.
+ *
+ * Lo que eso no zanja es una compilacion grande, donde las liberaciones son
+ * millones.  Los pares distintos se saturan mucho antes -- casi todo vuelve por
+ * un punado de sitios genericos -- pero "casi" no es una medida, y por eso
+ * existe @c g_pair_full y por eso se imprime.  Una tabla que deja de apuntar en
+ * silencio convierte "estos son los pares" en "estos son los pares que
+ * cupieron", y las dos cosas se leen igual.  \~
+ */
+/* \~english THE TWO GO TOGETHER, and that is why the count is written as a
+ * shift.  The index comes out of the TOP bits of the product, so how many to
+ * take depends on how big the table is: taking sixteen of them into a table of
+ * a million means only the first sixteenth of it is ever reachable, the load
+ * factor is sixteen times what it looks like, and growing the table changes
+ * nothing at all.  Which is exactly what happened here -- a table of 1.048.576
+ * refused 8.970 pairs while holding 38.207, an impossible 3,6 % until you see
+ * that the real figure was 58 %.
+ *
+ * \~spanish LOS DOS VAN JUNTOS, y por eso la cuenta se escribe como un
+ * desplazamiento.  El indice sale de los bits ALTOS del producto, asi que
+ * cuantos coger depende de lo grande que sea la tabla: coger dieciseis para una
+ * tabla de un millon deja alcanzable solo su primera dieciseisava parte, el
+ * factor de carga es dieciseis veces el que aparenta, y agrandarla no cambia
+ * nada.  Que es justo lo que paso aqui -- una tabla de 1.048.576 nego 8.970
+ * pares teniendo 38.207, un 3,6 % imposible hasta que se ve que la cifra real
+ * era el 58 %.  \~ */
+constexpr uint32_t kPairBits = 20;
+constexpr uint32_t kPairSlots = 1u << kPairBits;
+
+/// \~english One allocating site, once the pairs have been grouped: how many
+///           different places gave its blocks back, and how much went that way.
+///           Built by the report in a single pass, never kept.
+/// \~spanish Un sitio de reserva, ya agrupados los pares: cuantos sitios
+///           distintos devolvieron sus bloques y cuanto fue por ahi.  Lo
+///           construye el informe en una sola pasada y no se guarda.  \~
+struct Owned {
+    uint32_t owners;    ///< distinct sites that released its blocks
+    uint32_t one_owner; ///< the only one, when `owners == 1`
+    uint64_t blocks;
+    uint64_t bytes;
+};
+
+/// \~english The window, like everywhere else here.  \~spanish La ventana, como
+/// en todo lo demas de aqui.  \~
+constexpr uint32_t kPairProbe = 8;
+
+Pair *g_pairs = nullptr;
+
+/// \~english Releases whose pair found no room: counted, never dropped quietly.
+/// \~spanish Liberaciones cuyo par no encontro sitio: contadas, nunca tiradas
+/// en silencio.  \~
+std::atomic<uint64_t> g_pair_full{0};
+
 /// The longest life anybody has recorded.  Read by @c san_longest_life, which
 /// exists so a test can demand that the clock is running at all.
 std::atomic<uint64_t> g_longest_life{0};
@@ -1085,6 +1217,91 @@ void note_death(uint32_t stack, uint32_t req, bool same_thread,
     while (life > top && !g_longest_life.compare_exchange_weak(
                              top, life, std::memory_order_relaxed))
         ;
+}
+
+/**
+ * @brief
+ * \~english Notes that a block from @p alloc_stack came back through @p
+ *           free_stack.
+ * \~spanish Apunta que un bloque de @p alloc_stack volvio por @p free_stack.
+ * \~
+ *
+ * \~english
+ * CALLED WHERE THE BLOCK DIES, from BOTH doors -- the shadow's and the guarded
+ * one.  Only one of the two would be the same mistake this library has now made
+ * four times: the strictest level serves blocks the shadow never sees, so a
+ * tally wired to the shadow alone goes quiet exactly where the checking is
+ * strictest, and goes quiet WITHOUT saying so.
+ *
+ * Neither id can be zero for the pair to mean anything: zero is what the depot
+ * answers when a stack did not fit, and pairing a real site with "no idea"
+ * would put a row in the table that looks like knowledge.  Those are left out
+ * and the depot already counts its own overflow.
+ *
+ * \~spanish
+ * LLAMADA DONDE MUERE EL BLOQUE, desde las DOS puertas -- la del sombreado y la
+ * del bloque con guarda.  Solo una de las dos seria el mismo fallo que esta
+ * libreria lleva cometido cuatro veces: el nivel mas estricto sirve bloques que
+ * el sombreado no ve nunca, asi que una cuenta enganchada solo al sombreado se
+ * calla justo donde la comprobacion es mas estricta, y se calla SIN decirlo.
+ *
+ * Ninguno de los dos identificadores puede ser cero para que el par signifique
+ * algo: cero es lo que contesta el deposito cuando una pila no cupo, y emparejar
+ * un sitio real con "no se" pondria en la tabla una fila con aspecto de
+ * conocimiento.  Esas se dejan fuera, y el deposito ya cuenta su propio
+ * desbordamiento.  \~
+ *
+ * @param alloc_stack \~english who handed it out.  \~spanish quien lo entrego.
+ *                    \~
+ * @param free_stack  \~english who gave it back.  \~spanish quien lo devolvio.
+ *                    \~
+ * @param req         \~english the bytes that were asked for.  \~spanish los
+ *                    bytes que se pidieron.  \~
+ */
+void note_pair(uint32_t alloc_stack, uint32_t free_stack,
+               uint32_t req) noexcept {
+    if (g_pairs == nullptr) return;
+    if (alloc_stack == 0 || free_stack == 0) return;
+
+    const uint64_t key =
+        (uint64_t(alloc_stack) << 32) | uint64_t(free_stack);
+    uint64_t v = key * 0x9E3779B97F4A7C15ull;
+    uint32_t i = uint32_t(v >> (64 - kPairBits)) & (kPairSlots - 1);
+    for (uint32_t probe = 0; probe < kPairProbe; ++probe) {
+        Pair &p = g_pairs[i];
+        uint64_t cur = p.key.load(std::memory_order_acquire);
+        if (cur == 0) {
+            uint64_t expected = 0;
+            if (!p.key.compare_exchange_strong(expected, key,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_relaxed))
+                cur = expected; // somebody got there first; see what they put
+            else
+                cur = key;
+        }
+        if (cur == key) {
+            /* \~english Relaxed and not atomic-per-field: two threads releasing
+             * the same pair at the same instant can lose a count.  That is
+             * accepted here and it is a different thing from the table being
+             * full -- what this answers is the SHAPE of the ownership, and a
+             * missed unit does not turn one owner into several.  Making it
+             * exact would put a locked instruction on every release for a digit
+             * nobody reads.
+             *
+             * \~spanish Relajado y no atomico por campo: dos hilos soltando el
+             * mismo par en el mismo instante pueden perder una cuenta.  Se
+             * acepta, y es cosa distinta de que la tabla este llena -- lo que
+             * esto contesta es la FORMA de la propiedad, y una unidad perdida no
+             * convierte un dueño en varios.  Hacerlo exacto pondria una
+             * instruccion con cerrojo en cada liberacion por un digito que no
+             * lee nadie.  \~ */
+            p.blocks += 1;
+            p.bytes += req;
+            return;
+        }
+        i = (i + 1) & (kPairSlots - 1);
+    }
+    g_pair_full.fetch_add(1, std::memory_order_relaxed);
 }
 
 // =========================================================================
@@ -2214,6 +2431,26 @@ bool ensure_config() noexcept {
                 std::memset(life, 0, sizeof(Life) * kDepotSlots);
                 g_life = static_cast<Life *>(life);
             }
+            /* \~english And the pairs.  Not getting them is not failing the
+             * level: everything else works, only the question of who OWNS a
+             * site goes unanswered -- so it says so and carries on, instead of
+             * dropping to a lower level over a table that catches nothing.
+             *
+             * \~spanish Y los pares.  No conseguirlos no es fallar el nivel:
+             * todo lo demas funciona, solo se queda sin contestar la pregunta
+             * de quien es DUEÑO de un sitio -- asi que lo dice y sigue, en vez
+             * de bajar de nivel por una tabla que no caza nada.  \~ */
+            void *pairs = os_alloc(sizeof(Pair) * kPairSlots, kOsReadWrite);
+            if (pairs != nullptr) {
+                std::memset(pairs, 0, sizeof(Pair) * kPairSlots);
+                g_pairs = static_cast<Pair *>(pairs);
+            } else {
+                std::fprintf(stderr,
+                             "[allocator/check] no room for the table of "
+                             "site PAIRS: everything else still works, but "
+                             "nothing will be able to say whether a site has "
+                             "one owner or several\n");
+            }
             cfg.store(2, std::memory_order_release);
         } else {
             return false; // somebody else is in there; sit this one out
@@ -2761,6 +2998,10 @@ bool guarded_free(void *p, const void *fp) noexcept {
     const uint32_t tid = detail::have_cache(tc) ? tc->id : 0;
     note_death(g->alloc_stack, uint32_t(g->req), g->thread == tid, g->seq,
                thread_allocs(tc));
+    /* Y EL PAR, tambien desde esta puerta.  Un bloque con guarda no pasa por el
+     * sombreado, asi que engancharlo solo alli dejaria la tabla muda justo en el
+     * nivel mas estricto -- y muda sin decirlo.  Ver `note_pair`. */
+    note_pair(g->alloc_stack, g->free_stack, uint32_t(g->req));
 
     /* \~english DECOMMITTED, NOT FREED.  The pages go, so touching the block
      * from now on faults where it is touched; the range stays ours, so the
@@ -3045,6 +3286,9 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     note_death(s->alloc_stack, s->req, same_thread, s->seq, thread_allocs(c));
 
     s->free_stack = intern_stack(frames, n, walked);
+    /* Y QUIEN LO DEVOLVIO, contra quien lo entrego.  Aqui, donde por primera y
+     * unica vez se conocen los dos.  Ver `note_pair`. */
+    note_pair(s->alloc_stack, s->free_stack, s->req);
     s->meta = meta_of(kStFreed, meta_alloc_thread(s->meta), tid);
 
     if (detail::g_san_level >= SanLevel::Poison && g_poison != SanPoison::None)
@@ -3661,7 +3905,49 @@ bool write_check_csv(const char *dir) noexcept {
  * \~
  */
 void report() noexcept {
-    if (g_rows == nullptr || g_depot == nullptr) return;
+    /* \~english THE DEPOT IS WHAT THIS NEEDS; the shadow is not.
+     *
+     * This used to return unless BOTH were up, and the consequence was the
+     * worst one a checker can have: at the guard level the shadow is never
+     * built -- blocks come out of pages of their own and never touch it -- so
+     * the strictest setting printed NOTHING AT ALL.  Not a short report, not a
+     * warning: an empty stderr, with the run looking exactly like a clean one.
+     * Measured in the compiler itself, `g_rows` is a live table of 4.194.304
+     * rows at the poison level and a null pointer at the guard level, and
+     * eleven thousand guarded blocks had been served and counted with nobody
+     * left to print them.
+     *
+     * What the shadow holds is leaks and lives.  Everything else -- what each
+     * site moved, who gives back what, the guarded blocks, the verdicts already
+     * printed as they happened -- lives elsewhere and is worth saying on its
+     * own.  So the missing half is NAMED and the rest goes out.
+     *
+     * \~spanish LO QUE ESTO NECESITA ES EL DEPOSITO; el sombreado no.
+     *
+     * Antes volvia si no estaban los dos, y la consecuencia era la peor que
+     * puede tener un comprobador: en el nivel de guarda el sombreado no se monta
+     * nunca -- los bloques salen de paginas propias y no lo tocan --, asi que el
+     * ajuste mas estricto no imprimia NADA.  Ni un informe corto ni un aviso:
+     * un stderr vacio, con la corrida con el mismo aspecto que una limpia.
+     * Medido en el propio compilador, `g_rows` es una tabla viva de 4.194.304
+     * filas en el nivel de veneno y un puntero nulo en el de guarda, y once mil
+     * bloques con guarda se habian servido y contado sin que quedara nadie para
+     * imprimirlos.
+     *
+     * Lo que guarda el sombreado son fugas y vidas.  Todo lo demas -- lo que
+     * movio cada sitio, quien devuelve lo de quien, los bloques con guarda, los
+     * veredictos ya impresos segun ocurrian -- vive en otro sitio y merece
+     * decirse igual.  Asi que la mitad que falta se NOMBRA y el resto sale.  \~
+     */
+    if (g_depot == nullptr) return;
+    if (g_rows == nullptr)
+        std::fprintf(stderr,
+                     "[allocator/check] NOT COVERED: the shadow is not up, so "
+                     "there are no leaks and no lives below -- at the guard "
+                     "level blocks come out of pages of their own and never "
+                     "reach it.  What follows is everything that does NOT come "
+                     "from the shadow; it is not a clean run, it is a shorter "
+                     "report\n");
     /* \~english FROM HERE ON, WHAT WE ALLOCATE IS OURS.  Everything below
      * resolves names, and resolving allocates; without this the report would
      * appear in its own figures.  See `g_in_report`.
@@ -3949,8 +4235,116 @@ void report() noexcept {
         }
     }
 
+    /* \~english WHO OWNS WHAT, which is the one question the per-site figures
+     * above cannot reach.  They say how much a place allocates and how long its
+     * blocks live; none of them says who ends up responsible.
+     *
+     * The sites are listed by how many DIFFERENT places give their blocks back,
+     * smallest first, because that is the order in which the answer is useful:
+     * one place means the site has an owner and could be sent to an arena of
+     * its own; several mean it is shared and belongs where it is.  The rows are
+     * evidence for that decision, not the decision.
+     *
+     * \~spanish DE QUIEN ES CADA COSA, que es la unica pregunta a la que las
+     * cifras por sitio de arriba no llegan.  Dicen cuanto reserva un sitio y
+     * cuanto viven sus bloques; ninguna dice quien acaba respondiendo.
+     *
+     * Los sitios salen ordenados por CUANTOS sitios distintos devuelven sus
+     * bloques, de menos a mas, porque ese es el orden en que la respuesta sirve:
+     * uno solo quiere decir que el sitio tiene dueño y podria ir a una arena
+     * propia; varios, que es compartido y su lugar es donde esta.  Las filas son
+     * la prueba para esa decision, no la decision.  \~ */
+    if (g_pairs != nullptr) {
+        uint32_t used = 0;
+        for (uint32_t i = 0; i < kPairSlots; ++i)
+            if (g_pairs[i].key.load(std::memory_order_relaxed) != 0) ++used;
+        if (used != 0) {
+            std::fprintf(stderr,
+                         "\n[allocator/check] WHO GIVES BACK WHAT: %u pairs of "
+                         "(site that handed out, site that gave back).  A site "
+                         "whose blocks all come back through ONE place has an "
+                         "owner and could go to an arena of its own; one whose "
+                         "blocks come back through several is shared and "
+                         "belongs on the common path.  Not being able to show "
+                         "a single owner is NOT showing there are several.\n",
+                         used);
+            /* \~english ONE PASS, grouping into a row per allocating site --
+             * the same shape the leak list above already uses, and for the same
+             * reason.  Asking the table once per site instead would be
+             * `kDepotSlots * kPairSlots`, four thousand million reads to print
+             * a page, which is not a slow report but a hung process.  The cost
+             * is decided here, before writing it.
+             *
+             * \~spanish UNA PASADA, agrupando en una fila por sitio de reserva
+             * -- la misma forma que ya usa la lista de fugas de arriba, y por la
+             * misma razon.  Preguntarle a la tabla una vez por sitio seria
+             * `kDepotSlots * kPairSlots`, cuatro mil millones de lecturas para
+             * imprimir una pagina, que no es un informe lento sino un proceso
+             * colgado.  El coste se decide aqui, antes de escribirlo.  \~ */
+            const size_t own_bytes = sizeof(Owned) * kDepotSlots;
+            void *own_mem = os_alloc(own_bytes, kOsReadWrite);
+            if (own_mem != nullptr) {
+                Owned *by_site = static_cast<Owned *>(own_mem);
+                std::memset(own_mem, 0, own_bytes);
+                for (uint32_t i = 0; i < kPairSlots; ++i) {
+                    const uint64_t k =
+                        g_pairs[i].key.load(std::memory_order_relaxed);
+                    if (k == 0) continue;
+                    const uint32_t a = uint32_t(k >> 32);
+                    if (a >= kDepotSlots) continue;
+                    Owned &o = by_site[a];
+                    ++o.owners;
+                    o.one_owner = uint32_t(k & 0xFFFFFFFFu);
+                    o.blocks += g_pairs[i].blocks;
+                    o.bytes += g_pairs[i].bytes;
+                }
+                for (uint32_t a = 1; a < kDepotSlots; ++a) {
+                    const Owned &o = by_site[a];
+                    if (o.owners == 0) continue;
+                    if (o.owners == 1)
+                        std::fprintf(stderr,
+                                     "\n  ONE OWNER -- %llu blocks, %llu "
+                                     "bytes\n",
+                                     (unsigned long long)o.blocks,
+                                     (unsigned long long)o.bytes);
+                    else
+                        std::fprintf(stderr,
+                                     "\n  SHARED between %u places -- %llu "
+                                     "blocks, %llu bytes\n",
+                                     o.owners, (unsigned long long)o.blocks,
+                                     (unsigned long long)o.bytes);
+                    print_stack("  allocated", a);
+                    if (o.owners == 1) print_stack("  released", o.one_owner);
+                }
+                os_free(own_mem, own_bytes);
+            }
+        }
+        const uint64_t pfull = g_pair_full.load(std::memory_order_relaxed);
+        if (pfull != 0)
+            std::fprintf(stderr,
+                         "[allocator/check] NOT COVERED: %llu releases whose "
+                         "pair found no room in the table of %u, so the "
+                         "ownership above is what FIT, not what happened\n",
+                         (unsigned long long)pfull, kPairSlots);
+    }
+
     if (alive == 0) {
-        std::fprintf(stderr, "[allocator/check] nothing was left alive\n");
+        /* \~english AND WHICH OF THE TWO ZEROES THIS IS.  With no shadow
+         * nothing was ever watched, so "nothing was left alive" would be a
+         * claim about memory when it is a fact about the checker -- the exact
+         * shape of lie this library exists to prevent.
+         *
+         * \~spanish Y CUAL DE LOS DOS CEROS ES ESTE.  Sin sombreado no se
+         * vigilo nada, asi que "no quedo nada vivo" seria una afirmacion sobre
+         * la memoria cuando es un hecho sobre el comprobador -- justo la forma
+         * de mentira que esta libreria existe para impedir.  \~ */
+        if (g_rows == nullptr)
+            std::fprintf(stderr,
+                         "[allocator/check] whether anything was left alive is "
+                         "UNKNOWN here: the shadow that would have watched it "
+                         "was never built\n");
+        else
+            std::fprintf(stderr, "[allocator/check] nothing was left alive\n");
     } else {
         uint32_t n = 0;
         for (uint32_t i = 0; i < kDepotSlots; ++i)
