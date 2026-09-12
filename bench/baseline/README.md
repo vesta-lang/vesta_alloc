@@ -130,3 +130,24 @@ for:
   two columns do not get, because it does not recognise them.  Any earlier
   numbers comparing against `libc` are void.  The C-versus-C++ numbers are not
   affected: neither of our columns changed.
+
+## Un cambio en el asignador se mide con LOS DOS, 2026-09-12
+
+`bench_allocator` **no libera entre hilos**.  Todo lo que reserva lo suelta el
+mismo hilo que lo pidio, asi que un cambio que se equivoque con un bloque ajeno
+le pasa por delante sin que se entere.
+
+No es una suposicion.  Probando si convenia llevar la cuenta de bloques vivos de
+cada trozo, el decremento se escribio FUERA de la rama que comprueba de quien es
+el bloque -- o sea que un hilo movia el contador de un trozo que no era suyo,
+sin candado, mientras el dueno lo movia tambien.  Resultado:
+
+| | esa version |
+| :--- | :--- |
+| `bench_allocator`, tres rondas en los dos ordenes | **verde** |
+| `bench_contention`, tres intentos | **revienta, 0xC0000005** |
+| el compilador, 144.000 lineas | muere en el modulo quince |
+
+`bench_contention` son 24 hilos sobre tres perfiles de tamano, y es el UNICO
+sitio del banco donde una liberacion cruzada llega a ocurrir.  Medir un cambio
+del asignador solo con el primero es medir la mitad que no se rompe.

@@ -1114,6 +1114,89 @@ through a quick check. Use VESTA_SPAN_HYBRID or VESTA_SPAN_DEFERRED."
 
 /**
  * @brief
+ * \~english Count the live blocks of each chunk.  Off, and priced.
+ * \~spanish Contar los bloques vivos de cada trozo.  Apagado, y con precio.
+ * \~
+ *
+ * \~english
+ * A chunk handed to a size class never goes back, so one whose blocks all died
+ * is 64 KiB nobody can use: measured on a compile of 144.000 lines, 386 MiB.
+ * Knowing WHEN the last one dies is what would let it go back, and there are
+ * two ways to know -- count as it happens, which is this, or sweep the free
+ * lists between phases, which costs nothing on the hot path.
+ *
+ * This exists so the first one can be MEASURED instead of argued about.  Both
+ * halves go where they would really go: the decrement rides on a header the
+ * free path already reads, and the increment lands on the fast path, which
+ * takes its block from a per-thread batch and touches no chunk at all.
+ *
+ * \~spanish
+ * Un trozo entregado a una clase de tamano no vuelve nunca, asi que uno al que
+ * se le murieron todos los bloques son 64 KiB que no puede usar nadie: medido
+ * en una compilacion de 144.000 lineas, 386 MiB.  Saber CUANDO muere el ultimo
+ * es lo que permitiria devolverlo, y hay dos formas de saberlo -- contar segun
+ * pasa, que es esto, o barrer las listas de libres entre fases, que no cuesta
+ * nada en el camino caliente.
+ *
+ * Esto existe para poder MEDIR la primera en vez de discutirla.  Las dos
+ * mitades van donde irian de verdad: el decremento viaja en una cabecera que el
+ * camino de liberar ya lee, y el incremento cae en el camino rapido, que saca
+ * su bloque de una tanda del hilo y no toca ningun trozo.
+ *
+ * \~english
+ * AND IT WAS MEASURED, which is why it is still off.  `bench_allocator`, three
+ * rounds interleaved in both orders, six runs a side, on a build whose only
+ * difference is this switch:
+ *
+ *     one at a time   1,41 -> 4,08 ns   +188%
+ *     patterns        3,13 -> 4,60 ns    +47%
+ *
+ * The benchmark's own noise floor, measured with the allocator against itself,
+ * is 3,4%.  So the fast path nearly triples to answer a question asked twelve
+ * times in a compile.  The sweep between phases costs nothing here and reaches
+ * the same chunks; that is what got built.  This stays so the price can be
+ * taken again on other hardware, not as a thing to turn on.
+ *
+ * \~spanish
+ * Y SE MIDIO, que es por lo que sigue apagado.  `bench_allocator`, tres rondas
+ * intercaladas en los dos ordenes, seis corridas por lado, sobre una
+ * construccion cuya unica diferencia es este interruptor:
+ *
+ *     de uno en uno   1,31 -> 3,71 ns   +183%
+ *     patrones        2,87 -> 4,23 ns    +47%
+ *
+ * SIN EL ATOMICO (valor 2) casi todo eso se va: +17% y +6,2%.  Nueve decimas
+ * partes del precio eran el candado, no la cuenta.  Y ahi la idea parecia
+ * viable -- hasta que la CORRECCION la encarecio dos veces mas:
+ *
+ *   1. el decremento fuera de la rama que comprueba de quien es el bloque deja
+ *      a un hilo moviendo el contador de un trozo ajeno, sin candado.  Eso no
+ *      es una carrera teorica: el compilador murio en el modulo quince de un
+ *      proyecto con un 6% de liberaciones cruzadas.  Dentro de la rama se
+ *      arregla, y ademas sale mas barato;
+ *   2. pero `extra` YA TIENE DUENO en los trozos que importan: en uno grande es
+ *      el cursor de tallado de `grow_big`, o sea las clases de 2 KiB para
+ *      arriba -- justo donde estan los trozos que se podrian devolver.  Y la
+ *      cabecera esta llena: cuatro campos de cuatro bytes en dieciseis, con un
+ *      `static_assert` encima porque de ese tamano depende la alineacion de
+ *      todos los bloques.
+ *
+ * O sea que esto no es "anadir un contador": es hacerle sitio a un campo en una
+ * cabecera que no lo tiene, y eso es una reforma del reparto, no un ajuste.  El
+ * barrido entre fases llega a los mismos trozos sin pedir ni un byte ni tocar
+ * el camino caliente.
+ *
+ * Se queda apagado y con estas cifras para que la proxima vez que alguien tenga
+ * la idea -- que es buena, da O(1) donde el barrido da O(bloques) -- empiece por
+ * el punto 2 en vez de por el banco.
+ * \~
+ */
+#ifndef VESTA_ALLOC_CHUNK_LIVE
+#define VESTA_ALLOC_CHUNK_LIVE 0
+#endif
+
+/**
+ * @brief
  * \~english Whether the thread's cache gets a thread variable of its own.
  * \~spanish Si el cache del hilo recibe una variable de hilo propia.
  * \~

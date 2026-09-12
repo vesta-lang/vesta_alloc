@@ -2574,6 +2574,272 @@ size_t host_region_reserved() noexcept {
 
 size_t host_span_trim() noexcept { return span_sweep(); }
 
+/// \~english What a scan is accumulating.  \~spanish Lo que un barrido lleva
+/// acumulado.  \~
+struct ChunkScan {
+    detail::ThreadCache *cache;
+    /* El primero de la cadena de condenados, por indice mas uno.  Cero es que
+     * no hay ninguno; ver `scan_doom`. */
+    uint32_t doomed;
+    /* DESDE QUE CLASE.  El coste del barrido es por BLOQUE y el premio por
+     * TROZO, y las dos cosas caen del mismo lado: una clase de 16 bytes mete
+     * 4.096 bloques en un trozo -- que tienen que estar los 4.096 libres para
+     * que valga algo -- y una de 2 KiB, treinta y dos.  Las pequenas son casi
+     * todo el coste y casi nada del premio. */
+    uint32_t from_class;
+    uint64_t blocks;  ///< bloques libres recorridos
+    uint64_t full;    ///< trozos que salieron enteros libres
+    size_t bytes;     ///< y lo que suman
+};
+
+/// Primera pasada: apunta el bloque en la cuenta de su trozo.
+void scan_count(ChunkScan *st, void *p) noexcept {
+    if (!in_region(p)) return;
+    ChunkHeader *h = chunk_of(p);
+    if (h->magic != kChunkMagic) return;
+    h->extra++;
+    st->blocks++;
+}
+
+/// Segunda pasada: juzga el trozo la PRIMERA vez que se vuelve a pasar por el,
+/// y le devuelve `extra` a cero.
+void scan_judge(ChunkScan *st, void *p) noexcept {
+    if (!in_region(p)) return;
+    ChunkHeader *h = chunk_of(p);
+    if (h->magic != kChunkMagic || h->extra == 0) return;
+    const size_t capacity =
+        (kChunkBytes - sizeof(ChunkHeader)) / kSizes[h->cls];
+    /* EL QUE SE ESTA TALLANDO NO CUENTA: su `extra` es cuantos bloques van
+     * entregados, no cuantos libres, y ademas sus bloques no estan todos
+     * encadenados todavia. */
+    if (h != st->cache->big_run[h->cls] && h->extra >= capacity) {
+        st->full++;
+        st->bytes += kChunkBytes;
+    }
+    h->extra = 0;
+}
+
+/**
+ * @brief Recorre TODO lo que este hilo tiene libre, llamando a @p fn.
+ *
+ * Los tres sitios donde puede estar un bloque libre, y los tres son del mismo
+ * dueno: su tanda, su lista por clase, y la cola donde otros hilos le dejan lo
+ * que le sueltan.  Es lo que hace que un barrido por hilo vea TODOS los bloques
+ * libres de sus trozos sin mirar la cache de nadie mas.
+ */
+void scan_walk(ChunkScan *st, void (*fn)(ChunkScan *, void *)) noexcept {
+    detail::ThreadCache *c = st->cache;
+    for (uint32_t i = 0; i < c->batch_n; ++i)
+        fn(st, c->batch[i]);
+    for (uint32_t k = st->from_class; k < kClasses; ++k) {
+        for (void *p = c->free_list[k]; p != nullptr;
+             p = *reinterpret_cast<void **>(p))
+            fn(st, p);
+        /* La cola remota se lee una vez por la cima y se sigue desde ahi: otros
+         * hilos solo EMPUJAN, asi que lo que llegue durante el recorrido no
+         * estaba cuando se pregunto -- una foto, que es lo que se pide. */
+        void *r = g_remote[c->id].head[k].load(std::memory_order_acquire);
+        for (; r != nullptr; r = *reinterpret_cast<void **>(r))
+            fn(st, r);
+    }
+}
+
+/// Marca que `scan_judge` deja en un trozo que se va a devolver.  Un valor que
+/// ninguna capacidad real alcanza, para que no se confunda con una cuenta.
+constexpr uint32_t kChunkDoomed = 0xFFFFFFFFu;
+
+/// Como `scan_judge`, pero en vez de devolver `extra` a cero deja la marca en
+/// los que salen enteros libres: la tercera pasada los necesita reconocer.
+void scan_doom(ChunkScan *st, void *p) noexcept {
+    if (!in_region(p)) return;
+    ChunkHeader *h = chunk_of(p);
+    if (h->magic != kChunkMagic || h->extra == 0) return;
+    if (h->extra == kChunkDoomed) return;   // ya juzgado por otro de sus bloques
+    const size_t capacity =
+        (kChunkBytes - sizeof(ChunkHeader)) / kSizes[h->cls];
+    if (h != st->cache->big_run[h->cls] && h->extra >= capacity) {
+        /* \~english CHAINED THROUGH THE HEADER ITSELF, so that finding them
+         * again afterwards needs no list with a cap on it -- and a cap is how
+         * a sweep leaves headers half-marked when it overflows, which would be
+         * a fault in the allocator and not an incomplete measurement.
+         *
+         * The link goes in `owner`, which a doomed chunk no longer needs: it is
+         * about to stop being a chunk.  It holds the INDEX of the next one plus
+         * one, because zero has to mean the end.
+         *
+         * \~spanish ENCADENADOS POR LA PROPIA CABECERA, para que volver a
+         * encontrarlos no necesite una lista con tope -- y un tope es como un
+         * barrido deja cabeceras a medio marcar al desbordarse, que seria una
+         * averia en el asignador y no una medida incompleta.
+         *
+         * El enlace va en `owner`, que a un trozo condenado ya no le hace
+         * falta: esta a punto de dejar de ser un trozo.  Lleva el INDICE del
+         * siguiente mas uno, porque el cero tiene que significar el final.  \~ */
+        h->owner = st->doomed;
+        st->doomed = chunk_index_of(reinterpret_cast<uintptr_t>(h)) + 1u;
+        h->extra = kChunkDoomed;
+        st->full++;
+        st->bytes += kChunkBytes;
+        return;
+    }
+    h->extra = 0;
+}
+
+/// Si este bloque pertenece a un trozo que se va a devolver.
+bool block_is_doomed(void *p) noexcept {
+    if (!in_region(p)) return false;
+    ChunkHeader *h = chunk_of(p);
+    return h->magic == kChunkMagic && h->extra == kChunkDoomed;
+}
+
+/**
+ * @brief Rehace las dos estructuras del hilo sin los bloques condenados.
+ *
+ * SE REHACEN, no se desenhebra uno a uno.  Quitar un eslabon de una lista
+ * simple obliga a recordar el anterior, y la tanda es un array donde quitar por
+ * el medio mueve el resto; reconstruir las dos de una pasada es mas corto de
+ * escribir, mas corto de leer, y hace lo mismo.
+ */
+void scan_rebuild(ChunkScan *st) noexcept {
+    ThreadCache *c = st->cache;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < c->batch_n; ++i) {
+        if (!block_is_doomed(c->batch[i])) c->batch[kept++] = c->batch[i];
+    }
+    c->batch_n = kept;
+    for (uint32_t k = st->from_class; k < kClasses; ++k) {
+        void *head = nullptr;
+        void **tail = &head;
+        for (void *p = c->free_list[k]; p != nullptr;) {
+            void *next = *reinterpret_cast<void **>(p);
+            if (!block_is_doomed(p)) {
+                *tail = p;
+                tail = reinterpret_cast<void **>(p);
+            }
+            p = next;
+        }
+        *tail = nullptr;
+        c->free_list[k] = head;
+    }
+}
+
+size_t host_chunk_reclaim(uint32_t from_class) noexcept {
+    ChunkScan st;
+    st.cache = detail::current_cache();
+    st.from_class = from_class;
+    st.blocks = 0;
+    st.full = 0;
+    st.bytes = 0;
+    st.doomed = 0;
+    if (!detail::have_cache(st.cache)) return 0;
+
+    /* PRIMERO SE RECOGE LO QUE OTROS SOLTARON, y no es un detalle de orden: un
+     * bloque de este hilo que otro devolvio esta libre, pero esta en una pila
+     * concurrente.  Recogiendolo antes quedan solo DOS estructuras que tocar, y
+     * las dos son de este hilo -- que es lo que hace que todo lo de abajo no
+     * necesite ni un cerrojo ni que nadie deje de reservar. */
+    for (uint32_t k = st.from_class; k < kClasses; ++k) {
+        void *chain = take_remote(st.cache, k);
+        if (chain == nullptr) continue;
+        void *last = chain;
+        while (*reinterpret_cast<void **>(last) != nullptr)
+            last = *reinterpret_cast<void **>(last);
+        *reinterpret_cast<void **>(last) = st.cache->free_list[k];
+        st.cache->free_list[k] = chain;
+    }
+
+    scan_walk(&st, scan_count);
+    scan_walk(&st, scan_doom);
+    if (st.full == 0) {
+        /* Nada que devolver, pero `scan_doom` ha dejado a cero lo que toco y
+         * hay que dejarlo como estaba igualmente: sin trozos condenados, ya
+         * esta -- `scan_doom` limpia lo que no condena. */
+        return 0;
+    }
+    scan_rebuild(&st);
+
+    /* Y AHORA SI, DE TROZO A TRAMO -- y en este orden, no mezclado con el paso
+     * anterior.  En cuanto un trozo entra en el reparto de tramos, este le
+     * escribe su nodo de lista DENTRO, en los mismos bytes donde todavia hay
+     * eslabones que el recorrido de arriba necesita leer.  Convertir sobre la
+     * marcha se lee igual de bien y pisa la lista por la que se esta andando. */
+    size_t given = 0;
+    const uintptr_t base = detail::g_region_base.load(std::memory_order_relaxed);
+    for (uint32_t next = st.doomed; next != 0;) {
+        ChunkHeader *h = reinterpret_cast<ChunkHeader *>(
+            base + uintptr_t(next - 1u) * kChunkBytes);
+        next = h->owner;
+        h->magic = kSpanMagic;
+        h->cls = 1;       // un tramo de un solo trozo
+        h->owner = 0;
+        h->extra = 0;
+        free_span(h);     // se funde con sus vecinos libres, si los tiene
+        given += kChunkBytes;
+    }
+    return given;
+}
+
+size_t host_chunk_scan(uint32_t from_class, uint64_t *blocks_out,
+                       uint64_t *chunks_out) noexcept {
+    /* SOLO LO DE ESTE HILO, y por eso no hace falta ningun cerrojo: lo que se
+     * recorre es suyo.
+     *
+     * SE CUENTA EN LA CABECERA, en `extra`, que en un trozo de clase normal no
+     * usa nadie.  Es exactamente el contador que la variante A habria llevado
+     * -- solo que pagado UNA vez y en frio en vez de en cada reserva, que es la
+     * diferencia entre esto y un +188%.
+     *
+     * Y DOS PASADAS SOBRE LAS MISMAS LISTAS, no una con una lista de trozos
+     * vistos al lado: esa lista tendria un tope, y al desbordarlo dejaria
+     * cabeceras con `extra` sucio -- que no seria una medida incompleta, seria
+     * una averia en el asignador.  Recorrer dos veces no tiene tope. */
+    ChunkScan st;
+    st.cache = detail::current_cache();
+    st.from_class = from_class;
+    st.blocks = 0;
+    st.full = 0;
+    st.bytes = 0;
+    st.doomed = 0;
+    if (!detail::have_cache(st.cache)) {
+        if (blocks_out != nullptr) *blocks_out = 0;
+        if (chunks_out != nullptr) *chunks_out = 0;
+        return 0;
+    }
+    scan_walk(&st, scan_count);
+    scan_walk(&st, scan_judge);
+    if (blocks_out != nullptr) *blocks_out = st.blocks;
+    if (chunks_out != nullptr) *chunks_out = st.full;
+    return st.bytes;
+}
+
+size_t host_span_free_bytes() noexcept {
+    /* SE RECORRE, no se lleva una cuenta.  Un contador que se mantuviera al
+     * insertar y al sacar seria exacto y gratis de leer, pero pondria una suma
+     * atomica en el camino de coger y soltar un tramo -- que no es el camino
+     * caliente de reservar, pero esta cerca -- para servir a una llamada que se
+     * hace una vez cada doscientas mil reservas.  Recorrer cuesta donde se
+     * pregunta y no donde se trabaja.
+     *
+     * El tamano sale de la LISTA en la que esta, no de la cabecera: `list_insert`
+     * mete cada tramo en la lista de su numero de trozos, asi que la posicion ya
+     * lo dice y no hay que tocar la cabecera de nadie. */
+    size_t bytes = 0;
+    {
+        SpanLock lk;
+        for (uint32_t k = 1; k <= kMaxSpanChunks; ++k) {
+            for (SpanNode *n = g_span_free[k]; n != nullptr; n = n->next)
+                bytes += size_t(k) * kChunkBytes;
+        }
+    }
+#if VESTA_SPAN_HAS_PARKING
+    /* Y lo aparcado en el reciclador, que tambien esta libre aunque todavia no
+     * haya llegado al reparto comun.  Dejarlo fuera contestaria "el asignador
+     * no tiene nada guardado" justo cuando lo tiene sin fundir. */
+    bytes += g_recycle_bytes.load(std::memory_order_relaxed);
+#endif
+    return bytes;
+}
+
 uint64_t host_per_thread_exhausted() noexcept {
     return g_no_per_thread_id.load(std::memory_order_relaxed);
 }
@@ -3090,6 +3356,38 @@ namespace {
 StatsDump::~StatsDump() {
     if (!g_measure) return;
     const HostAllocStats s = host_alloc_stats();
+
+    /* \~english WHAT THE PROCESS ACTUALLY HELD, first, because it is the
+     * question everybody brings to this report and the only one it could not
+     * answer.  Every other figure below is about what went THROUGH the
+     * allocator; this one is what the program NEEDED, and the two are not the
+     * same number: measured on a compile of 441.000 lines, the sites add up to
+     * 1.112 MiB and the process committed 2.374.  Reading the tables as a total
+     * answers for less than half.
+     *
+     * It is asked of the system, which knows it exactly and counts the stacks,
+     * the image and whatever a library committed on its own.  `os_process_memory`
+     * was already written, documented and used by NOBODY.
+     *
+     * \~spanish LO QUE EL PROCESO TUVO DE VERDAD, lo primero, porque es la
+     * pregunta con la que todo el mundo llega a este informe y la unica que no
+     * sabia contestar.  Todas las demas cifras de abajo hablan de lo que paso
+     * POR el asignador; esta es la que el programa NECESITO, y no son el mismo
+     * numero: medido sobre una compilacion de 441.000 lineas, los sitios suman
+     * 1.112 MiB y el proceso comprometio 2.374.  Leer las tablas como un total
+     * contesta por menos de la mitad.
+     *
+     * Se le pregunta al sistema, que lo sabe exacto y cuenta las pilas, la
+     * imagen y lo que haya comprometido por su cuenta cualquier libreria.
+     * `os_process_memory` ya estaba escrita, documentada y sin usar por NADIE.
+     * \~ */
+    const OsProcessMemory pm = os_process_memory();
+    std::fprintf(stderr,
+                 "[allocator] the PROCESS: committed peak=%.1f MiB (now %.1f) "
+                 "| resident peak=%.1f MiB  <- what it needed, all of it\n",
+                 (double)pm.commit_peak / (1024.0 * 1024.0),
+                 (double)pm.commit / (1024.0 * 1024.0),
+                 (double)pm.working_set_peak / (1024.0 * 1024.0));
     std::fprintf(
         stderr,
         "[allocator] small=%llu freed=%llu freed-by-others=%llu "

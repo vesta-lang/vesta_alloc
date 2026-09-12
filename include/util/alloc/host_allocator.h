@@ -1370,6 +1370,50 @@ size_t direct_bytes(const void *p) noexcept;
     const uint32_t k = class_of(n);
     void *p = pop_block(c, k);
     if (p == nullptr) return host_alloc_refill(c, k, n);
+#if VESTA_ALLOC_CHUNK_LIVE
+    /* \~english THE LIVE COUNT OF THE CHUNK, and it is here ON PURPOSE, where
+     * it hurts.  Knowing when a chunk's last block dies is what would let one
+     * go back to the span pool instead of belonging to its size class for the
+     * rest of the run -- measured on a compile of 144.000 lines, 386 MiB sat in
+     * chunks with every block dead.
+     *
+     * The free side is nearly free: that path already reads the header to find
+     * the owner.  THIS side is the one that costs, and this is the switch that
+     * prices it: the fast path takes its block from a per-thread batch and
+     * never touches the chunk, so counting here adds a second cache line and an
+     * atomic to an operation that measures 1,34 ns.
+     *
+     * Off by default.  It exists to be measured against the alternative -- a
+     * sweep between phases, which costs nothing here -- and the number decides
+     * which one is built, not an argument about which ought to be cheaper.
+     *
+     * \~spanish LA CUENTA DE VIVOS DEL TROZO, y esta aqui A PROPOSITO, donde
+     * duele.  Saber cuando muere el ultimo bloque de un trozo es lo que
+     * permitiria devolverlo al reparto de tramos en vez de que sea de su clase
+     * de tamano el resto de la corrida -- medido en una compilacion de 144.000
+     * lineas, 386 MiB estaban en trozos con todos sus bloques muertos.
+     *
+     * El lado de liberar sale casi gratis: ese camino ya lee la cabecera para
+     * saber de quien es.  ESTE es el que cuesta, y este interruptor es lo que
+     * le pone precio: el camino rapido coge su bloque de una tanda del hilo y
+     * no toca el trozo, asi que contar aqui le anade una segunda linea de cache
+     * y un atomico a una operacion que mide 1,34 ns.
+     *
+     * Apagado por defecto.  Existe para medirse contra la alternativa -- un
+     * barrido entre fases, que aqui no cuesta nada -- y que la cifra decida
+     * cual se construye, en vez de una discusion sobre cual deberia ser mas
+     * barata.  \~ */
+#if VESTA_ALLOC_CHUNK_LIVE == 2
+    /* SIN ATOMICO.  Quien mueve esta cuenta es siempre el hilo DUENO del trozo:
+     * reservar y liberar en local son suyos, y una liberacion remota no toca el
+     * trozo -- empuja el bloque a la cola del dueno, que lo recoge despues.
+     * Asi que el candado sobra, y lo que queda es el precio de tocar la linea
+     * de la cabecera, que es lo que se quiere saber. */
+    chunk_of(p)->extra++;
+#else
+    __atomic_fetch_add(&chunk_of(p)->extra, 1u, __ATOMIC_RELAXED);
+#endif
+#endif
     return p;
 }
 
@@ -1682,6 +1726,43 @@ namespace detail {
     }
     detail::ThreadCache *c = detail::current_cache();
     if (detail::have_cache(c) && h->owner == c->id) {
+#if VESTA_ALLOC_CHUNK_LIVE
+        /* \~english THE OTHER HALF OF THE COUNT, and it goes INSIDE the branch
+         * that has just established this thread owns the chunk.
+         *
+         * OUTSIDE IT, A THREAD RELEASING SOMEBODY ELSE'S BLOCK would move a
+         * counter that is not its own while the owner moves it too: a lost
+         * update, a chunk declared empty with live blocks in it, and a crash
+         * somewhere else entirely.  That is not a hypothesis -- it was written
+         * outside the branch to price the counter, and the compiler died on the
+         * fifteenth module of a project with 6% cross-thread frees.  The
+         * allocator benchmark passed it three times over: it does not release
+         * across threads, so it measured a version that corrupts memory.
+         *
+         * A block released by ANOTHER thread is not discounted here.  It goes
+         * to the owner's queue and is reconciled when the owner drains it,
+         * which is a cold path and the only place where both facts -- which
+         * chunk, and whose -- are known at once without a lock.
+         *
+         * \~spanish LA OTRA MITAD DE LA CUENTA, y va DENTRO de la rama que
+         * acaba de establecer que este hilo es el dueno del trozo.
+         *
+         * FUERA DE ELLA, UN HILO QUE SUELTA UN BLOQUE AJENO moveria un contador
+         * que no es suyo mientras el dueno lo mueve tambien: actualizacion
+         * perdida, un trozo declarado vacio con bloques vivos dentro, y una
+         * caida en otro sitio completamente distinto.  No es una hipotesis --
+         * estuvo fuera de la rama para ponerle precio al contador, y el
+         * compilador murio en el modulo quince de un proyecto con un 6% de
+         * liberaciones cruzadas.  El banco del asignador lo paso tres veces:
+         * no libera entre hilos, asi que midio tan contento una version que
+         * corrompe memoria.
+         *
+         * Un bloque soltado por OTRO hilo no se descuenta aqui.  Se va a la
+         * cola del dueno y se reconcilia cuando este la drena, que es un camino
+         * frio y el unico sitio donde los dos hechos -- de que trozo es, y de
+         * quien -- se saben a la vez sin ningun cerrojo.  \~ */
+        h->extra--;
+#endif
         detail::push_block(c, p, h->cls);
         return;
     }
@@ -3472,6 +3553,252 @@ uint64_t host_direct_refused() noexcept;
  * \~
  */
 size_t host_span_trim() noexcept;
+
+/**
+ * @brief
+ * \~english How much the allocator is holding that nobody is using.
+ * \~spanish Cuanto tiene guardado el asignador que no esta usando nadie.
+ * \~
+ *
+ * \~english
+ * WHAT IT IS FOR, AND WHAT IT IS NOT.  The checker can already say what a run
+ * has LIVE and what the allocator's ranges COST the process, and the distance
+ * between the two is memory the program is paying for and not using.  That
+ * distance is two different things added together, and they have two different
+ * cures:
+ *
+ *   - whole spans sitting in the free lists, which nobody is using and which
+ *     could be handed back to the system;
+ *   - chunks handed to a size class with most of their blocks free, which
+ *     cannot be handed back at all -- the ones still in use are scattered
+ *     through them.
+ *
+ * This answers the FIRST of the two.  Subtracting it from the distance leaves
+ * the second, and the two numbers point at different work: giving pages back
+ * is the allocator's, and not holding a whole program at once is the caller's.
+ * Telling them apart before building either is the entire reason this exists.
+ *
+ * @par What it costs
+ * It walks the free lists under the span lock, so it is O(free spans) and it is
+ * a COLD call: a phase boundary, or a cut of the checker's time axis, never a
+ * loop.  Nothing on the allocation path changes because of it.
+ *
+ * @par Threads
+ * **Safe from any thread.**  The answer is a snapshot: other threads may be
+ * freeing while it walks, so it is a figure to plot, not one to assert on.
+ *
+ * \~spanish
+ * PARA QUE, Y PARA QUE NO.  El comprobador ya sabe decir lo que una corrida
+ * tiene VIVO y lo que los rangos del asignador le CUESTAN al proceso, y la
+ * distancia entre las dos es memoria que el programa paga y no usa.  Esa
+ * distancia son dos cosas sumadas, y tienen dos curas distintas:
+ *
+ *   - tramos enteros parados en las listas de libres, que no usa nadie y que se
+ *     le podrian devolver al sistema;
+ *   - trozos entregados a una clase de tamano con casi todos sus bloques
+ *     libres, que no se pueden devolver de ninguna manera -- los que siguen en
+ *     uso estan repartidos por ellos.
+ *
+ * Esto contesta la PRIMERA de las dos.  Restandola de la distancia queda la
+ * segunda, y las dos cifras senalan trabajos distintos: devolver paginas es del
+ * asignador, y no sostener un programa entero a la vez es de quien llama.
+ * Distinguirlas antes de construir ninguno de los dos es la razon entera de que
+ * esto exista.
+ *
+ * @par Lo que cuesta
+ * Recorre las listas de libres con el cerrojo de tramos, asi que es O(tramos
+ * libres) y es una llamada FRIA: una frontera de fase, o un corte del eje del
+ * tiempo del comprobador, nunca un bucle.  El camino de reserva no cambia en
+ * nada por esto.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo.**  La respuesta es una foto: otros hilos
+ * pueden estar liberando mientras recorre, asi que es una cifra para dibujar,
+ * no para afirmar sobre ella.
+ *
+ * \~
+ * @return
+ * \~english bytes in the free lists plus whatever the recycler is parking.
+ * \~spanish bytes en las listas de libres mas lo que el reciclador tenga
+ *           aparcado.
+ * \~
+ */
+size_t host_span_free_bytes() noexcept;
+
+
+/**
+ * @brief
+ * \~english What THIS thread could give back, if a chunk could go back.
+ * \~spanish Lo que ESTE hilo podria devolver, si un trozo pudiera volver.
+ * \~
+ *
+ * \~english
+ * A MEASUREMENT, not the reclaim.  It walks what this thread holds free and
+ * counts the chunks whose every block is free -- the ones that could go back to
+ * the span pool -- without moving a single one.  It is here to price the walk
+ * before the reclaim is built on top of it, because that walk is the whole cost
+ * of the idea and it was not known: the lists are threaded THROUGH the blocks,
+ * scattered over a gigabyte, so it is a cache miss per block.
+ *
+ * ONE THREAD'S OWN, and no lock.  A free block of a chunk is always in one of
+ * three places and all three belong to the chunk's owner: its batch, its list
+ * for that class, and the queue where other threads leave what they release of
+ * his.  So a thread sees ALL the free blocks of ITS chunks without looking at
+ * anybody else's cache -- which is what makes a per-thread reclaim complete
+ * rather than partial.
+ *
+ * @par Threads
+ * **Safe from any thread**, and it needs no quiescence: it reads its own two
+ * lists, and the remote queue by its top, which others only push onto.
+ *
+ * \~spanish
+ * UNA MEDIDA, no la devolucion.  Recorre lo que este hilo tiene libre y cuenta
+ * los trozos con todos sus bloques libres -- los que podrian volver al reparto
+ * de tramos -- sin mover ni uno.  Esta para ponerle precio al recorrido antes
+ * de construir la devolucion encima, porque ese recorrido es el coste entero de
+ * la idea y no se sabia: las listas van enhebradas POR DENTRO de los bloques,
+ * repartidos por un gigabyte, asi que es un fallo de cache por bloque.
+ *
+ * LO DE UN HILO, y sin cerrojo.  Un bloque libre de un trozo esta siempre en
+ * uno de tres sitios y los tres son del dueno del trozo: su tanda, su lista de
+ * esa clase, y la cola donde otros hilos le dejan lo que le sueltan.  Asi que
+ * un hilo ve TODOS los bloques libres de SUS trozos sin mirar la cache de nadie
+ * -- que es lo que hace que un barrido por hilo sea completo y no parcial.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo**, y no pide quiescencia: lee sus dos listas, y
+ * la cola remota por su cima, sobre la que los demas solo empujan.
+ *
+ * \~
+ * @param blocks_out
+ * \~english how many free blocks it walked, or null.
+ * \~spanish cuantos bloques libres recorrio, o nulo.
+ * \~
+ * @param chunks_out
+ * \~english how many chunks came out entirely free, or null.
+ * \~spanish cuantos trozos salieron enteros libres, o nulo.
+ * \~
+ * @return
+ * \~english bytes in those chunks.
+ * \~spanish bytes en esos trozos.
+ * \~
+ */
+/**
+ * @brief
+ * \~english Which size class @c host_chunk_reclaim starts at by default.
+ * \~spanish Por que clase de tamano empieza @c host_chunk_reclaim por defecto.
+ * \~
+ *
+ * \~english
+ * Measured on a compile of 144.000 lines, at the emitter's boundary:
+ *
+ *     from class  0 (16 B)   1.373.621 blocks   183,4 MiB   116 ms
+ *     from class  8 (160 B)    579.159 blocks   160,2 MiB    31 ms
+ *     from class 12 (320 B)     98.489 blocks    55,3 MiB     4 ms
+ *
+ * Eight is where the curve turns: 87% of the bytes for 27% of the cost.  A
+ * consumer whose sizes look different should pass its own.
+ *
+ * \~spanish
+ * Medido en una compilacion de 144.000 lineas, en la frontera del emisor:
+ *
+ *     desde clase  0 (16 B)   1.373.621 bloques   183,4 MiB   116 ms
+ *     desde clase  8 (160 B)    579.159 bloques   160,2 MiB    31 ms
+ *     desde clase 12 (320 B)     98.489 bloques    55,3 MiB     4 ms
+ *
+ * El ocho es donde gira la curva: el 87% de los bytes por el 27% del coste.  Un
+ * consumidor con otro perfil de tamanos que pase el suyo.
+ * \~
+ */
+inline constexpr uint32_t kReclaimFromClass = 8;
+
+size_t host_chunk_scan(uint32_t from_class, uint64_t *blocks_out,
+                       uint64_t *chunks_out) noexcept;
+
+/**
+ * @brief
+ * \~english Gives back the chunks of THIS thread that hold nothing.
+ * \~spanish Devuelve los trozos de ESTE hilo que no tienen nada.
+ * \~
+ *
+ * \~english
+ * WHAT IT IS FOR.  A chunk handed to a size class never goes back on its own:
+ * it comes off the region watermark, gets its class, and serves that class for
+ * the rest of the run.  A phase that fills 400 MiB of one size and then drops
+ * it leaves those chunks belonging to a class the next phase may not ask for.
+ * Measured on a compile of 144.000 lines: 386 MiB in chunks with every block
+ * dead, against 279 MiB in chunks still holding something.
+ *
+ * ASKED FOR, never automatic, and that is the design.  Only the caller knows it
+ * has finished with a working set; a sweep on a timer would return chunks that
+ * are about to be asked for again, and would put its cost in the middle of
+ * somebody's measurement.  It is the same shape as @c host_span_trim, at the
+ * same place in a program, and for the same reason.
+ *
+ * @par What it costs
+ * It walks what this thread holds free, so it is O(free blocks) and it is a
+ * COLD call.  Nothing on the allocation path changes because of it -- that was
+ * the alternative, and it was measured: counting live blocks as they happen
+ * costs the fast path between 6% and 183% depending on how it is written, and
+ * does not fit in the chunk header anyway.  See @c VESTA_ALLOC_CHUNK_LIVE.
+ *
+ * @par Threads
+ * **Safe from any thread, and it needs no quiescence.**  It touches the cache
+ * of the thread that calls it and nothing else: a free block of a chunk is
+ * always within reach of that chunk's owner -- its batch, its list for that
+ * class, or the queue where other threads leave what they release of his --
+ * so a thread sees all the free blocks of its own chunks without looking at
+ * anybody else's cache.
+ *
+ * \~spanish
+ * PARA QUE.  Un trozo entregado a una clase de tamano no vuelve nunca por su
+ * cuenta: sale de la marca de agua de la region, coge su clase, y sirve a esa
+ * clase el resto de la corrida.  Una fase que llena 400 MiB de un tamano y
+ * luego lo suelta deja esos trozos siendo de una clase que la fase siguiente
+ * puede no pedir.  Medido en una compilacion de 144.000 lineas: 386 MiB en
+ * trozos con todos sus bloques muertos, contra 279 MiB en trozos que aun
+ * sostienen algo.
+ *
+ * SE PIDE, nunca es automatica, y eso es el diseno.  Solo quien llama sabe que
+ * ha terminado con un conjunto de trabajo; un barrido por temporizador
+ * devolveria justo los trozos que estan a punto de volver a hacer falta, y
+ * pondria su coste en mitad de la medida de otro.  Es la misma forma que
+ * @c host_span_trim, en el mismo sitio de un programa, y por lo mismo.
+ *
+ * @par Lo que cuesta
+ * Recorre lo que este hilo tiene libre, asi que es O(bloques libres) y es una
+ * llamada FRIA.  El camino de reserva no cambia en nada por esto -- esa era la
+ * alternativa, y se midio: llevar la cuenta de vivos segun pasa le cuesta al
+ * camino rapido entre un 6% y un 183% segun como se escriba, y ademas no cabe
+ * en la cabecera del trozo.  Ver @c VESTA_ALLOC_CHUNK_LIVE.
+ *
+ * @par Hilos
+ * **Segura desde cualquier hilo, y no pide quiescencia.**  Toca la cache del
+ * hilo que la llama y nada mas: un bloque libre de un trozo esta siempre al
+ * alcance del dueno de ese trozo -- su tanda, su lista de esa clase, o la cola
+ * donde otros hilos le dejan lo que le sueltan --, asi que un hilo ve todos los
+ * bloques libres de sus propios trozos sin mirar la cache de nadie.
+ *
+ * \~
+ * @param from_class
+ * \~english the size class to start at.  The cost is per BLOCK and the prize
+ *           per CHUNK, and both fall on the same side: a 16-byte class puts
+ *           4.096 blocks in a chunk and all 4.096 must be free for it to be
+ *           worth anything, while a 2 KiB class puts thirty-two.  Measured:
+ *           starting at class 8 keeps 87% of the bytes for 27% of the cost.
+ * \~spanish la clase de tamano por la que empezar.  El coste es por BLOQUE y
+ *           el premio por TROZO, y las dos cosas caen del mismo lado: una clase
+ *           de 16 bytes mete 4.096 bloques en un trozo y tienen que estar los
+ *           4.096 libres para que valga algo, y una de 2 KiB mete treinta y
+ *           dos.  Medido: empezar por la clase 8 conserva el 87% de los bytes
+ *           por el 27% del coste.
+ * \~
+ * @return
+ * \~english bytes handed back to the span pool.
+ * \~spanish bytes devueltos al reparto de tramos.
+ * \~
+ */
+size_t host_chunk_reclaim(uint32_t from_class = kReclaimFromClass) noexcept;
 
 /**
  * @brief
