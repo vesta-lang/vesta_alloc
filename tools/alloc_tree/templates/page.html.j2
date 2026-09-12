@@ -31,12 +31,31 @@
 <header>
   <h1>{{ title }} <span class="sub" id="sub"></span></h1>
   <div id="warns"></div>
+  <!-- QUE ESTABA MAL, arriba del todo y no en una tabla del final.  Un hallazgo
+       importa mas que cualquier reparto: enterrarlo entre diez tablas crudas es
+       tenerlo y no darlo. -->
+  <div id="verdicts"></div>
 
   <div class="tabs">
     <button class="on" data-panel="p-tree" data-t="tab.tree"></button>
+    {# El eje del tiempo.  Pestana aparte y no una columna del arbol: el arbol
+       contesta QUIEN reserva y esto contesta CUANDO, y sus numeros no se pueden
+       sumar entre si.  `time.js` la esconde si la corrida no llevaba eje. #}
+    <button data-panel="p-time" data-t="tab.time"></button>
     <button data-panel="p-raw"><span data-t="tab.raw"></span>
       <span class="n">{{ raw_rows }}</span></button>
     <span class="grow"></span>
+    {# TRES estados y no dos.  Por defecto manda el sistema, que es lo que casi
+       todo el mundo quiere y nadie configura; el interruptor le gana en las dos
+       direcciones, porque una pagina que solo ofrece "oscuro" no se puede
+       devolver a claro en una maquina puesta en oscuro. #}
+    <label class="pick"><span data-t="tool.theme"></span>
+      <select id="theme">
+        <option value="auto" data-t="theme.auto"></option>
+        <option value="light" data-t="theme.light"></option>
+        <option value="dark" data-t="theme.dark"></option>
+      </select>
+    </label>
     <label class="pick"><span data-t="tool.lang"></span>
       <select id="lang">
         {%- for code, name in langs %}
@@ -119,6 +138,119 @@
   <div id="detail"></div>
 </div>
 
+<div class="panel" id="p-time">
+  <p class="note" data-t="time.note"></p>
+  <div class="row bar-tools">
+    {# El GRANO va primero porque decide que son las demas: cambiarlo cambia
+       que se puede elegir, no solo como se ve. #}
+    <label class="pick"><span data-t="time.group"></span>
+      <select id="tgroup">
+        <option value="site" data-t="time.g.site"></option>
+        <option value="function" data-t="time.g.function"></option>
+        <option value="file" data-t="time.g.file"></option>
+        <option value="module" data-t="time.g.module"></option>
+        {# POR TAMANO y POR FORMA, que no son granos del mismo eje que los de
+           arriba: aquellos parten los sitios por DONDE estan, y estos por QUE
+           son.  Van en el mismo selector porque la pregunta del lector es la
+           misma -- "reparteme la curva por..." -- y tener dos controles para
+           eso obliga a entender la diferencia antes de poder mirar. #}
+        <option value="size" data-t="time.g.size"></option>
+        <option value="shape" data-t="time.g.shape"></option>
+        <option value="life" data-t="time.g.life"></option>
+      </select>
+    </label>
+    <label class="pick"><span data-t="time.what"></span>
+      <select id="tseries">
+        <option value="both" data-t="time.both"></option>
+        <option value="live" data-t="time.onlylive"></option>
+        <option value="committed" data-t="time.onlycomm"></option>
+      </select>
+    </label>
+    <label class="pick"><span data-t="time.top"></span>
+      <select id="ttop">
+        <option value="5">5</option>
+        <option value="10" selected>10</option>
+        <option value="20">20</option>
+        <option value="40">40</option>
+      </select>
+    </label>
+    {# LA ESCALA.  Con cuarenta bandas apiladas contra la curva total, las
+       finas son una raya: medirlas contra lo ELEGIDO es lo que las separa. #}
+    <label class="pick"><span data-t="time.scale"></span>
+      <select id="tscale">
+        <option value="all" data-t="time.s.all"></option>
+        <option value="picked" data-t="time.s.picked"></option>
+      </select>
+    </label>
+    {# COMO SE DIBUJA.  Era una casilla de "apilarlos" con dos respuestas, y
+       apilado o no es solo una de las formas de mirar esto: la pila contesta
+       cuanto suma, el eje logaritmico deja ver a la vez la banda de 0,5 MiB y
+       la de 70, el 100% ensena de QUE esta hecha la memoria, la rejilla da a
+       cada banda su propia regla, y las burbujas contestan quien pesa en un
+       instante.  Una casilla no puede ofrecer seis respuestas. #}
+    <label class="pick"><span data-t="time.draw"></span>
+      <select id="tdraw">
+        <option value="stack" data-t="time.d.stack"></option>
+        <option value="lines" data-t="time.d.lines"></option>
+        <option value="log" data-t="time.d.log"></option>
+        <option value="pct" data-t="time.d.pct"></option>
+        <option value="grid" data-t="time.d.grid"></option>
+        <option value="bubbles" data-t="time.d.bubbles"></option>
+      </select>
+    </label>
+    <label class="chk"><input type="checkbox" id="tmine" checked>
+      <span data-t="time.hideown"></span></label>
+    <span class="grow"></span>
+    <span class="stat" data-t="time.help"></span>
+  </div>
+
+  {# LA CAJA SE ESTIRA Y EL GRAFICO CRECE CON ELLA.  Con una altura fija, la
+     rejilla de veinte bandas o un empaquetado de burbujas se miran por una
+     rendija.  `resize: vertical` es del navegador: no hay que programar el
+     arrastre, y el lienzo lee su alto de la caja. #}
+  <div class="chartbox">
+    {# LOS BOTONES DE AMPLIAR, en todos los dibujos y no solo donde hay eje de
+       tiempo: en burbujas el arrastre desplaza y sin ampliar no se llega a las
+       pequenas. #}
+    <div class="zoom">
+      <button id="tzout" title="-" data-t="time.z.out"></button>
+      <button id="tzin" title="+" data-t="time.z.in"></button>
+      <button id="tzall" data-t="time.z.all"></button>
+    </div>
+    <canvas id="tchart"></canvas>
+    <div id="ttip" class="tip"></div>
+  </div>
+  <div id="tlegend" class="legend"></div>
+  {# QUIEN LLAMO A QUIEN.  La cadena entera esta en `check_frames.csv` y hasta
+     ahora la pagina solo ensenaba su marco mas interior: el nombre solo dice
+     QUE reservo, y la pregunta es casi siempre DESDE DONDE. #}
+  <div id="tstack-detail" class="stackbox"></div>
+
+  {# El SELECTOR.  Lo que de verdad hacia falta: el grafico no decide por ti
+     que diez series importan -- se marcan y se desmarcan aqui, y el buscador
+     filtra la lista, no el grafico. #}
+  <div class="row bar-tools">
+    <input type="search" id="tfilter" data-tph="time.filter">
+    <button id="tall" data-t="time.all"></button>
+    <button id="tnone" data-t="time.none"></button>
+  </div>
+  <div id="tpick" class="picker"></div>
+
+  <h2 class="rawh" id="tpeakhead"></h2>
+  <div class="wrap">
+  <table class="flat" id="tpeak">
+    <thead><tr>
+      <th class="n" data-t="time.col.bytes"></th>
+      <th class="n" data-t="time.col.share"></th>
+      <th data-t="time.col.growth"></th>
+      <th data-t="col.name"></th>
+      <th data-t="col.file"></th>
+    </tr></thead>
+    <tbody id="tpeakrows"></tbody>
+  </table>
+  </div>
+</div>
+
 <div class="panel" id="p-raw">
   <p class="note" data-t="raw.note"></p>
 
@@ -137,20 +269,13 @@
       <th{% if c.numeric %} class="n"{% endif %}>{{ c.name }}</th>
       {%- endfor %}
     </tr></thead>
-    <tbody>
-      {%- for row in t.rows %}
-      <tr>
-        {#- The same rule as the tree: a number is a number, and any text is
-            capped in width and wrapped rather than allowed to stretch its
-            column across the screen.  Nothing is shortened. -#}
-        {%- for c in t.columns %}
-        {%- if c.numeric %}<td class="n">{{ row[loop.index0] }}</td>
-        {%- elif c.mono %}<td class="name"><span class="sym">{{ row[loop.index0] }}</span></td>
-        {%- else %}<td><span class="path">{{ row[loop.index0] }}</span></td>{% endif %}
-        {%- endfor %}
-      </tr>
-      {%- endfor %}
-    </tbody>
+    {#- EL CUERPO VA VACIO Y LO LLENA LA PAGINA.  Escrito aqui, cada celda
+        costaba sus etiquetas -- una fila de `check_frames.csv` son 441 bytes de
+        marcado contra 66 de dato -- y con 185.000 filas eso eran 85 MB de un
+        envoltorio repetido.  Las filas viajan en `DATA.raw` y se pintan al
+        abrir la pestana, a trozos segun se baja: se ve exactamente lo mismo,
+        no falta ni una.  Ver `tables.js`. -#}
+    <tbody></tbody>
   </table>
   </div>
   {%- endfor %}

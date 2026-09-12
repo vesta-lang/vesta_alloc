@@ -40,6 +40,154 @@
      columna y descuadraba la tabla entera por una fila.  Una columna sin cota
      es una columna que mide lo que mida su peor fila. */
   --off: 16ch;
+
+  /* \~english THE CHART'S COLOURS AS VARIABLES, like every other colour here.
+   * A canvas paints whatever it is told, so a value written into the drawing
+   * code is a colour no theme can reach -- and one theme's ink on the other
+   * theme's paper is unreadable.  These are read back from the stylesheet when
+   * drawing, which is what makes the chart follow the page.
+   * \~spanish LOS COLORES DEL GRAFICO COMO VARIABLES, igual que los demas.  Un
+   * lienzo pinta lo que se le diga, asi que un valor escrito en el codigo de
+   * dibujo es un color al que ningun tema llega -- y la tinta de un tema sobre
+   * el papel del otro no se lee.  Estos se releen de la hoja de estilos al
+   * dibujar, que es lo que hace que el grafico siga a la pagina.  \~ */
+  --grid: rgba(120,125,130,.18);
+  --axis: rgba(107,114,128,.85);
+  --live: #178f6e;
+  --comm: #c97b45;
+  /* La region del asignador: entre las otras dos y con tinta propia, porque lo
+     que dice es justo lo que hay entre ellas. */
+  --region: #8a5cd6;
+  /* Los tramos libres: entre lo vivo y la region, que es donde esta. */
+  --free: #4a90c2;
+  /* Los trozos con todo muerto: la tercera parte del hueco. */
+  --empty: #c2a04a;
+  --mark: rgba(90,90,190,.85);
+  --markline: rgba(90,90,190,.45);
+  --rest: rgba(120,125,130,.30);
+  --rule: rgba(90,95,100,.45);
+  --band: rgba(80,130,230,.18);
+
+  /* \~english AND THE REST OF THE INK, which used to be written where it was
+   * used.  A colour written into a rule is a colour no theme reaches, and the
+   * page had thirty of them: on a dark ground the result was not "a bit off",
+   * it was rows of white on white.  Every one of them is a ROLE now, and a
+   * theme is the list of roles filled in.
+   * \~spanish Y EL RESTO DE LA TINTA, que estaba escrita donde se usaba.  Un
+   * color escrito en una regla es un color al que ningun tema llega, y la
+   * pagina tenia treinta: sobre fondo oscuro el resultado no era "algo raro",
+   * eran filas de blanco sobre blanco.  Ahora cada uno es un PAPEL, y un tema
+   * es la lista de papeles rellenada.  \~ */
+  --rowline: #f2f4f6;
+  --hover: #f8fafc;
+  --detail: #fcfdfe;
+  --tag-bg: #eef2f7;
+  --tag-ink: #33507a;
+  --tag-line: #dbe3ee;
+  --acc: #2563eb;
+  --inl: #7c3aed;
+  --hit-bg: #fde68a;
+  --hit-ink: #1a1d21;
+  --kw: #0550ae;
+  --ns: #55606d;
+  --arg: #97a1ad;
+  --pn: #8b96a5;
+  --lang-c: #0f766e;
+  --lang-cpp: #4338ca;
+}
+
+/* \~english DARK, both ways round.  The system setting decides by default --
+ * most readers never touch a switch -- and the switch wins over it when
+ * somebody does, in BOTH directions: a page that only offers "dark" cannot be
+ * put back to light on a machine set to dark.
+ * \~spanish OSCURO, en los dos sentidos.  Por defecto decide el ajuste del
+ * sistema -- la mayoria no toca ningun interruptor -- y el interruptor le gana
+ * cuando alguien lo toca, en LAS DOS direcciones: una pagina que solo ofrece
+ * "oscuro" no se puede devolver a claro en una maquina puesta en oscuro.  \~ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15181c;
+    --ink: #dde1e6;
+    --dim: #949ba4;
+    --line: #2b3038;
+    --head: #1c2026;
+    --hot: #1e3a5c;
+    --hot2: #4a2f22;
+    --sel: #24405e;
+    --warn-bg: #2a2416;
+    --warn-line: #d6a93a;
+    --warn-ink: #e8cf8a;
+    --grid: rgba(150,158,166,.16);
+    --axis: rgba(148,155,164,.85);
+    --live: #4fd1a5;
+    --comm: #e8a06a;
+    --region: #b48bf0;
+    --free: #7fc0e8;
+    --empty: #e0c473;
+    --mark: rgba(150,150,240,.95);
+    --markline: rgba(150,150,240,.45);
+    --rest: rgba(150,158,166,.24);
+    --rule: rgba(200,205,210,.40);
+    --band: rgba(120,160,255,.20);
+    --rowline: #23272e;
+    --hover: #1b1f25;
+    --detail: #191d22;
+    --tag-bg: #22303f;
+    --tag-ink: #a8c6e4;
+    --tag-line: #2f4257;
+    --acc: #6ea8fe;
+    --inl: #b794f6;
+    --hit-bg: #6b5a12;
+    --hit-ink: #f3e8c0;
+    --kw: #7cb7ff;
+    --ns: #9aa4b0;
+    --arg: #79838f;
+    --pn: #7d8894;
+    --lang-c: #4fd1a5;
+    --lang-cpp: #9aa0ff;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #15181c;
+  --ink: #dde1e6;
+  --dim: #949ba4;
+  --line: #2b3038;
+  --head: #1c2026;
+  --hot: #1e3a5c;
+  --hot2: #4a2f22;
+  --sel: #24405e;
+  --warn-bg: #2a2416;
+  --warn-line: #d6a93a;
+  --warn-ink: #e8cf8a;
+  --grid: rgba(150,158,166,.16);
+  --axis: rgba(148,155,164,.85);
+  --live: #4fd1a5;
+  --comm: #e8a06a;
+  --region: #b48bf0;
+  --free: #7fc0e8;
+  --empty: #e0c473;
+  --mark: rgba(150,150,240,.95);
+  --markline: rgba(150,150,240,.45);
+  --rest: rgba(150,158,166,.24);
+  --rule: rgba(200,205,210,.40);
+  --band: rgba(120,160,255,.20);
+  --rowline: #23272e;
+  --hover: #1b1f25;
+  --detail: #191d22;
+  --tag-bg: #22303f;
+  --tag-ink: #a8c6e4;
+  --tag-line: #2f4257;
+  --acc: #6ea8fe;
+  --inl: #b794f6;
+  --hit-bg: #6b5a12;
+  --hit-ink: #f3e8c0;
+  --kw: #7cb7ff;
+  --ns: #9aa4b0;
+  --arg: #79838f;
+  --pn: #7d8894;
+  --lang-c: #4fd1a5;
+  --lang-cpp: #9aa0ff;
 }
 
 * { box-sizing: border-box; }
@@ -69,7 +217,9 @@ button, .seg button {
   font: 12px var(--ui);
   padding: 4px 10px;
   border: 1px solid var(--line);
-  background: #fff;
+  /* Del tema y no un blanco escrito: un boton blanco sobre papel oscuro es lo
+     unico que se ve de la pagina, y lo que se ve es justo lo que sobra. */
+  background: var(--bg);
   color: var(--ink);
   border-radius: 4px;
   cursor: pointer;
@@ -79,26 +229,71 @@ button:hover { background: var(--head); }
 .seg button { border-radius: 0; margin-left: -1px; }
 .seg button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
 .seg button:last-child { border-radius: 0 4px 4px 0; }
-.seg button.on { background: var(--sel); border-color: #93c5fd; }
+.seg button.on { background: var(--sel); border-color: var(--acc); }
 
 input[type=search] {
   font: 12px var(--ui);
   padding: 4px 8px;
   border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
   border-radius: 4px;
   min-width: 260px;
 }
+/* Que los controles del sistema -- el desplegable, la casilla -- se dibujen en
+   el mismo tema.  Sin esto salen en claro sobre el papel oscuro. */
+select, input[type=checkbox] { color-scheme: light dark; }
 .chk { font-size: 12px; color: var(--dim); display: inline-flex; gap: 4px; }
 
-.warn {
+/* El bloque entero pliega.  Cerrado es UNA linea; abierto son las que haya.
+   Ver la nota de `i18n.js`: plegado no es escondido mientras el resumen diga
+   cuantos hay y de que tipo. */
+.warnbox {
   margin: 8px 0 0;
+  border: 1px solid var(--warn-line);
+  background: var(--warn-bg);
+  border-radius: 4px;
+}
+.warnbox > summary {
   padding: 5px 10px;
+  color: var(--warn-ink);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.warnbox[open] > summary { border-bottom: 1px solid var(--warn-line); }
+
+.warn {
+  margin: 0;
+  padding: 4px 10px 4px 22px;
+  color: var(--warn-ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+/* Un HUECO del nivel no es un aviso: aquello se intento y no cupo, esto ni se
+   mira.  Se distinguen en la lista para no leerlos como lo mismo. */
+.warn.gap { opacity: .8; font-style: italic; }
+
+/* QUE ESTABA MAL.  Comparte los colores de aviso a proposito -- es la misma
+   familia de mensaje, "esto merece tu atencion" -- pero con mas cuerpo: un
+   hallazgo no es una nota al pie, y el reparto de memoria de abajo solo importa
+   despues de haberlos leido.  Un DEMOSTRADO se marca mas fuerte que un
+   SOSPECHADO porque no son la misma afirmacion. */
+.verdicts { margin: 14px 0 0; }
+.verdicts h2 { margin: 0 0 6px; font-size: 13px; }
+.verdict {
+  margin: 6px 0 0;
+  padding: 7px 10px;
   border: 1px solid var(--warn-line);
   background: var(--warn-bg);
   color: var(--warn-ink);
+  border-left-width: 4px;
   border-radius: 4px;
   font-size: 12px;
 }
+.verdict.proven { border-left-color: var(--warn-ink); }
+.verdict .vkind { font-weight: 700; letter-spacing: .02em; }
+.verdict .vwhere { margin-top: 3px; opacity: .85; font-size: 11px; }
 
 /* -- tabs ---------------------------------------------------------------- */
 .tabs { display: flex; gap: 2px; margin-top: 9px; }
@@ -138,11 +333,11 @@ th {
   user-select: none;
 }
 th.n { text-align: right; }
-th .dir { color: #2563eb; }
+th .dir { color: var(--acc); }
 
 td {
   padding: 2px 8px;
-  border-bottom: 1px solid #f2f4f6;
+  border-bottom: 1px solid var(--rowline);
   vertical-align: top;
   white-space: nowrap;
 }
@@ -178,7 +373,7 @@ td.dimmed, .dim { color: var(--dim); }
    entero en dos lineas antes que a medias en una. */
 .off { max-width: var(--off); }
 
-tbody tr:hover td { background: #f8fafc; }
+tbody tr:hover td { background: var(--hover); }
 tbody tr.sel td { background: var(--sel); }
 
 /* The bar lives BEHIND the number instead of in a column of its own: a shape
@@ -203,8 +398,8 @@ td.bar span { position: relative; z-index: 1; }
   font-family: var(--mono);
 }
 .tog.leaf { cursor: default; color: transparent; }
-.inl { color: #7c3aed; }              /* inlined into the next frame */
-.hit { background: #fde68a; border-radius: 2px; }
+.inl { color: var(--inl); }              /* inlined into the next frame */
+.hit { background: var(--hit-bg); color: var(--hit-ink); border-radius: 2px; }
 
 /* -- symbols ---------------------------------------------------------------
    Nothing is hidden or shortened here: what changes is WEIGHT.  The name the
@@ -212,16 +407,16 @@ td.bar span { position: relative; z-index: 1; }
    arguments and its parameter list stay legible and step back, so a
    four-hundred-character symbol can be scanned instead of deciphered. */
 .id { font-weight: 600; color: var(--ink); }
-.kw { color: #0550ae; }                  /* void, const, unsigned...        */
-.ns { color: #55606d; }                  /* namespaces and qualifiers       */
-.arg { color: #97a1ad; }                 /* inside <> and ()                */
-.pn { color: #8b96a5; }                  /* :: , * & and the rest           */
+.kw { color: var(--kw); }                  /* void, const, unsigned...        */
+.ns { color: var(--ns); }                  /* namespaces and qualifiers       */
+.arg { color: var(--arg); }                 /* inside <> and ()                */
+.pn { color: var(--pn); }                  /* :: , * & and the rest           */
 
 /* The LANGUAGE of the code, on the name it is called by and on its module.
    "Who allocated this" reads very differently when the answer is a C library
    carried inside the project and when it is the C++ standard library. */
-.lang-c, .id.lang-c { color: #0f766e; }        /* C   -- teal              */
-.lang-cpp, .id.lang-cpp { color: #4338ca; }    /* C++ -- indigo            */
+.lang-c, .id.lang-c { color: var(--lang-c); }        /* C   -- teal              */
+.lang-cpp, .id.lang-cpp { color: var(--lang-cpp); }    /* C++ -- indigo            */
 
 /* What a count INHERITED when it evicted a weaker entry.  Beside the number
    and never inside it: the total is a floor, the two together a ceiling. */
@@ -241,7 +436,9 @@ select {
   padding: 3px 6px;
   border: 1px solid var(--line);
   border-radius: 4px;
-  background: #fff;
+  /* Del tema: en oscuro, un desplegable blanco con texto claro dentro no se
+     lee -- y es donde estan los controles que gobiernan la pagina entera. */
+  background: var(--bg);
   color: var(--ink);
 }
 
@@ -254,9 +451,9 @@ select {
   padding: 0 5px;
   margin-right: 3px;
   border-radius: 8px;
-  background: #eef2f7;
-  color: #33507a;
-  border: 1px solid #dbe3ee;
+  background: var(--tag-bg);
+  color: var(--tag-ink);
+  border: 1px solid var(--tag-line);
 }
 
 /* -- the panel that follows the selection --------------------------------- */
@@ -265,7 +462,7 @@ select {
   padding: 8px 14px 12px;
   max-height: 38vh;
   overflow: auto;
-  background: #fcfdfe;
+  background: var(--detail);
 }
 #detail h2 {
   font-size: 11px;
@@ -311,6 +508,19 @@ select {
 .pbar b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .pbar em { color: var(--dim); font-style: normal; width: 46px; text-align: right; }
 
+/* Por cuenta o por bytes, en el encabezado del histograma de la rama.  Dos
+   enlaces y no un desplegable: son dos, se ve cual esta puesto sin abrir nada,
+   y cambia lo que se DIBUJA, no lo que se lista. */
+.szpick { margin-left: 10px; font-size: 11px; font-weight: normal; }
+.szpick a {
+  color: var(--dim);
+  text-decoration: none;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.szpick a.on { color: var(--fg); background: var(--hot); }
+.szpick a:hover { text-decoration: underline; }
+
 .wrap.grid { max-height: calc(62vh - 90px); }
 .wrap.sm { max-height: 30vh; }
 
@@ -320,3 +530,113 @@ select {
 #p-raw .row { padding: 0 14px 4px; }
 
 .empty { padding: 14px; color: var(--dim); }
+
+/* -- el eje del tiempo ------------------------------------------------------
+ * \~english Its own block and not a variant of the tree's: a chart is a box
+ * with a canvas that has to resize with the window, and the grid is a table
+ * that scrolls.  Sharing the rules between them is how one of the two ends up
+ * with a scrollbar nobody asked for.
+ *
+ * AND EVERY LIST HERE HAS A CEILING, which is the opposite of the rule the top
+ * of this file states for the grid.  The reason it flips: those are rows a
+ * reader goes through, and these are controls AROUND the drawing -- a legend
+ * that grows to forty chips pushes the chart off the screen, and then the
+ * controls have eaten the thing they control.
+ *
+ * \~spanish Bloque propio y no una variante del arbol: un grafico es una caja
+ * con un lienzo que tiene que redimensionarse con la ventana, y la rejilla es
+ * una tabla que se desplaza.  Compartirles las reglas es como uno de los dos
+ * acaba con una barra de desplazamiento que nadie pidio.
+ *
+ * Y AQUI TODA LISTA LLEVA TOPE, que es lo contrario de lo que dice la cabecera
+ * de este fichero para la rejilla.  Por que cambia: alli son filas que uno
+ * recorre, y aqui son controles ALREDEDOR del dibujo -- una leyenda que crece
+ * a cuarenta fichas empuja el grafico fuera de la pantalla, y entonces los
+ * controles se han comido lo que controlan.  \~ */
+#p-time .bar-tools { padding: 8px 14px; }
+.chartbox { position: relative; margin: 0 14px; }
+.chartbox canvas { display: block; width: 100%; cursor: grab; }
+.chartbox canvas:active { cursor: grabbing; }
+/* LA CAJA SE ESTIRA.  `resize` es del navegador -- ni un evento que programar --
+   y `overflow:auto` es lo que hace que la rejilla, que se hace tan alta como
+   bandas haya, se pueda recorrer dentro en vez de empujar la pagina. */
+.chartbox { position: relative; height: 380px; min-height: 200px;
+            resize: vertical; overflow: auto; }
+.chartbox .zoom { position: absolute; right: 14px; top: 6px; z-index: 4;
+                  display: flex; gap: 4px; }
+.chartbox .zoom button { font-size: 11px; padding: 1px 7px; line-height: 1.5; }
+
+.tip { position: absolute; display: none; z-index: 5; pointer-events: none;
+       background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+       padding: 6px 8px; font-size: 11px; width: 330px;
+       box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+.tip .h { color: var(--dim); margin-bottom: 4px; }
+.tip table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+.tip td { padding: 1px 0; vertical-align: top; overflow: hidden;
+          text-overflow: ellipsis; white-space: nowrap; }
+.tip td.n { text-align: right; width: 74px; padding-left: 8px;
+            font-variant-numeric: tabular-nums; }
+.tip tr.rest td { color: var(--dim); font-style: italic; }
+.tip i, .legend i, .picker i { display: inline-block; width: 8px; height: 8px;
+                               border-radius: 2px; margin-right: 5px;
+                               flex: none; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px 0;
+          max-height: 84px; overflow: auto; }
+.legend .lg { display: inline-flex; align-items: center; gap: 6px;
+              font-size: 11px; max-width: 28ch; }
+.legend .lg .w { color: var(--dim); font-variant-numeric: tabular-nums;
+                 flex: none; }
+.legend .lg .sym { overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; }
+
+/* El selector: una lista con tope y barra propia.  Es lo unico de este panel
+   que puede tener cientos de filas, asi que es lo unico que se desplaza. */
+.picker { margin: 8px 14px 14px; border: 1px solid var(--line);
+          border-radius: 6px; max-height: 210px; overflow: auto;
+          display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.picker .pk { display: flex; align-items: center; gap: 6px; font-size: 11px;
+              padding: 3px 8px; cursor: pointer; min-width: 0; }
+.picker .pk:hover { background: var(--head); }
+.picker .pk .sym { overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; flex: 1 1 auto; min-width: 0; }
+.picker .pk .w { color: var(--dim); font-variant-numeric: tabular-nums;
+                 flex: none; }
+.picker .pk .path { color: var(--dim); flex: none; max-width: 18ch;
+                    overflow: hidden; text-overflow: ellipsis;
+                    white-space: nowrap; }
+.picker .stat { padding: 4px 8px; }
+
+/* La cadena de llamadas de una serie.  Una caja y no un globo: se lee, se
+   compara y a veces se copia, y un globo que desaparece al mover el raton no
+   deja hacer ninguna de las tres. */
+.stackbox:empty { display: none; }
+.stackbox { margin: 8px 14px; border: 1px solid var(--line); border-radius: 6px;
+            background: var(--detail); padding: 8px 10px; font-size: 11px;
+            max-height: 280px; overflow: auto; }
+.stackbox .h { display: flex; align-items: center; gap: 6px;
+               margin-bottom: 6px; }
+.stackbox .h .x { margin-left: auto; padding: 0 7px; line-height: 1.4; }
+.stackbox .one { margin: 6px 0 0; }
+.stackbox .sh { color: var(--dim); font-variant-numeric: tabular-nums; }
+.stackbox ol.chain { list-style: none; margin: 2px 0 0; padding: 0 0 0 4px; }
+.stackbox ol.chain li { padding: 1px 0 1px 10px;
+                        border-left: 2px solid var(--line); }
+/* De fuera hacia dentro, y sangrando: la forma dice quien esta dentro de quien
+   sin tener que contar lineas. */
+.stackbox ol.chain li + li { margin-left: 10px; }
+.stackbox ol.chain li.lib { opacity: .62; }
+.stackbox ol.chain li.instr, .stackbox ol.chain li.start { opacity: .45; }
+.stackbox ol.chain li .path { color: var(--dim); margin-left: 8px; }
+/* El reparto por fichero de una banda.  Va arriba del todo y en columnas: es
+   lo primero que se mira al abrir una banda de forma o de vida -- la pregunta
+   ahi es a que codigo ir --, y en columnas los pesos se comparan de un vistazo
+   en vez de leerse uno a uno. */
+.stackbox .files { margin-bottom: 8px; }
+.stackbox .files ol { list-style: none; margin: 2px 0 0; padding: 0; }
+.stackbox .files li { display: flex; gap: 10px; align-items: baseline;
+                      padding: 1px 0; }
+.stackbox .files li .n { min-width: 72px; text-align: right;
+                         font-variant-numeric: tabular-nums; }
+.stackbox .files li .path { flex: 1; overflow: hidden;
+                            text-overflow: ellipsis; white-space: nowrap; }
