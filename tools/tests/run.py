@@ -27,6 +27,7 @@ TOOLS = os.path.dirname(HERE)
 sys.path.insert(0, TOOLS)
 
 import test_model                                   # noqa: E402
+import test_query                                   # noqa: E402
 from alloc_tree.page import _payload                # noqa: E402
 
 FAILURES = [0]
@@ -95,6 +96,8 @@ def main():
         check_sources_are_text()
         print(" -- el modelo")
         report = test_model.run(tmp, say)
+        print(" -- las consultas")
+        test_query.run(tmp, say)
         print(" -- la pagina")
         run_js(report, tmp)
     finally:

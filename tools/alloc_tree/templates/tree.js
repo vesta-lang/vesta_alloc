@@ -24,6 +24,12 @@
 'use strict';
 
 var F_FN = 0, F_FILE = 1, F_LINE = 2, F_MOD = 3, F_INLINED = 4, F_LIB = 5;
+/* Las dos puntas: el aparato de medida por dentro y la entrada del sistema al
+ * hilo por fuera.  Ver `ours.py`, que es donde se decide y por que. */
+var F_INSTR = 6, F_START = 7;
+
+/// Ni biblioteca, ni instrumento: los marcos por los que el filtro se para.
+function isMine(f) { return !f[F_LIB] && !f[F_INSTR] && !f[F_START]; }
 
 /*
  * WHICH POPULATION IS ON SCREEN.  An export can carry two, and they are not
@@ -35,7 +41,28 @@ var F_FN = 0, F_FILE = 1, F_LINE = 2, F_MOD = 3, F_INLINED = 4, F_LIB = 5;
  * `VIEW` and not `DATA`, which is what keeps a second renderer -- and the
  * drift that comes with it -- from ever being needed.
  */
-var VIEW = DATA;
+/* \~english AND THE CHECKER'S IS THE ONE THAT OPENS, when the export carried
+ * one.  Not because it is more complete -- it is not, it covers what its
+ * shadow reached -- but because it is the one that ANSWERS: the allocator's
+ * keeps one return address per site, so an allocation made inside a shared
+ * out-of-line body names the container and never its owner.  Opening on the
+ * population that cannot answer the first question a reader has means the
+ * answer is behind a control most readers will not touch.
+ *
+ * The other one is one click away and the control says what each is, so
+ * nothing is hidden -- what changes is which of the two has to be asked for.
+ *
+ * \~spanish Y LA DEL COMPROBADOR ES LA QUE ABRE, cuando el volcado trajo una.
+ * No porque sea mas completa -- no lo es, cubre lo que su sombreado alcanzo --
+ * sino porque es la que CONTESTA: la del asignador guarda una direccion de
+ * retorno por sitio, asi que una reserva hecha dentro de un cuerpo compartido
+ * fuera de linea nombra al contenedor y jamas a su dueno.  Abrir en la
+ * poblacion que no puede contestar la primera pregunta que trae quien lee es
+ * dejar la respuesta detras de un control que casi nadie va a tocar.
+ *
+ * La otra esta a un clic y el control dice lo que es cada una, asi que no se
+ * esconde nada -- lo que cambia es cual de las dos hay que pedir.  \~ */
+var VIEW = DATA.check || DATA;
 
 /**
  * Switch population.  The cache is dropped rather than keyed by dataset: the
@@ -77,7 +104,7 @@ function ownChain(site, chain, scope) {
   if (scope === 'extern') {
     if (site.foreign) return chain;
     if (!chain.length) return null;
-    return VIEW.frames[chain[0]][F_LIB] ? chain : null;
+    return isMine(VIEW.frames[chain[0]]) ? null : chain;
   }
 
   // Another module entirely -- the C runtime, a system library.  This one is
@@ -85,13 +112,28 @@ function ownChain(site, chain, scope) {
   if (site.foreign) return null;
   if (!chain.length) return chain;
   if (scope === 'hide')
-    return VIEW.frames[chain[0]][F_LIB] ? null : chain;
-  for (var i = 0; i < chain.length; i++)
-    if (!VIEW.frames[chain[i]][F_LIB]) return chain.slice(i);
-  // All the way out and still library code: there is nobody to hang it on.
+    return isMine(VIEW.frames[chain[0]]) ? chain : null;
+
+  /* PLEGAR LAS DOS PUNTAS, no solo la de dentro.
+   *
+   * Hasta aqui se salia hacia fuera hasta el primer marco del autor, que
+   * resuelve el extremo interior -- la biblioteca, y ahora tambien el propio
+   * asignador, que el comprobador pone en las 9.542 pilas por igual.  El
+   * extremo EXTERIOR tenia el mismo problema por el otro lado: de fuera hacia
+   * dentro toda cadena arranca con siete marcos de como el sistema entro en el
+   * hilo, asi que el arbol de arriba abajo tampoco se separaba hasta el
+   * septimo nivel.
+   *
+   * Se recorta, no se borra: 'todo' sigue ensenando la cadena entera, que es
+   * la medida.  Esto es una forma de MIRAR. */
+  var lo = 0, hi = chain.length;
+  while (lo < hi && !isMine(VIEW.frames[chain[lo]])) lo++;
+  while (hi > lo && !isMine(VIEW.frames[chain[hi - 1]])) hi--;
+  // All the way out and still nobody's: there is nothing to hang it on.
   // Inventing a parent would put the allocation under a function that never
   // asked for it.
-  return null;
+  if (lo >= hi) return null;
+  return chain.slice(lo, hi);
 }
 
 /**
@@ -176,6 +218,11 @@ function makeNode(fn, file, line, mod, inlined) {
            // BRANCH answer "many small or a few large": the process-wide
            // histogram cannot be handed back out to the sites that formed it.
            sizes: {},
+           // bucket -> BYTES, summed the same way.  Apart from the counts and
+           // never derived from them: a bucket holds a range, so a count gives
+           // an interval and the last bucket -- the one that decides the peak
+           // -- has no ceiling to bound it with at all.
+           sizeBytes: {},
            sites: [], tags: {}, kidsBy: {}, kids: [], parent: null,
            keep: true, selfHit: false };
 }
@@ -185,13 +232,47 @@ function groupNode(site, chain, how) {
   if (how === 'purpose') {
     return makeNode(site.tag || '(sin declarar)', '', 0, '', 0);
   }
-  /* The OUTERMOST frame is the one that exists in the binary, so its module
-   * and its file are whose code ASKED -- which is the question.  The innermost
-   * would answer `std::string`, which is true and useless. */
-  for (var i = chain.length - 1; i >= 0; i--) {
+  /* \~english THE FIRST FRAME THE AUTHOR WROTE, walking OUT of the library
+   * code -- the same rule `timeOwnFrame` and the query mode follow, so the
+   * three views name the same site the same way.
+   *
+   * IT USED TO BE THE OUTERMOST ONE, and that was wrong in a way that only
+   * showed up with a deep stack walk: the further out you go, the more that
+   * frame looks like how the system entered the thread, which is the same for
+   * the whole program and tells nothing apart.  Measured on a compile of
+   * 144.000 lines with eight frames walked, 7.536 of 8.611 sites changed
+   * module -- 61% of them landing under `KERNEL32.DLL`, `ntdll.dll` or the C
+   * runtime's start-up.  Grouping by module answered, and said nothing.
+   *
+   * With no frame of the author's, the innermost is used: a stack that is
+   * genuinely all library code belongs to that library, not to the thread's
+   * entry point.
+   *
+   * \~spanish EL PRIMER MARCO QUE ESCRIBIO EL AUTOR, saliendo de la libreria
+   * hacia fuera -- la misma regla que siguen `timeOwnFrame` y el modo consulta,
+   * para que las tres vistas nombren igual al mismo sitio.
+   *
+   * ERA EL DE MAS AFUERA, y estaba mal de una forma que solo se veia con un
+   * recorrido de pila profundo: cuanto mas lejos se va, mas se parece ese marco
+   * a como entro el sistema en el hilo, que es el mismo para todo el programa y
+   * no distingue nada.  Medido en una compilacion de 144.000 lineas con ocho
+   * marcos recorridos, 7.536 de 8.611 sitios cambiaban de modulo -- el 61% de
+   * ellos cayendo bajo `KERNEL32.DLL`, `ntdll.dll` o el arranque del CRT.
+   * Agrupar por modulo contestaba, y no decia nada.
+   *
+   * Sin ningun marco del autor se usa el de mas adentro: una pila que de verdad
+   * es toda libreria es de esa libreria, no del arranque del hilo.  \~ */
+  var owner = null;
+  for (var i = 0; i < chain.length; i++) {
     var f = VIEW.frames[chain[i]];
-    if (how === 'module' && f[F_MOD]) return makeNode(f[F_MOD], '', 0, f[F_MOD], 0);
-    if (how === 'file' && f[F_FILE]) return makeNode(f[F_FILE], f[F_FILE], 0, f[F_MOD], 0);
+    if (isMine(f)) { owner = f; break; }
+  }
+  if (!owner && chain.length) owner = VIEW.frames[chain[0]];
+  if (owner) {
+    if (how === 'module' && owner[F_MOD])
+      return makeNode(owner[F_MOD], '', 0, owner[F_MOD], 0);
+    if (how === 'file' && owner[F_FILE])
+      return makeNode(owner[F_FILE], owner[F_FILE], 0, owner[F_MOD], 0);
   }
   return makeNode(how === 'module' ? '(sin clasificar)' : '(sin fichero)',
                   '', 0, '', 0);
@@ -236,15 +317,29 @@ function accum(node, site) {
   addTag(node, site.tag, site.allocs);
   for (var b in site.sizes)
     node.sizes[b] = (node.sizes[b] || 0) + site.sizes[b];
+  for (var bb in site.sizeBytes)
+    node.sizeBytes[bb] = (node.sizeBytes[bb] || 0) + site.sizeBytes[bb];
 }
 
-/// The size split of a branch, biggest bucket first, with its bound.
+/**
+ * The size split of a branch, with its bound, counted AND weighed.
+ *
+ * The two together and not one or the other, because they answer opposite
+ * questions about the same rows and the reader switches between them: by count
+ * the last bucket of a real run is thirty-three out of ninety million, and by
+ * bytes it is an eighth of everything the program asked for.
+ *
+ * `bytes` is zero when the export has no such column, which is what an older
+ * one looks like.  The caller checks `VIEW.hasSizeBytes` before offering the
+ * view: a bar of zero and "there is no measurement" must not look the same.
+ */
 function sizesOf(node) {
   var out = [];
   for (var i = 0; i < VIEW.buckets.length; i++) {
     var b = VIEW.buckets[i][0];
     if (node.sizes[b]) out.push({ b: b, upper: VIEW.buckets[i][1],
-                                  n: node.sizes[b] });
+                                  n: node.sizes[b],
+                                  bytes: node.sizeBytes[b] || 0 });
   }
   return out;
 }
@@ -283,8 +378,37 @@ function treeFor(dir, grouping, scope, lang) {
    * escribio: una vista de "solo C" vacia se leeria como "aqui no hay C"
    * cuando lo que falta es con que saberlo. */
   root.noLang = 0;
+  /* \~english WHAT THE REPORT SPENT ON ITSELF, out of the tree at every scope
+   * and counted here.  This is NOT the scope filter: folding the standard
+   * library away is a way of LOOKING and the reader decides it, while the
+   * measuring apparatus is simply not part of what it measures.  Leaving it in
+   * made it the biggest branch of the tree -- 1.253 MB of 1.961 on a 24k-line
+   * compile, 63,9 % of the bytes, more than the program -- so the first thing
+   * anybody saw was the report reading DWARF to write the report.
+   *
+   * Out, and SAID: the figure is on the status line.  Quantifiable and
+   * subtractable is the rule; declared away is not.
+   *
+   * \~spanish LO QUE EL INFORME SE GASTO EN SI MISMO, fuera del arbol en todos
+   * los alcances y contado aqui.  Esto NO es el filtro de alcance: plegar la
+   * biblioteca estandar es una forma de MIRAR y la decide quien lee, mientras
+   * que el aparato de medida sencillamente no es parte de lo que mide.
+   * Dejarlo dentro lo convertia en la rama mas grande del arbol -- 1.253 MB de
+   * 1.961 en una compilacion de 24k lineas, el 63,9 % de los bytes, mas que el
+   * programa --, asi que lo primero que veia cualquiera era el informe leyendo
+   * DWARF para escribir el informe.
+   *
+   * Fuera, y DICHO: la cifra va en la linea de estado.  La regla es
+   * cuantificable y restable; declarado inexistente no.  \~ */
+  root.instr = 0;
+  root.instrBytes = 0;
   for (var s = 0; s < VIEW.sites.length; s++) {
     var site = VIEW.sites[s];
+    if (site.instr) {
+      root.instr += site.allocs;
+      root.instrBytes += site.bytes;
+      continue;
+    }
     var chain = ownChain(site, site.chain, scope);
     /* El idioma se mira SOBRE lo que el ambito dejo, no sobre la cadena
      * entera: si el ambito plego hacia fuera, la funcion que reserva es otra,

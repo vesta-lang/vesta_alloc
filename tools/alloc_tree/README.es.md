@@ -107,6 +107,90 @@ diferencia entre los dos.
 | `--out FILE` | donde escribir la pagina |
 | `--no-open` | escribirla y no abrir el navegador |
 
+## Preguntarle a las tablas
+
+El arbol contesta "quien reserva". La otra mitad de las preguntas que se le
+hacen a una medicion no es un dibujo sino una consulta — los cortes donde la
+holgura fue peor, los sitios de un modulo ordenados por bytes, en que tabla
+aparece un simbolo — y eso se acababa contestando con un `python -c` distinto
+cada vez.
+
+```sh
+# que tablas hay, con sus columnas
+python -m alloc_tree /tmp/corrida --tables
+
+# los cortes con mas memoria guardada y sin entregar
+python -m alloc_tree /tmp/corrida --table epochs \
+    --cols 'epoch,mark,mib(live_bytes) as vivo,mib(region_bytes-live_bytes) as holgura' \
+    --sort=-holgura
+
+# los sitios de un modulo, por bytes, con el nombre de quien los pidio
+python -m alloc_tree /tmp/corrida --table sites --where 'module=="ir"' \
+    --cols 'func,where,allocs,mib(bytes) as mib' --sort=-mib
+
+# los bytes por modulo
+python -m alloc_tree /tmp/corrida --table sites --group-by module \
+    --cols 'allocs,mib(bytes) as mib' --sort=-mib
+
+# donde aparece esto, en todas las tablas a la vez
+python -m alloc_tree /tmp/corrida --grep VelNodeStream
+```
+
+| | |
+| :--- | :--- |
+| `--tables` | que tablas hay, sus columnas y las que se **pegan** al cruzar los marcos |
+| `--table N` | consultar esa tabla; vale la abreviatura (`epochs` por `check_epochs.csv`) |
+| `--where E` | quedarse con las filas que cumplan la expresion |
+| `--cols E` | columnas de salida, con `expresion as nombre` |
+| `--group-by E` | agrupar por eso y **sumar** las columnas numericas |
+| `--sort=-COL` | ordenar por una columna de SALIDA; el `-` la invierte, y va pegado con `=` |
+| `--rows N` | cuantas filas ensenar (0 = todas) |
+| `--csv` | sacarlo como CSV, para encadenarlo |
+
+Dentro de una expresion hay `kib()`, `mib()`, `gib()`, `pct(parte, total)`,
+`like(texto, patron)` y `has(texto, trozo)`, ademas de los operadores de
+siempre.
+
+**Las columnas pegadas** son la razon de que esto sea util: a una fila con un
+sitio se le anaden `func`, `inner`, `outer`, `file`, `where`, `module` y
+`chain`. Sin ellas, una consulta devuelve un `site_id` y hay que ir a buscarlo a
+otro fichero.
+
+`func` es **el primer marco que escribio el autor**, saliendo de la libreria
+hacia fuera — la misma regla que usa la pagina y que usa el arbol al plegar: una
+reserva hecha a traves de `std::vector` ES nuestra, lo que no es nuestro es el
+marco de dentro. `inner` es el de mas adentro (contesta `std::string`, cierto e
+inutil) y `outer` el de mas afuera.
+
+**`outer` no sirve para atribuir, y se midio**: con el, subir la profundidad del
+recorrido de pila de 4 a 16 movia el pico de `vx::Lowering::emit` a
+`RtlUserThreadStart`. Cuanto mas lejos se camina, mas se parece el marco de
+fuera al arranque del hilo — que es el mismo para todo el programa y por tanto
+no distingue nada. Con MAS datos, peor respuesta.
+
+Y se cruzan contra **la poblacion que toca**: las tablas del asignador contra
+`frames.csv` y las del comprobador contra `check_frames.csv`. Son dos
+poblaciones distintas — una direccion de retorno contra una pila recorrida — y
+mezclarlas contestaria otra pregunta.
+
+### Las tres trampas, resueltas una vez
+
+Son las que un guion escrito a mano se come en silencio:
+
+- **Una celda vacia es NULO, no cero.** Las tablas lo usan a proposito: en
+  `check_sizes.csv` lo vivo va vacio cuando la corrida no pudo saberlo, y un
+  cero ahi se leeria como "este tamano no se queda nada". Un nulo no suma, no
+  ordena y no casa — y se **cuenta**, para que el pie diga cuantas filas no se
+  pudieron juzgar en vez de dejarlas fuera sin avisar.
+- **Los numeros se comparan como numeros.** Ordenando por texto, `640` va por
+  delante de `40000`.
+- **Los nulos se ordenan al final**, se pida el orden que se pida: encabezar
+  una tabla de mayor a menor con las filas de las que no se sabe nada es lo
+  contrario de lo que se pidio.
+
+De aqui **no sale ningun numero que no salga de la exportacion**: una columna
+calculada es una cuenta sobre lo que hay.
+
 ## Una construccion sin simbolos
 
 Una construccion despojada — `Release` — no tiene tabla de simbolos ni

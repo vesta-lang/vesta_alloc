@@ -18,6 +18,7 @@ TWO DIRECTIONS, and they answer different questions:
 The page builds its own copy of this in the browser, so flipping the direction
 costs nothing there.  This one serves `--text`, and is what the tests exercise.
 """
+from .ours import owning_frame
 from .report import Frame
 
 
@@ -75,18 +76,20 @@ def group_frame(site, chain, how):
     there before.  A grouping that rebuilt the tree differently would make the
     two views impossible to compare.
     """
+    # EL PRIMER MARCO QUE ESCRIBIO EL AUTOR, saliendo de la libreria hacia
+    # fuera.  La misma regla que la pagina (`groupNode`) y que el modo consulta,
+    # y por la misma razon medida: con el marco de MAS AFUERA, y un recorrido de
+    # pila profundo, 7.536 de 8.611 sitios acababan bajo `KERNEL32.DLL`,
+    # `ntdll.dll` o el arranque del CRT -- que es el mismo para todo el programa
+    # y por tanto no agrupa nada.
+    owner = owning_frame(chain) if chain else None
     if how == "module":
-        # The OUTERMOST frame is the one that exists in the binary, so its
-        # module is whose code asked -- which is the question.  The innermost
-        # would answer "std::string", which is true and useless.
-        for frame in reversed(chain):
-            if frame.module:
-                return Frame(frame.module, "", 0, False, frame.module)
+        if owner is not None and owner.module:
+            return Frame(owner.module, "", 0, False, owner.module)
         return Frame("(sin clasificar)", "", 0, False)
     if how == "file":
-        for frame in reversed(chain):
-            if frame.file:
-                return Frame(frame.file, frame.file, 0, False, frame.module)
+        if owner is not None and owner.file:
+            return Frame(owner.file, owner.file, 0, False, owner.module)
         return Frame("(sin fichero)", "", 0, False)
     if how == "purpose":
         return Frame(site.tag or "(sin declarar)", "", 0, False)

@@ -104,6 +104,87 @@ two impossible to see.
 | `--out FILE` | where to write the page |
 | `--no-open` | write it and do not launch a browser |
 
+## Asking the tables
+
+The tree answers "who allocates".  The other half of the questions put to a
+measurement is not a drawing but a query — the cuts where the slack was worst,
+the sites of one module by bytes, which table a symbol appears in — and that
+used to be answered with a different `python -c` every time.
+
+```sh
+# what tables there are, with their columns
+python -m alloc_tree /tmp/run --tables
+
+# the cuts holding the most memory that was never handed out
+python -m alloc_tree /tmp/run --table epochs \
+    --cols 'epoch,mark,mib(live_bytes) as live,mib(region_bytes-live_bytes) as slack' \
+    --sort=-slack
+
+# the sites of one module, by bytes, with the name of whoever asked
+python -m alloc_tree /tmp/run --table sites --where 'module=="ir"' \
+    --cols 'func,where,allocs,mib(bytes) as mib' --sort=-mib
+
+# the bytes per module
+python -m alloc_tree /tmp/run --table sites --group-by module \
+    --cols 'allocs,mib(bytes) as mib' --sort=-mib
+
+# where this appears, across every table at once
+python -m alloc_tree /tmp/run --grep VelNodeStream
+```
+
+| | |
+| :--- | :--- |
+| `--tables` | what tables there are, their columns, and the ones JOINED in |
+| `--table N` | query that table; an abbreviation will do (`epochs` for `check_epochs.csv`) |
+| `--where E` | keep the rows that satisfy the expression |
+| `--cols E` | output columns, with `expression as name` |
+| `--group-by E` | group by that and **sum** the numeric columns |
+| `--sort=-COL` | sort by an OUTPUT column; `-` reverses it, and it goes attached with `=` |
+| `--rows N` | how many rows to show (0 = all) |
+| `--csv` | print it as CSV, to pipe onwards |
+
+Inside an expression there are `kib()`, `mib()`, `gib()`, `pct(part, whole)`,
+`like(text, pattern)` and `has(text, piece)`, on top of the usual operators.
+
+**The joined columns** are what makes this useful: a row carrying a site gains
+`func`, `inner`, `outer`, `file`, `where`, `module` and `chain`.  Without them a
+query hands back a `site_id` and you go looking for it in another file.
+
+`func` is **the first frame the author wrote**, walking out of the library code
+-- the same rule the page uses and the one the tree folds by: an allocation made
+through `std::vector` IS ours, what is not ours is the innermost frame.  `inner`
+is the innermost one (it answers `std::string`, true and useless) and `outer`
+the outermost.
+
+**`outer` is no good for attribution, and that was measured**: with it, raising
+the stack walk from 4 frames to 16 moved the peak from `vx::Lowering::emit` to
+`RtlUserThreadStart`.  The further out you walk, the more that frame looks like
+the thread's entry point -- which is the same for the whole program and so tells
+nothing apart.  With MORE data, a worse answer.
+
+And they are joined against **the right population**: the allocator's tables
+against `frames.csv` and the checker's against `check_frames.csv`.  Those are
+two different populations — one return address against a walked stack — and
+mixing them would answer a different question.
+
+### The three traps, solved once
+
+They are the ones a hand-written script eats in silence:
+
+- **An empty cell is NULL, not zero.**  The tables use that on purpose: in
+  `check_sizes.csv` the live column is left empty when the run could not know
+  it, and a zero there would read as "this size keeps nothing".  A null does
+  not add up, does not sort and does not match — and it is **counted**, so the
+  footer says how many rows could not be judged instead of dropping them
+  without a word.
+- **Numbers compare as numbers.**  Sorted as text, `640` comes before `40000`.
+- **Nulls sort last**, whichever order was asked for: heading a table sorted
+  high-to-low with the rows nothing is known about is the opposite of what was
+  asked.
+
+**No number comes out of here that does not come out of the export**: a
+computed column is arithmetic over what is there.
+
 ## A build with no symbols
 
 A stripped build — `Release` — has no symbol table and no debug information,
