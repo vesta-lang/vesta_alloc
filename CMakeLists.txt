@@ -369,6 +369,9 @@ set(VESTA_ALLOC_SOURCES
         # El cable entre leerse a uno mismo y el gancho de la exportacion: con
         # una linea, el informe sale con nombres en vez de desplazamientos.
         src/symbols/self_resolver.cpp
+        # De que objeto sale cada tramo de codigo, del mapa del enlazador.
+        # Es lo unico que atribuye en un binario estripado.
+        src/symbols/link_map.cpp
         # La paridad para C: lo mismo que ve un programa en C++ lo ve uno en C.
         # El C++ de este proyecto LLAMA a codigo C y varias dependencias son C
         # puro, asi que una capacidad solo-C++ es una capacidad que la mitad
@@ -418,9 +421,90 @@ endif()
 # queda nada que mantener al dia.
 
 # -----------------------------------------------------------------------------
+#  Declarar un modulo DESDE EL BUILD
+# -----------------------------------------------------------------------------
+#
+# LA OTRA MITAD de `VESTA_ALLOC_MODULE_HERE`, y existe porque el reparto en
+# modulos ya esta decidido AQUI: un objetivo de CMake es exactamente un conjunto
+# de fuentes con un nombre, que es la definicion de modulo que hace falta.
+# Declararlo aqui no toca ni una linea de codigo.
+#
+# LAS DOS VIAS, y no una: esta no cuesta nada en un proyecto que use CMake, pero
+# ATA la clasificacion al sistema de construccion -- quien compile a mano, con
+# otro generador o incruste los fuentes se queda sin ella.  La linea en el
+# codigo viaja con el codigo.  Cualquiera de las dos vale, las dos juntas
+# tambien (gana la mas especifica, que es el directorio mas largo).
+#
+# Se genera un fichero minimo por objetivo en vez de pedir un `#include` en
+# alguno suyo: un objetivo no tiene "fichero principal" donde poner eso, y
+# elegirle uno seria dejar el registro en un sitio del que nadie se acuerda al
+# borrar ese fichero.
+# -----------------------------------------------------------------------------
+#  Que CADA FICHERO diga cual es, sin escribir una linea en ninguno
+# -----------------------------------------------------------------------------
+#
+# Fuerza `alloc_declare_tu.h` en todas las unidades del objetivo.  Ver esa
+# cabecera: `__BASE_FILE__` le dice a la cabecera en que `.cpp` esta, asi que
+# una sola linea aqui cubre los que haya y los que se anadan manana.
+#
+# POR QUE ASI Y NO UNA LINEA POR FICHERO.  Porque lo segundo se olvida, y un
+# fichero que se olvida no desaparece del informe: sus reservas caen en el
+# marcador del fichero anterior y salen con el nombre de aquel.  Una convencion
+# que puede fallar en silencio y atribuir mal no es una convencion.
+#
+# `-include` es de GCC y Clang; con MSVC seria `/FI`.  Si algun dia hace falta,
+# se anade aqui y no en setecientos ficheros, que es justo la ventaja.
+function(vesta_alloc_declare_files target)
+    target_include_directories(${target} PRIVATE
+                               "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include")
+    target_compile_options(${target} PRIVATE
+            -include "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include/util/report/alloc_declare_tu.h")
+endfunction()
+
+function(vesta_alloc_module target name)
+    # DONDE VIVE LO PREGUNTAMOS AL OBJETIVO, no a quien llama: `SOURCE_DIR` es
+    # el directorio donde se declaro, que es precisamente el modulo.  Asi esta
+    # funcion vale llamada desde cualquier sitio -- incluido el CMakeLists raiz,
+    # despues de todos los `add_subdirectory` -- y sigue sin haber una sola ruta
+    # escrita a mano.
+    get_target_property(_dir ${target} SOURCE_DIR)
+    if(NOT _dir)
+        message(FATAL_ERROR
+                "vesta_alloc_module: '${target}' no es un objetivo")
+    endif()
+    set(_gen "${CMAKE_CURRENT_BINARY_DIR}/vesta_alloc_module_${target}.c")
+    # `GENERATE` y no `configure_file` para que se rehaga si cambia algo.
+    file(GENERATE OUTPUT "${_gen}" CONTENT
+"/* GENERADO por vesta_alloc_module(): no editar.
+ * Dice que todo lo que cuelga del directorio de este objetivo es el modulo
+ * \"${name}\".  Ver `vesta_alloc_declare_module`. */
+#include \"util/report/alloc_csv_c.h\"
+
+__attribute__((constructor)) static void vesta_alloc_declare_${target}(void) {
+    vesta_alloc_declare_module(\"${_dir}\", \"${name}\");
+}
+")
+    target_sources(${target} PRIVATE "${_gen}")
+    target_include_directories(${target} PRIVATE
+                               "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include")
+endfunction()
+
+# -----------------------------------------------------------------------------
 #  El objetivo principal: objetos.  Ver la nota de arriba.
 # -----------------------------------------------------------------------------
 add_library(vesta_alloc OBJECT ${VESTA_ALLOC_SOURCES})
+
+# QUE ESTA LIBRERIA ESTA ENLAZADA, dicho enlazandola.
+#
+# Es la puerta de las macros que declaran modulo y fichero (ver
+# `alloc_csv_c.h`): sin esto no generan codigo, y asi un fichero puede llevar su
+# declaracion aunque acabe tambien en un binario que no tenga informe -- un test
+# que se lleva tres fuentes, o `libvesta_gc.a`, que solo puede depender de libc.
+#
+# PUBLIC y no PRIVATE: la define quien COMPILA contra esto, que es justo la
+# condicion que se quiere expresar.  Se probo antes con simbolos debiles y
+# reventaba en PE; el porque, entero, esta en `alloc_csv_c.h`.
+target_compile_definitions(vesta_alloc PUBLIC VESTA_ALLOC_LINKED=1)
 
 # Las cabeceras se incluyen como `util/alloc/host_allocator.h`.  El prefijo
 # `util/` se conserva porque es tambien el namespace (`util::`); lo que hay
@@ -706,7 +790,8 @@ if(VESTA_ALLOC_BUILD_TESTS)
                   test_alloc_sites test_span_race test_counters_agree
                   test_variants test_thread_slot test_scratch_arena
                   test_mem_ops test_host_layout test_call_site
-                  test_os_env test_alloc_csv test_module_symbols)
+                  test_os_env test_os_memory test_alloc_csv
+                  test_module_symbols test_chunk_reclaim)
     if(VESTA_ALLOC_INTERPOSE_MALLOC AND
        CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT MSVC)
         list(APPEND _va_tests test_malloc_interpose)

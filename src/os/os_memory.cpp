@@ -436,6 +436,40 @@ OsProcessMemory os_process_memory() noexcept {
     return m;
 }
 
+size_t os_range_memory(const void *base, size_t bytes) noexcept {
+    if (base == nullptr || bytes == 0) return 0;
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t end = begin + bytes;
+    size_t total = 0;
+
+    /* Se pregunta REGION a REGION, no pagina a pagina.  Cada respuesta trae el
+     * tamano del tramo entero que comparte estado, asi que un rango de 256 GiB
+     * apenas reservado se recorre en unas pocas consultas en vez de en sesenta
+     * y siete millones. */
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uintptr_t probe = begin; probe < end;) {
+        if (NtQueryVirtualMemory(VESTA_NT_SELF, reinterpret_cast<PVOID>(probe),
+                                 0 /* MemoryBasicInformation */, &mbi,
+                                 sizeof(mbi), nullptr) < 0)
+            break;
+        const uintptr_t region_begin =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        uintptr_t region_end = region_begin + mbi.RegionSize;
+        if (region_end <= probe) break; // sin avance: el sistema no sabe mas
+
+        if (mbi.State == MEM_COMMIT) {
+            /* Se cuenta solo la PARTE que cae dentro: la primera region suele
+             * empezar antes del rango y la ultima acabar despues. */
+            const uintptr_t from = probe > region_begin ? probe : region_begin;
+            const uintptr_t to = region_end < end ? region_end : end;
+            if (to > from) total += static_cast<size_t>(to - from);
+        }
+        probe = region_end;
+    }
+    return total;
+}
+
 OsSystemMemory os_system_memory() noexcept {
     OsSystemMemory m;
     MEMORYSTATUSEX st;
@@ -750,7 +784,160 @@ unsigned read_statm(uint64_t out[7]) noexcept {
     return got;
 }
 
+/**
+ * @brief Lector de lineas con buffer fijo, sin reservar nada.
+ *
+ * `/proc/self/smaps` son decenas de KiB de texto y hay que recorrerlo entero,
+ * pero no cabe de una lectura ni conviene que quepa: se lee por trozos y las
+ * lineas se van sacando de ahi.  Sin flujos y sin cadenas, por lo mismo que
+ * `read_statm`: esto tiene que poder llamarse desde un sitio sin memoria.
+ */
+struct LineReader {
+    int fd = -1;
+    char buf[4096];
+    size_t have = 0; // bytes validos en el buffer
+    size_t pos = 0;  // siguiente byte sin consumir
+
+    bool open_file(const char *path) noexcept {
+        fd = open(path, O_RDONLY);
+        return fd >= 0;
+    }
+
+    void close_file() noexcept {
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+
+    /**
+     * @brief Copia la siguiente linea, sin el salto, en `out`.
+     * @return false cuando se acabo el fichero.
+     *
+     * Una linea mas larga que `cap` se TRUNCA en vez de partirse en dos: las
+     * que interesan son cortas, y partir una daria una linea falsa que podria
+     * parecer otra cosa.
+     */
+    bool next(char *out, size_t cap) noexcept {
+        size_t n = 0;
+        for (;;) {
+            if (pos == have) {
+                const ssize_t r = read(fd, buf, sizeof(buf));
+                if (r <= 0) {
+                    out[n] = '\0';
+                    return n != 0;
+                }
+                have = size_t(r);
+                pos = 0;
+            }
+            const char c = buf[pos++];
+            if (c == '\n') {
+                out[n] = '\0';
+                return true;
+            }
+            if (n + 1 < cap) out[n++] = c;
+        }
+    }
+};
+
+/// Un digito hexadecimal, o 16 si no lo es.
+inline unsigned hex_digit(char c) noexcept {
+    if (c >= '0' && c <= '9') return unsigned(c - '0');
+    if (c >= 'a' && c <= 'f') return unsigned(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return unsigned(c - 'A') + 10;
+    return 16;
+}
+
+/**
+ * @brief Reconoce la cabecera de una region: `<inicio>-<fin> <permisos> ...`.
+ * @return false si la linea es un campo de la region anterior.
+ */
+bool parse_map_header(const char *line, uintptr_t *begin,
+                      uintptr_t *end) noexcept {
+    const char *p = line;
+    uintptr_t lo = 0;
+    unsigned digits = 0;
+    for (unsigned d; (d = hex_digit(*p)) < 16; ++p, ++digits)
+        lo = (lo << 4) | d;
+    if (digits == 0 || *p != '-') return false;
+    ++p;
+    uintptr_t hi = 0;
+    digits = 0;
+    for (unsigned d; (d = hex_digit(*p)) < 16; ++p, ++digits)
+        hi = (hi << 4) | d;
+    if (digits == 0 || *p != ' ') return false;
+    *begin = lo;
+    *end = hi;
+    return true;
+}
+
+/**
+ * @brief Lee `<clave>: <numero> kB` y devuelve el numero, en KiB.
+ * @return false si la linea no es esa clave.
+ */
+bool parse_kib_field(const char *line, const char *key,
+                     uint64_t *out) noexcept {
+    const char *p = line;
+    const char *k = key;
+    while (*k != '\0') {
+        if (*p != *k) return false;
+        ++p;
+        ++k;
+    }
+    while (*p == ' ' || *p == '\t')
+        ++p;
+    if (*p < '0' || *p > '9') return false;
+    uint64_t v = 0;
+    while (*p >= '0' && *p <= '9')
+        v = v * 10 + uint64_t(*p++ - '0');
+    *out = v;
+    return true;
+}
+
 } // namespace
+
+size_t os_range_memory(const void *base, size_t bytes) noexcept {
+    if (base == nullptr || bytes == 0) return 0;
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t end = begin + bytes;
+
+    LineReader lr;
+    if (!lr.open_file("/proc/self/smaps")) return 0;
+
+    /* SE SUMA `Rss`, que es lo unico que este sistema sabe contestar: aqui no
+     * hay "comprometido" -- un mapeo se respalda segun se toca --, asi que lo
+     * que cuesta el rango es lo que tiene residente.  La cabecera lo dice sin
+     * taparlo; las dos cifras no son la misma medida. */
+    size_t total = 0;
+    uintptr_t vma_begin = 0;
+    uintptr_t vma_end = 0;
+    bool touches = false; // la region actual cae dentro del rango
+    char line[256];
+    while (lr.next(line, sizeof(line))) {
+        if (parse_map_header(line, &vma_begin, &vma_end)) {
+            touches = vma_begin < end && vma_end > begin;
+            continue;
+        }
+        if (!touches) continue;
+        uint64_t kib;
+        if (!parse_kib_field(line, "Rss:", &kib)) continue;
+
+        /* Una region puede asomar por los bordes del rango, y `Rss` es de la
+         * region ENTERA.  Lo normal es que caiga dentro del todo -- cada
+         * `mprotect` parte la region por donde se pidio --, y cuando no, se
+         * reparte a prorrata: es lo unico que se puede decir sin preguntar
+         * pagina por pagina, que costaria un bitmap de 64 MiB por cada 256 GiB
+         * de rango. */
+        const uintptr_t from = vma_begin > begin ? vma_begin : begin;
+        const uintptr_t to = vma_end < end ? vma_end : end;
+        const uint64_t rss = kib * 1024;
+        const uint64_t span = uint64_t(vma_end - vma_begin);
+        const uint64_t part = uint64_t(to - from);
+        total += size_t(span == part ? rss : (rss * part) / span);
+        touches = false; // `Rss` sale una vez por region; el resto sobra
+    }
+    lr.close_file();
+    return total;
+}
 
 OsProcessMemory os_process_memory() noexcept {
     OsProcessMemory m;

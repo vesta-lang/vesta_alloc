@@ -979,6 +979,84 @@ OsProcessMemory os_process_memory() noexcept;
 
 /**
  * @brief
+ * \~english How much of a RANGE the process is actually paying for.
+ * \~spanish Cuanto de un RANGO esta pagando el proceso de verdad.
+ * \~
+ *
+ * \~english
+ * WHAT IT IS FOR.  A reservation is not memory: this allocator reserves 256 GiB
+ * of address space and commits a sliver of it.  `os_process_memory` says what
+ * the whole process holds, and the per-site figures say what was handed OUT --
+ * and between the two there is a gap that belongs to nobody: memory the
+ * allocator committed and has not given back.  Measured on a compile of 144.000
+ * lines: 91 MiB alive against 1.925 committed.  This is the only way to put a
+ * number on where that gap lives without reading a single header.
+ *
+ * AND WITHOUT READING ONE.  Walking the allocator's own chunk headers to add
+ * them up would race with their owners and, worse, read pages that were handed
+ * out but not yet committed -- a bug this library already paid for once (see
+ * the note on the free-span bitmap in `host_allocator.cpp`).  The system knows
+ * the answer and telling it costs nothing to anybody.
+ *
+ * @par The two systems answer different questions, and it is said rather than
+ *      hidden
+ * On Windows, COMMITTED: pages the process has reserved backing store for,
+ * whether or not they are resident.  On Linux there is no such thing --
+ * mappings are backed lazily -- so what comes back is RESIDENT: pages actually
+ * in memory.  Both answer "what is this range costing", which is the question;
+ * neither is the other, and comparing the two numbers across systems would be
+ * comparing two different measurements.
+ *
+ * @par Cost
+ * One walk of the memory map of the range.  It is meant to be called from a
+ * cold path -- once per cut of the time axis, not per allocation.
+ *
+ * \~spanish
+ * PARA QUE.  Una reserva no es memoria: este asignador aparta 256 GiB de
+ * espacio de direcciones y compromete una astilla.  `os_process_memory` dice lo
+ * que tiene el proceso entero, y las cifras por sitio dicen lo ENTREGADO -- y
+ * entre las dos hay un hueco que no es de nadie: memoria que el asignador
+ * comprometio y no ha devuelto.  Medido en una compilacion de 144.000 lineas:
+ * 91 MiB vivos contra 1.925 comprometidos.  Esta es la unica forma de ponerle
+ * un numero a donde vive ese hueco sin leer una sola cabecera.
+ *
+ * Y SIN LEER NINGUNA.  Recorrer las cabeceras de los trozos del asignador para
+ * sumarlas competiria con sus duenos y, peor, leeria paginas repartidas pero
+ * aun sin comprometer -- un fallo que esta libreria ya pago una vez (ver la
+ * nota del mapa de tramos libres en `host_allocator.cpp`).  El sistema sabe la
+ * respuesta y darla no le cuesta nada a nadie.
+ *
+ * @par Los dos sistemas contestan cosas distintas, y se dice en vez de taparlo
+ * En Windows, COMPROMETIDO: paginas para las que el proceso tiene respaldo
+ * apartado, esten o no residentes.  En Linux no existe tal cosa -- los mapeos
+ * se respaldan segun se tocan --, asi que lo que vuelve es RESIDENTE: paginas
+ * que estan de verdad en memoria.  Las dos contestan "cuanto esta costando este
+ * rango", que es la pregunta; ninguna es la otra, y comparar las dos cifras
+ * entre sistemas seria comparar dos medidas distintas.
+ *
+ * @par Coste
+ * Un recorrido del mapa de memoria del rango.  Esta pensada para un camino
+ * frio: una vez por corte del eje del tiempo, no por reserva.
+ *
+ * \~
+ * @param base
+ * \~english where the range starts.
+ * \~spanish donde empieza el rango.
+ * \~
+ * @param bytes
+ * \~english how long it is.
+ * \~spanish cuanto ocupa.
+ * \~
+ * @return
+ * \~english bytes of it the process is paying for; zero if it cannot be asked.
+ * \~spanish bytes de el que el proceso esta pagando; cero si no se puede
+ *           preguntar.
+ * \~
+ */
+size_t os_range_memory(const void *base, size_t bytes) noexcept;
+
+/**
+ * @brief
  * \~english What the system says about ITSELF.
  * \~spanish Lo que el sistema dice de SI MISMO.
  * \~
