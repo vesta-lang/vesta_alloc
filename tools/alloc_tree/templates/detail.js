@@ -80,23 +80,74 @@ function detail(node) {
    * handed back out to the branches that formed it, which is why the
    * allocator now records the split per site. */
   var split = sizesOf(node);
+  /* POR CUENTA O POR BYTES, y no una de las dos: son lecturas opuestas de las
+   * mismas filas.  Por cuenta, la ultima casilla de una rama de verdad son
+   * unas pocas reservas entre millones -- una barra de ancho cero -- y por
+   * bytes puede ser todo lo que esa rama pidio.
+   *
+   * Se elige aqui y se recuerda, como el idioma: quien mira por bytes quiere
+   * mirar por bytes tambien en la rama siguiente. */
+  var byBytes = detailByBytes() && VIEW.hasSizeBytes;
+  var szTotal = 0;
+  for (var si = 0; si < split.length; si++)
+    szTotal += byBytes ? split[si].bytes : split[si].n;
+  if (!szTotal) szTotal = 1;
   var sizes = split.length
       ? split.map(function (s) {
-          var pct = 100 * s.n / total;
+          var v = byBytes ? s.bytes : s.n;
+          var pct = 100 * v / szTotal;
           return '<div class="pbar"><i style="width:' + pct.toFixed(1) +
                  '%"></i><span>' +
                  (s.upper ? '&le; ' + human(s.upper) : '&gt; 16 MiB') +
-                 '</span><b>' + num(s.n) + '</b><em>' + pct.toFixed(1) +
-                 '%</em></div>';
+                 '</span><b>' + (byBytes ? human(v) : num(v)) + '</b><em>' +
+                 pct.toFixed(1) + '%</em></div>';
         }).join('')
       : '<div class="dim">' + esc(T('det.nosizes')) + '</div>';
+  /* El control solo si hay las dos medidas.  Una exportacion anterior no trae
+   * los bytes por casilla, y ofrecer una vista que saldria a cero seria una
+   * promesa que la pagina no puede cumplir. */
+  var sizePick = VIEW.hasSizeBytes
+      ? '<span class="szpick">' +
+        '<a href="#" data-szview="allocs"' +
+        (byBytes ? '' : ' class="on"') + '>' + esc(T('sz.allocs')) + '</a>' +
+        '<a href="#" data-szview="bytes"' +
+        (byBytes ? ' class="on"' : '') + '>' + esc(T('sz.bytes')) + '</a>' +
+        '</span>'
+      : '';
 
   document.getElementById('detail').innerHTML = head +
     '<div class="dcols"><div><h2>' + esc(T('det.what')) + '</h2>' + tags +
-      '<h2 style="margin-top:10px">' + esc(T('det.sizes')) + '</h2>' + sizes +
+      '<h2 style="margin-top:10px">' + esc(T('det.sizes')) + sizePick +
+      '</h2>' + sizes +
     '</div>' +
     '<div class="dsites"><h2>' +
       esc(T('det.sites', { n: num(ids.length) })) + '</h2>' +
       '<div class="wrap sm"><table class="flat"><thead><tr>' + heads +
       '</tr></thead><tbody>' + rowsHtml + '</tbody></table></div></div></div>';
+
+  /* Y se vuelve a dibujar la MISMA rama al cambiar de vista.  Redibujar el
+   * panel entero y no solo las barras: el encabezado dice cual esta elegida, y
+   * dos sitios que dicen lo mismo se separan en cuanto uno de los dos cambia. */
+  document.querySelectorAll('#detail [data-szview]').forEach(function (a) {
+    a.onclick = function (e) {
+      e.preventDefault();
+      detailSetByBytes(a.dataset.szview === 'bytes');
+      detail(node);
+    };
+  });
+}
+
+/// Si el histograma de la rama se dibuja por bytes.  Recordado como el idioma
+/// y el tema, y por lo mismo: una eleccion que hay que repetir en cada rama es
+/// una eleccion que se deja de hacer.
+function detailByBytes() {
+  try {
+    return window.localStorage.getItem('alloc_tree_detail_bytes') === '1';
+  } catch (e) { return false; }
+}
+
+function detailSetByBytes(on) {
+  try {
+    window.localStorage.setItem('alloc_tree_detail_bytes', on ? '1' : '0');
+  } catch (e) { /* ventana privada: va igual, solo no lo recuerda */ }
 }

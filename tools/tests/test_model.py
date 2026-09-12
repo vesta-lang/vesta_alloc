@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(HERE))          # tools/
 import fixtures                                     # noqa: E402
 from alloc_tree.i18n import LANGS, STRINGS, t       # noqa: E402
 from alloc_tree.report import Report                # noqa: E402
-from alloc_tree.tree import build_tree              # noqa: E402
+from alloc_tree.tree import build_tree, group_frame  # noqa: E402
 
 GROUPINGS = (None, "module", "file", "purpose")
 
@@ -136,6 +136,129 @@ def check_sizes_per_site(report, say):
     say(tree.allocs >= sum(total.values()),
         "sin pasarse del total del arbol")
 
+    # Y LOS BYTES, que son la otra mitad y no salen de la primera: la casilla
+    # con MENOS reservas de todo el fixture es la que mas bytes pidio, que es
+    # justo el caso que una vista por cuentas esconde.  Si esto se pudiera
+    # deducir de las cuentas, la columna sobraria.
+    weighed = {}
+    for site in report.sites:
+        for b, n in site.size_bytes.items():
+            weighed[b] = weighed.get(b, 0) + n
+    say(bool(weighed), "y cada sitio trae tambien los bytes de cada casilla")
+    top_by_allocs = max(total, key=lambda b: total[b])
+    top_by_bytes = max(weighed, key=lambda b: weighed[b])
+    say(top_by_allocs != top_by_bytes,
+        "y la casilla que mas reservas tiene NO es la que mas bytes pidio -- "
+        "que es la razon entera de contar las dos cosas")
+
+
+def check_sizes_without_bytes(tmp, say):
+    """Un volcado anterior a la columna de bytes: ausencia, no ceros."""
+    report = load(os.path.join(tmp, "nobytes"), size_bytes=False)
+    say(all(s.sizes for s in report.sites if s.sid in (0, 1, 2, 3, 4)),
+        "sin la columna de bytes, el reparto por cuentas sigue entero")
+    say(all(not s.size_bytes for s in report.sites),
+        "y los bytes por casilla no estan -- vacio es 'no se midio', que no "
+        "es lo mismo que cero")
+
+
+def check_live_sizes(tmp, report, say):
+    """Lo que cada tamano SE QUEDA, y cuando eso no se puede saber."""
+    sizes = report.check.sizes
+    say(len(sizes) == len(fixtures.CHECK_SIZES),
+        "el comprobador trae una fila por casilla con lo que se queda")
+    last = sizes[-1]
+    say(last["allocs"] < sizes[0]["allocs"] and last["live"] > sizes[0]["live"],
+        "y la casilla con menos reservas es la que mas deja vivo -- que es lo "
+        "que la cuenta no puede enseñar")
+    say(all(r["live"] is not None for r in sizes),
+        "con el eje, lo vivo consta en todas")
+
+    # SIN EJE no se sabe: un bloque grande nace y no muere nunca, asi que lo
+    # vivo de su casilla seria todo lo que llego a servir.  Nulo y no cero.
+    without = load(os.path.join(tmp, "noaxis"), live_sizes=False)
+    say(all(r["live"] is None for r in without.check.sizes),
+        "y sin el, lo vivo es 'no consta' -- nulo, no cero, que se leeria "
+        "como 'este tamano no se queda nada'")
+    say(all(r["bytes"] > 0 for r in without.check.sizes),
+        "mientras que lo entregado se cuenta igual en los dos casos")
+
+
+def check_grouping_hangs_on_the_author(report, say):
+    """De QUE marco cuelga una reserva al agrupar por modulo o por fichero.
+
+    EL CASO ES LA PILA ENTERA DEL COMPROBADOR: el aparato de medida por dentro,
+    la biblioteca estandar en medio, UN marco del autor, y como el sistema entro
+    en el hilo por fuera.  Con la regla de "el marco de mas afuera" esa pila
+    caia bajo `ntdll.dll`; con la del autor cae donde se escribio.
+
+    No es una preferencia.  Medido en una compilacion de 144.000 lineas con
+    ocho marcos recorridos, la regla vieja mandaba 7.536 de 8.611 sitios a
+    `KERNEL32.DLL`, `ntdll.dll` o el arranque del CRT: agrupar por modulo
+    contestaba y no decia nada.
+    """
+    chain = report.check.chains.get(9) or []
+    site = [s for s in report.check.sites if s.sid == 9][0]
+    say(bool(chain) and chain[-1].module == "ntdll.dll",
+        "la pila de prueba acaba, por fuera, en como el sistema entro al hilo")
+    say(group_frame(site, chain, "module").function == "vm.exe",
+        "y aun asi se agrupa por el modulo del marco del AUTOR, no por el del "
+        "arranque del hilo")
+    say(group_frame(site, chain, "file").function.endswith("emit.cpp"),
+        "y por fichero, igual: el que escribio alguien")
+
+
+def check_region_measured(tmp, report, say):
+    """Lo que cuestan los rangos del asignador, corte a corte."""
+    cuts = report.check.epochs
+    say(all("region" in c for c in cuts),
+        "cada corte trae lo que costaban los rangos del asignador")
+    # El primer corte se toma antes de que haya rango: cero es "no se pudo
+    # preguntar".  Leerlo como una medida diria que el asignador no tenia nada.
+    say(cuts[0]["region"] == 0,
+        "y el primero, antes de que hubiera rango, va a cero")
+    later = cuts[2]
+    say(later["live"] < later["region"] < later["committed"],
+        "y despues queda entre lo vivo y lo comprometido -- la holgura por "
+        "debajo, lo que no es de este asignador por encima")
+
+    # Y EL HUECO, REPARTIDO EN SUS DOS MITADES.  Son la razon entera de la
+    # columna: lo que esta en listas de libres podria volver al sistema y lo
+    # que no, no.  Medido en una corrida de verdad el reparto era 197 MiB
+    # contra 664, asi que confundirlas es atacar la cuarta parte del problema.
+    say(all(c["free_spans"] + c["empty_chunks"] <= c["region"] - c["live"]
+            for c in cuts if c["region"]),
+        "lo recuperable es una PARTE del hueco, nunca mas que el")
+    last = cuts[-1]
+    say(last["free_spans"] > 0 and last["empty_chunks"] > 0
+        and last["region"] - last["live"] - last["free_spans"]
+            - last["empty_chunks"] > 0,
+        "y el hueco tiene sus TRES partes: tramos libres, trozos con todo "
+        "muerto, y trozos con algo vivo repartido")
+    # LAS DOS PRIMERAS SON DEL ASIGNADOR Y LA TERCERA NO, que es la razon de
+    # medirlas por separado: en una corrida de verdad eran 211 + 386 contra
+    # 279 MiB, y darlas juntas decidiria mal de quien es el arreglo.
+    say(last["empty_chunks"] > last["free_spans"],
+        "y la mayor de las recuperables son los trozos vacios, no los tramos")
+
+    # Una tabla escrita antes de que existiera la columna no es un error: se
+    # lee como "no se midio", que es lo que la curva necesita para no salir.
+    old = os.path.join(tmp, "sinregion", "export")
+    fixtures.write_export(old)
+    path = os.path.join(old, "check_epochs.csv")
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    # Se quitan LAS DOS columnas nuevas, que es lo que tenia un volcado de
+    # antes de medirlas: quitar solo una probaria un formato que no existio.
+    kept = [",".join(c for i, c in enumerate(ln.split(",")) if i not in (5, 6))
+            for ln in lines]
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(kept) + "\n")
+    without = Report(old)
+    say(all(c["region"] == 0 and c["free_spans"] == 0
+            for c in without.check.epochs),
+        "y un volcado sin esas columnas carga igual, con las dos sin medir")
+
 
 def check_old_export_still_loads(tmp, say):
     """An export written before these columns existed is not an error."""
@@ -191,6 +314,10 @@ def run(tmp, say):
     check_functions_group(report, say)
     check_purposes_travel(report, say)
     check_sizes_per_site(report, say)
+    check_sizes_without_bytes(tmp, say)
+    check_live_sizes(tmp, report, say)
+    check_grouping_hangs_on_the_author(report, say)
+    check_region_measured(tmp, report, say)
     check_old_export_still_loads(tmp, say)
     check_warnings_are_keys(report, say)
     check_catalogue(say)

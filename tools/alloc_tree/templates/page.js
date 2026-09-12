@@ -30,6 +30,11 @@ var scope = 'all';
 // C++" son dos preguntas distintas, y meterlas en una sola lista dejaria sin
 // poder pedir las combinaciones utiles -- mi codigo en C, lo externo en C++.
 var langFilter = 'all';
+// 'alloc' o 'check'.  Arranca en la del comprobador cuando el volcado la trae,
+// que es la unica que puede decir DE QUIEN es una reserva -- ver la nota de
+// `VIEW` en `tree.js`.  Y viaja en el enlace, porque cual es la de por defecto
+// depende del volcado.
+var dataset = DATA.check ? 'check' : 'alloc';
 var sortKey = 'total', sortDesc = true, picked = null, rows = [];
 
 /* `esc`, `num`, `human`, `codeHtml` and `langOf` come from `code.js`; `T` from
@@ -139,7 +144,7 @@ function rowHtml(e) {
 /// The view, into the address bar, so a finding can be sent to someone.
 function shareState() {
   writeHash({ grouping: grouping, dir: dir, needle: needle, byBytes: byBytes,
-              scope: scope, langFilter: langFilter,
+              scope: scope, langFilter: langFilter, dataset: dataset,
               path: picked ? pathOf(picked) : null });
 }
 
@@ -164,6 +169,14 @@ function render() {
   if (root().leftOut)
     stat += '  |  ' + T('scope.left_out', {
       allocs: num(root().leftOut), bytes: human(root().leftOutBytes)
+    });
+  /* Y LO QUE EL INFORME SE GASTO EN SI MISMO.  No esta en el arbol -- no es del
+   * programa -- pero la memoria se pidio, asi que se dice.  Aqui y no en un
+   * aviso: quien mira los totales tiene que ver de que totales se esta
+   * hablando.  Ver la nota de `treeFor`. */
+  if (root().instr)
+    stat += '  |  ' + T('stat.instrument', {
+      allocs: num(root().instr), bytes: human(root().instrBytes)
     });
   /* Y CUANTAS DE ESAS SE FUERON POR NO SABERSE SU LENGUAJE, que es otra cosa
    * que ser del otro.  Sin esto, una vista de "solo C" vacia se lee como "este
@@ -206,7 +219,7 @@ function flip(what, value) {
    * that is not tidiness: a node and a site id only mean something inside the
    * dataset they came from, so carrying them across would reopen a branch that
    * is not the same branch and highlight a site that is a different site. */
-  else if (what === 'dataset') setView(value);
+  else if (what === 'dataset') { dataset = value; setView(value); }
   else grouping = value;
   unfolded.clear();
   picked = null;
@@ -281,10 +294,31 @@ function boot() {
       });
       b.classList.add('on');
       document.getElementById(b.dataset.panel).classList.add('on');
+      /* UN LIENZO EN UN PANEL ESCONDIDO MIDE CERO, asi que lo dibujado
+       * mientras estaba oculto no vale: hay que rehacerlo al enseñarlo.  Es la
+       * diferencia entre un grafico y una tabla, que sale bien sin que nadie
+       * la mire. */
+      if (b.dataset.panel === 'p-time' && typeof timeDraw === 'function')
+        timeDraw();
     };
   });
-  document.querySelectorAll('table.flat').forEach(wireTable);
-  document.querySelectorAll('input[data-for-table]').forEach(wireFilter);
+  rawInit();
+  /* El eje del tiempo, si la corrida lo llevaba.  Se monta aqui y no al abrir
+   * su pestana porque un lienzo dentro de un panel escondido mide cero de
+   * ancho, y lo que se dibuja con ese ancho no se ve nunca. */
+  if (typeof timeInit === 'function') timeInit();
+
+  /* El tema antes que nada de lo que se dibuja: el grafico lee los colores de
+   * la hoja de estilos al pintar, asi que aplicarlo despues lo dejaria pintado
+   * con los del tema anterior hasta el siguiente repintado. */
+  var theme = loadTheme();
+  applyTheme(theme);
+  var pickTheme = document.getElementById('theme');
+  pickTheme.value = theme;
+  pickTheme.onchange = function (e) {
+    saveTheme(e.target.value);
+    if (typeof timeDraw === 'function') timeDraw();
+  };
 
   loadLang();
   var pickLang = document.getElementById('lang');
@@ -293,6 +327,10 @@ function boot() {
     saveLang(e.target.value);
     applyLang();
     render();      // the status line and the panel are built here, not marked
+    /* El grafico lleva su texto DENTRO del lienzo -- los nombres de las fases,
+     * la escala --, y eso no lo alcanza `applyLang`: hay que volver a pintarlo.
+     * Sin esto la pagina cambiaba de idioma entera menos el dibujo. */
+    if (typeof timeDraw === 'function') timeDraw();
   };
   applyLang();
 
@@ -302,6 +340,13 @@ function boot() {
    * means nothing on the plain call stack, and picking the wrong row would be
    * worse than picking none. */
   var link = readHash();
+  /* La poblacion, ANTES que nada: todo lo de abajo -- el camino seleccionado,
+   * el filtro, el arbol -- se resuelve dentro de una, y hacerlo sobre la
+   * equivocada para cambiarla despues seleccionaria una fila que no es. */
+  if (link.dataset) dataset = link.dataset;
+  setView(dataset);
+  var pick = document.getElementById('dataset');
+  if (pick) pick.value = dataset;
   if (link.grouping) grouping = link.grouping;
   if (link.scope) scope = link.scope;
   if (link.langFilter) langFilter = link.langFilter;

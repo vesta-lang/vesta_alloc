@@ -41,6 +41,11 @@ function readHash() {
     var key = pair.slice(0, at);
     var value = decodeURIComponent(pair.slice(at + 1).replace(/\+/g, ' '));
     if (key === 'g') state.grouping = value;
+    /* Which POPULATION, because a link that does not carry it opens on the
+     * default -- and since the default is now the checker's when there is one,
+     * a link made while looking at the allocator's would land the reader on
+     * different numbers under the same address. */
+    else if (key === 'v') state.dataset = value;
     else if (key === 'd') state.dir = value;
     else if (key === 'q') state.needle = value;
     else if (key === 'b') state.byBytes = value === '1';
@@ -65,6 +70,11 @@ function writeHash(state) {
   var parts = [];
   if (state.grouping && state.grouping !== 'stack')
     parts.push('g=' + encodeURIComponent(state.grouping));
+  /* Written whenever the file HAS two populations, even for the one that
+   * opens by default: which one that is depends on the export, so leaving it
+   * out would make the link mean one thing here and another elsewhere. */
+  if (state.dataset && DATA.check)
+    parts.push('v=' + encodeURIComponent(state.dataset));
   if (state.dir && state.dir !== 'td')
     parts.push('d=' + encodeURIComponent(state.dir));
   if (state.needle) parts.push('q=' + encodeURIComponent(state.needle));
