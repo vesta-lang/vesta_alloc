@@ -528,6 +528,68 @@ uint64_t san_longest_life() noexcept;
 
 /**
  * @brief
+ * \~english Names the stretch of the run that starts here.
+ * \~spanish Pone nombre al tramo de la corrida que empieza aqui.
+ * \~
+ *
+ * \~english
+ * WHAT A CURVE WITHOUT NAMES IS WORTH: a peak at sample 57 of 200.  The program
+ * is the only one that knows sample 57 was the assembler, and it knows it for
+ * free -- it already brackets its phases to time them -- so the label costs one
+ * call where a bracket already exists.
+ *
+ * It also TAKES A CUT, which is the half that matters more: a cut on a phase
+ * boundary is what makes two phases comparable at all, instead of one snapshot
+ * landing mid-parse and the next mid-emission.
+ *
+ * DOES NOTHING unless the time axis was asked for with `VESTA_ALLOC_SAN_EPOCH`,
+ * and does not even exist unless the checker is compiled in: outside that build
+ * this is an inline empty body, so a program can call it wherever it makes
+ * sense and pay nothing for it.
+ *
+ * \~english
+ * A KEY, NOT A SENTENCE.  What comes in here is written into a table and shown
+ * to somebody later, so prose written at the call site would be text facing a
+ * user that no catalogue can translate -- and this library has no business
+ * carrying another program's words in another program's language.  A stable
+ * identifier (`vx.phase.emit`) means the same thing in every language, and
+ * whoever RENDERS the curve looks it up where translations already live.
+ *
+ * \~spanish
+ * UNA CLAVE, NO UNA FRASE.  Lo que entra aqui se escribe en una tabla y se le
+ * ensena a alguien despues, asi que prosa escrita en el sitio de la llamada
+ * seria texto de cara al usuario que ningun catalogo puede traducir -- y esta
+ * libreria no tiene por que llevar las palabras de otro programa en el idioma
+ * de otro programa.  Un identificador estable (`vx.phase.emit`) significa lo
+ * mismo en todos los idiomas, y quien ENSENA la curva lo busca donde ya viven
+ * las traducciones.
+ * \~
+ *
+ * @param name \~english a stable key, and a literal that outlives the run: it
+ *             is stored, not copied.  \~spanish una clave estable, y un literal
+ *             que sobreviva a la corrida: se guarda, no se copia.  \~
+ *
+ * \~spanish
+ * LO QUE VALE UNA CURVA SIN NOMBRES: un pico en la muestra 57 de 200.  El unico
+ * que sabe que la muestra 57 era el ensamblador es el programa, y lo sabe
+ * gratis -- ya acota sus fases para cronometrarlas --, asi que la etiqueta
+ * cuesta una llamada donde ya hay un corchete.
+ *
+ * Ademas TOMA UN CORTE, que es la mitad que mas importa: un corte en la
+ * frontera de una fase es lo que hace que dos fases se puedan comparar
+ * siquiera, en vez de que una foto caiga a mitad de analisis y la siguiente a
+ * mitad de emision.
+ *
+ * NO HACE NADA salvo que se haya pedido el eje del tiempo con
+ * `VESTA_ALLOC_SAN_EPOCH`, y ni existe salvo que el comprobador este compilado
+ * dentro: fuera de ese build esto es un cuerpo vacio en linea, asi que un
+ * programa puede llamarlo donde tenga sentido sin pagar nada.
+ * \~
+ */
+void san_mark(const char *name) noexcept;
+
+/**
+ * @brief
  * \~english Every byte handed out so far, released or not.
  * \~spanish Todos los bytes entregados hasta ahora, liberados o no.
  * \~
@@ -843,6 +905,49 @@ bool san_realloc(void *p, size_t n, void **out) noexcept;
 
 #else // the checker is not in this build / el comprobador no esta en este build
 
+/* \~english The level, and it is @c Off -- the RIGHT answer, not a stub.  With
+ * the macro off nobody serves a block but the allocator, so every question of
+ * the form "is the checker placing blocks / changing sizes?" answers no.  It is
+ * spelled out here so a consumer can ask without an `#if` of its own, and every
+ * comparison folds away at compile time.
+ *
+ * Leaving it out was not neutral: it turned a question with a known answer into
+ * a COMPILE ERROR, and the consumer's only way out was to wrap the question --
+ * which is how a check quietly disappears from the build that does not define
+ * the macro.
+ *
+ * \~spanish El nivel, y es @c Off -- la respuesta CORRECTA, no un tapon.  Con
+ * la macro apagada nadie sirve un bloque salvo el asignador, asi que toda
+ * pregunta del tipo "esta el comprobador colocando bloques / cambiando
+ * tamanos?" se responde que no.  Se dice aqui para que quien la use pueda
+ * preguntar sin un `#if` propio, y toda comparacion se pliega al compilar.
+ *
+ * No ponerlo no era neutral: convertia una pregunta de respuesta conocida en un
+ * ERROR DE COMPILACION, y la unica salida de quien la hacia era envolverla --
+ * que es como una comprobacion desaparece en silencio del build que no define
+ * la macro.
+ * \~ */
+enum class SanLevel : unsigned {
+    Off = 0,
+    Track = 1,
+    Canary = 2,
+    Poison = 3,
+    Guard = 4,
+};
+
+namespace detail {
+
+/// \~english The level in force: none.  A constant, not the `extern` of the
+///           other branch: it is read only to compare, so it folds away and no
+///           copy of it reaches any object file.
+/// \~spanish El nivel en vigor: ninguno.  Una constante, no el `extern` de la
+///           otra rama: solo se lee para comparar, asi que se pliega y no llega
+///           ni una copia a ningun objeto.
+/// \~
+constexpr SanLevel g_san_level = SanLevel::Off;
+
+} // namespace detail
+
 /* \~english Empty and always inlined: with the macro off, `host_alloc` and
  * `host_free` have to generate the same instructions as if this file did not
  * exist.  That is a promise the build checks, not an intention.
@@ -890,6 +995,13 @@ bool san_realloc(void *p, size_t n, void **out) noexcept;
                                                void **) noexcept {
     return false;
 }
+/// \~english Without the checker there is no curve to put a name on, so this is
+///           an empty body: a program marks its phases wherever it makes sense
+///           and a build without the checker does not pay a call for it.
+/// \~spanish Sin el comprobador no hay curva a la que poner nombre, asi que
+///           esto es un cuerpo vacio: un programa marca sus fases donde tenga
+///           sentido y un build sin comprobador no paga ni la llamada.  \~
+[[gnu::always_inline]] inline void san_mark(const char *) noexcept {}
 
 #endif // VESTA_ALLOC_SANITIZER
 

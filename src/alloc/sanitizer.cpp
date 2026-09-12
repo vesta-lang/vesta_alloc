@@ -101,6 +101,15 @@
 #include <cerrno>
 #include <sys/stat.h>
 #include <sys/types.h>
+/* \~english The unwinder libgcc already carries, which is the same code that
+ * runs when an exception is thrown -- so it reads `.eh_frame`, which every
+ * compiler emits, instead of trusting a register that most functions do not
+ * keep.  See `capture_tables`.
+ * \~spanish El desenrollador que libgcc ya lleva, que es el mismo codigo que
+ * corre al lanzar una excepcion -- asi que lee `.eh_frame`, que todo compilador
+ * emite, en vez de fiarse de un registro que la mayoria de las funciones no
+ * conservan.  Ver `capture_tables`.  \~ */
+#include <unwind.h>
 #endif
 
 #include <atomic>
@@ -131,7 +140,43 @@ namespace {
 /// \~
 /// The most frames a stack can ever hold.  It sizes the depot entry, so it is
 /// a constant; how many are actually WALKED is @c g_depth.
-constexpr unsigned kFrames = 8;
+/**
+ * @brief
+ * \~english How deep ONE walk can go before it runs out of somewhere to write.
+ * \~spanish Cuanto puede caminar UN paseo antes de quedarse sin donde escribir.
+ * \~
+ *
+ * \~english
+ * IT IS A BUFFER, NOT A BUDGET, and that is the whole difference from what this
+ * used to be.  It was eight because a depot entry held eight frames inline, so
+ * every entry paid for the deepest walk anyone might do -- eight pointers times
+ * 65.536 entries, whether a stack used one or seven.  Raising it raised the cost
+ * of the table.
+ *
+ * Now the frames live in a pool and this is only the landing space a single
+ * walk needs while it runs, on the stack of the thread doing it.  Sixty-four is
+ * 512 bytes of stack for the length of one call, so the number stopped being a
+ * trade and became a formality.
+ *
+ * It still bites eventually, and when it does the stack is marked CUT rather
+ * than handed back looking whole.
+ *
+ * \~spanish
+ * ES UN BUFFER, NO UN PRESUPUESTO, y esa es toda la diferencia con lo que era.
+ * Valia ocho porque una entrada del deposito llevaba ocho marcos dentro, asi
+ * que cada entrada pagaba el paseo mas hondo que alguien pudiera dar -- ocho
+ * punteros por 65.536 entradas, usara una pila uno o siete.  Subirlo subia el
+ * coste de la tabla.
+ *
+ * Ahora los marcos viven en un almacen y esto es solo el sitio donde aterriza un
+ * paseo mientras corre, en la pila del hilo que lo da.  Sesenta y cuatro son 512
+ * bytes de pila durante una llamada, asi que el numero dejo de ser un
+ * compromiso y paso a ser un tramite.
+ *
+ * Sigue mordiendo alguna vez, y cuando muerde la pila se marca CORTADA en vez
+ * de devolverse con aspecto de entera.  \~
+ */
+constexpr unsigned kFrames = 64;
 
 /**
  * @brief
@@ -353,14 +398,163 @@ const char *certainty_word(Certainty c) noexcept {
 /// \~
 enum : uint32_t { kSlotEmpty = 0, kSlotClaiming = 1, kSlotReady = 2 };
 
+/**
+ * @brief
+ * \~english One stack: where its frames are, and how many.  NOT the frames.
+ * \~spanish Una pila: donde estan sus marcos y cuantos.  NO los marcos.
+ * \~
+ *
+ * \~english
+ * THE FRAMES USED TO LIVE HERE, in a `const void *pc[8]`, and that one array
+ * was three limits at once wearing the same hat:
+ *
+ *   - it capped HOW DEEP anything could be walked, because asking for more
+ *     would have written past the end of an entry.  The cap was not a decision
+ *     about stacks; it was the size of a struct member.
+ *   - it made every entry pay for eight frames whether it used one or seven.
+ *     Measured on a real compile, the average is 3,2 -- so over half of the
+ *     4,7 MB this table costs was padding.
+ *   - and when it DID bite, a truncated stack came back looking exactly like a
+ *     complete one.
+ *
+ * Now the entry says WHERE, and the frames go in a pool that grows.  Twelve
+ * bytes instead of seventy-two, what is walked is what is paid, and the depth a
+ * walk can reach stops being a property of this struct.
+ *
+ * \~spanish
+ * LOS MARCOS VIVIAN AQUI, en un `const void *pc[8]`, y ese array era tres
+ * limites a la vez disfrazados del mismo:
+ *
+ *   - topaba CUANTO se podia caminar, porque pedir mas habria escrito pasado el
+ *     final de una entrada.  El tope no era una decision sobre pilas; era el
+ *     tamano de un campo.
+ *   - hacia que cada entrada pagara ocho marcos usara uno o siete.  Medida
+ *     sobre una compilacion real, la media son 3,2 -- o sea que mas de la mitad
+ *     de los 4,7 MB que costaba esta tabla era relleno.
+ *   - y cuando el tope SI mordia, una pila truncada volvia con el mismo aspecto
+ *     que una completa.
+ *
+ * Ahora la entrada dice DONDE, y los marcos van a un almacen que crece.  Doce
+ * bytes en vez de setenta y dos, se paga lo que se camina, y la profundidad que
+ * alcanza un paseo deja de ser una propiedad de esta estructura.  \~
+ */
 struct Stack {
     std::atomic<uint32_t> state;
-    uint8_t frames; ///< how many entries of `pc` are real
-    uint8_t walked; ///< 1 = frame chain followed, 0 = one return address only
-    const void *pc[kFrames];
+    uint32_t first;  ///< \~english index of its first frame in the pool
+                     ///< \~spanish indice de su primer marco en el almacen  \~
+    uint8_t n;       ///< \~english how many frames  \~spanish cuantos marcos \~
+    uint8_t walked;  ///< 1 = frame chain followed, 0 = one return address only
+    uint8_t cut;     ///< \~english 1 = the walk hit the buffer, so this stack is
+                     ///<           as much as FIT, not as much as there was
+                     ///< \~spanish 1 = el paseo llego al tope del buffer, asi
+                     ///<           que esta pila es lo que CUPO, no lo que habia
+                     ///< \~
 };
 
+static_assert(sizeof(Stack) <= 16, "una entrada del deposito son 12 bytes");
+
 Stack *g_depot = nullptr;
+
+/**
+ * @brief
+ * \~english The frames themselves, in chunks asked for as they are needed.
+ * \~spanish Los marcos, en trozos que se piden segun hacen falta.
+ * \~
+ *
+ * \~english
+ * IT GROWS, so nothing here decides in advance how deep a program's stacks may
+ * be.  A chunk is asked of the system the first time somebody needs it, and the
+ * table of chunks is the only fixed thing left -- big enough that reaching the
+ * end means the program walked more frames than there are stacks in the depot,
+ * which is a different problem.
+ *
+ * A run of frames never straddles two chunks: the reservation skips to the next
+ * one instead, wasting the tail.  With runs of at most @c kFrames and chunks of
+ * 65.536, that waste is a rounding error, and it buys the lookup being one
+ * division and one add rather than a loop.
+ *
+ * \~spanish
+ * CRECE, asi que nada de aqui decide de antemano cuanto de hondas pueden ser
+ * las pilas de un programa.  Un trozo se le pide al sistema la primera vez que
+ * alguien lo necesita, y la tabla de trozos es lo unico fijo que queda --
+ * bastante grande como para que llegar al final signifique que el programa
+ * camino mas marcos que pilas hay en el deposito, que es otro problema.
+ *
+ * Una tirada de marcos no cruza nunca de un trozo a otro: la reserva salta al
+ * siguiente y desperdicia la cola.  Con tiradas de como mucho @c kFrames y
+ * trozos de 65.536, ese desperdicio es un error de redondeo, y compra que
+ * localizar un marco sea una division y una suma en vez de un bucle.  \~
+ */
+constexpr uint32_t kPoolChunk = 1u << 16;  ///< frames per chunk (512 KiB)
+constexpr uint32_t kPoolChunks = 512;      ///< up to 33 million frames
+
+std::atomic<const void **> g_pool[kPoolChunks];
+std::atomic<uint32_t> g_pool_used{0};
+
+/// \~english Frames that found no room in the pool.  Counted, never quiet.
+/// \~spanish Marcos que no encontraron sitio en el almacen.  Contados, nunca
+/// en silencio.  \~
+std::atomic<uint64_t> g_pool_full{0};
+
+/// \~english Where a stack's frames are, or nullptr.
+/// \~spanish Donde estan los marcos de una pila, o nulo.  \~
+[[gnu::always_inline]] inline const void *const *frames_of(
+    const Stack &s) noexcept {
+    if (s.n == 0) return nullptr;
+    const uint32_t chunk = s.first / kPoolChunk;
+    if (chunk >= kPoolChunks) return nullptr;
+    const void **const base = g_pool[chunk].load(std::memory_order_acquire);
+    if (base == nullptr) return nullptr;
+    return base + (s.first % kPoolChunk);
+}
+
+/**
+ * @brief
+ * \~english Reserves @p n consecutive frames and returns where they start.
+ * \~spanish Reserva @p n marcos seguidos y devuelve donde empiezan.
+ * \~
+ * @return \~english the index, or UINT32_MAX when there is no room.
+ *         \~spanish el indice, o UINT32_MAX cuando no hay sitio.  \~
+ */
+uint32_t pool_reserve(unsigned n) noexcept {
+    if (n == 0) return UINT32_MAX;
+    uint32_t at = g_pool_used.load(std::memory_order_relaxed);
+    for (;;) {
+        uint32_t start = at;
+        /* Que no cruce de trozo: si no cabe en lo que queda de este, empieza en
+         * el siguiente y la cola se pierde.  Ver la nota del almacen. */
+        if ((start % kPoolChunk) + n > kPoolChunk)
+            start = (start / kPoolChunk + 1) * kPoolChunk;
+        const uint32_t chunk = start / kPoolChunk;
+        if (chunk >= kPoolChunks) {
+            g_pool_full.fetch_add(n, std::memory_order_relaxed);
+            return UINT32_MAX;
+        }
+        /* `at` se queda con lo que hubiera de verdad si alguien se adelanto, que
+         * es lo que hace el CAS, asi que la vuelta siguiente parte de ahi. */
+        if (!g_pool_used.compare_exchange_weak(at, start + n,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_relaxed))
+            continue;
+        /* El trozo, la primera vez que alguien lo pisa.  Quien pierda la carrera
+         * suelta el suyo y usa el del que gano. */
+        if (g_pool[chunk].load(std::memory_order_acquire) == nullptr) {
+            void *mem = os_alloc(sizeof(const void *) * kPoolChunk,
+                                 kOsReadWrite);
+            if (mem == nullptr) {
+                g_pool_full.fetch_add(n, std::memory_order_relaxed);
+                return UINT32_MAX;
+            }
+            std::memset(mem, 0, sizeof(const void *) * kPoolChunk);
+            const void **expected = nullptr;
+            if (!g_pool[chunk].compare_exchange_strong(
+                    expected, static_cast<const void **>(mem),
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                os_free(mem, sizeof(const void *) * kPoolChunk);
+        }
+        return start;
+    }
+}
 
 /**
  * @brief
@@ -401,6 +595,141 @@ Stack *g_depot = nullptr;
 
 /**
  * @brief
+ * \~english Whether @p p points into the stack this thread is running on.
+ * \~spanish Si @p p apunta a la pila sobre la que corre este hilo.
+ * \~
+ *
+ * \~english
+ * TO THROW OUT WHAT IS PROVABLY NOT A RETURN ADDRESS, which is a different job
+ * from deciding what IS one.  Accepting only addresses inside a loaded module
+ * would look stricter and would be wrong here: code this VM generated at run
+ * time belongs to no module, so a real frame through compiled code would be
+ * dropped -- and dropping a true frame in silence is worse than keeping a false
+ * one, because it turns "we do not know" into "it was not there".
+ *
+ * The other direction is provable.  The walk is reading the stack; a value
+ * sitting in that same stack cannot be an address to return TO.  Asked of the
+ * thread block, the bounds are exact and cost two loads -- no call, no syscall.
+ *
+ * Where the bounds cannot be had cheaply, the answer is "not provably stack"
+ * and nothing is thrown out, which leaves the walk exactly as it was.
+ *
+ * \~spanish
+ * PARA TIRAR LO QUE DEMOSTRABLEMENTE NO ES UNA DIRECCION DE RETORNO, que es
+ * cosa distinta de decidir cual SI lo es.  Aceptar solo direcciones dentro de un
+ * modulo cargado pareceria mas estricto y aqui seria incorrecto: el codigo que
+ * esta maquina genera en ejecucion no pertenece a ningun modulo, asi que un
+ * marco real que pasara por codigo compilado se tiraria -- y tirar un marco
+ * cierto en silencio es peor que quedarse uno falso, porque convierte "no lo
+ * sabemos" en "no estaba".
+ *
+ * La otra direccion si es demostrable.  El recorrido esta leyendo la pila; un
+ * valor que esta en esa misma pila no puede ser una direccion a la que volver.
+ * Preguntados al bloque del hilo, los limites son exactos y cuestan dos cargas
+ * -- ni llamada ni entrada al sistema.
+ *
+ * Donde no se puedan tener baratos, la respuesta es "no se demuestra que sea
+ * pila" y no se tira nada, con lo que el recorrido se queda como estaba.  \~
+ */
+[[gnu::always_inline]] inline bool in_own_heap(const void *p) noexcept {
+    /* \~english THE OTHER HALF OF THE SAME ARGUMENT, and it costs a mask and a
+     * compare because the allocator already answers this for its own reasons.
+     * A slot that was holding a pointer to a block instead of a return address
+     * lands here: nothing ever returns INTO the region this allocator carves
+     * blocks out of.
+     *
+     * Measured: with only the stack test the leftovers were 11,1 % of frames,
+     * and they were heap addresses.
+     *
+     * \~spanish LA OTRA MITAD DEL MISMO ARGUMENTO, y cuesta una mascara y una
+     * comparacion porque el asignador ya contesta esto por sus propios motivos.
+     * Una ranura que llevaba un puntero a un bloque en vez de una direccion de
+     * retorno cae aqui: nadie vuelve JAMAS a la region de la que este asignador
+     * recorta bloques.
+     *
+     * Medido: con solo la prueba de pila, lo que quedaba era el 11,1 % de los
+     * marcos, y eran direcciones del monton.  \~ */
+    return in_region(p) || in_big_region(p);
+}
+
+[[gnu::always_inline]] inline bool in_own_stack(const void *p) noexcept {
+#if defined(_WIN32)
+    const NT_TIB *const tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(tib->StackLimit);
+    const uintptr_t hi = reinterpret_cast<uintptr_t>(tib->StackBase);
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return lo != 0 && hi > lo && a >= lo && a < hi;
+#else
+    (void)p;
+    return false; // sin limites baratos no se demuestra nada, y no se tira nada
+#endif
+}
+
+/**
+ * @brief
+ * \~english The lowest address any code could ever live at.
+ * \~spanish La direccion mas baja en la que podria vivir codigo.
+ * \~
+ *
+ * \~english
+ * NOT A GUESS, A RESERVATION.  Windows keeps the bottom 64 KiB of every
+ * process permanently unmapped -- it is what turns a dereference of a small
+ * number into a fault instead of a read -- and Linux does the same by default
+ * through `mmap_min_addr`, which is 65536.  So a return address down there is
+ * PROVABLY not one, and that is the only kind of claim this walk is allowed to
+ * act on.
+ *
+ * It stays on the right side of the rule the rest of the file follows: reject
+ * the provably-impossible, never accept-only-the-provable.  Code this VM
+ * generated at run time belongs to no module and would be dropped by a
+ * module-membership test; it is nowhere near the first page, so this one keeps
+ * it.
+ *
+ * \~spanish
+ * NO ES UNA SUPOSICION, ES UNA RESERVA.  Windows deja los 64 KiB de abajo de
+ * todo proceso permanentemente sin mapear -- es lo que convierte en fallo, y no
+ * en una lectura, el desreferenciar un numero pequeno -- y Linux hace lo mismo
+ * por defecto con `mmap_min_addr`, que vale 65536.  Asi que una direccion de
+ * retorno ahi abajo DEMOSTRABLEMENTE no lo es, y esa es la unica clase de
+ * afirmacion sobre la que este recorrido puede actuar.
+ *
+ * Se queda del lado bueno de la regla que sigue el resto del fichero: tirar lo
+ * demostrablemente imposible, nunca aceptar solo lo demostrable.  El codigo que
+ * esta maquina genera en ejecucion no pertenece a ningun modulo y una prueba de
+ * pertenencia lo tiraria; de la primera pagina esta lejisimos, asi que esta lo
+ * conserva.
+ * \~
+ */
+constexpr uintptr_t kLowestCode = 0x10000;
+
+/// \~english What is written down in place of a hop that could not be read.
+///           Every one of them lands on THIS value so that the depot key stops
+///           splitting one stack into many; being below @c kLowestCode is what
+///           lets the report name it without a second flag.
+/// \~spanish Lo que se apunta en lugar de un salto que no se pudo leer.  Todos
+///           caen en ESTE valor para que la clave del deposito deje de partir
+///           una pila en varias; estar por debajo de @c kLowestCode es lo que
+///           permite nombrarlo en el informe sin una segunda marca.
+/// \~
+const void *const kUnreadableFrame = reinterpret_cast<const void *>(uintptr_t(1));
+
+/// \~english Whether @p p could be an address code lives at.  See @c kLowestCode.
+/// \~spanish Si @p p podria ser una direccion donde vive codigo.  Ver @c kLowestCode.
+/// \~
+[[gnu::always_inline]] inline bool could_be_code(const void *p) noexcept {
+    return reinterpret_cast<uintptr_t>(p) >= kLowestCode;
+}
+
+/// \~english Hops the walk could not read.  Counted and PRINTED: a walk that
+///           quietly swallows them looks like a program with short stacks.
+/// \~spanish Saltos que el recorrido no pudo leer.  Se cuentan y se IMPRIMEN:
+///           un recorrido que se los traga en silencio parece un programa con
+///           pilas cortas.
+/// \~
+std::atomic<uint64_t> g_frames_unreadable{0};
+
+/**
+ * @brief
  * \~english Fills @p out with the caller's stack, as deep as it can PROVE.
  * \~spanish Llena @p out con la pila del llamante, tan hondo como pueda
  *           DEMOSTRAR.
@@ -429,10 +758,435 @@ Stack *g_depot = nullptr;
  * \~spanish cuantos marcos son de verdad.
  * \~
  */
-unsigned walk_stack(const void **out, const void *first, const void *from,
-                    bool *walked) noexcept {
+#if defined(_WIN32)
+/**
+ * @brief
+ * \~english Which function an address belongs to, remembered.
+ * \~spanish De que funcion es una direccion, recordado.
+ * \~
+ *
+ * \~english
+ * THE WHOLE POINT OF UNWINDING BY HAND.  `RtlCaptureStackBackTrace` does the
+ * same loop this one does -- capture the registers, then per frame look the
+ * function up and apply its unwind data -- and measured with VTune on a real
+ * compile it was 80,5 % of the whole run, 12,65 s of 15,7.
+ *
+ * The dear half is the LOOKUP, not the unwinding: `RtlLookupFunctionEntry`
+ * binary-searches the image's function table, and `vm.exe` is 180 MB with some
+ * two hundred thousand entries, so every frame is a walk down a 2 MB table
+ * missing the cache at each probe.  That is why one capture costs 958 ns there
+ * and 365 ns in a small benchmark: the difference IS the lookup.
+ *
+ * And it is perfectly cacheable, because an address always belongs to the same
+ * function -- there is nothing to invalidate.  Measured on that same compile,
+ * 235.481 frames printed came from only 6.421 distinct addresses, each one
+ * looked up 36,7 times over.
+ *
+ * WHAT IS NOT DONE, and why.  Going below `RtlVirtualUnwind` -- reading the
+ * unwind data ourselves and keeping just "how far the stack rises here" -- was
+ * prototyped and measured: it saves another 35 ns of the 222, and it has to get
+ * right, by hand, the frame register, chained unwind information and being
+ * stopped inside an epilogue.  A walk that gets those wrong does not run slow,
+ * it NAMES ANOTHER FUNCTION, which is the failure this whole change exists to
+ * remove.  The system keeps the hard half; we keep the cache.
+ *
+ * \~spanish
+ * TODA LA RAZON DE DESENROLLAR A MANO.  `RtlCaptureStackBackTrace` hace el
+ * mismo bucle que este -- capturar los registros y, por marco, buscar la
+ * funcion y aplicar sus datos de desenrollado -- y medido con VTune sobre una
+ * compilacion real era el 80,5 % de la corrida entera, 12,65 s de 15,7.
+ *
+ * La mitad cara es la BUSQUEDA, no el desenrollado: `RtlLookupFunctionEntry`
+ * busca en binario en la tabla de funciones de la imagen, y `vm.exe` son 180 MB
+ * con unas doscientas mil entradas, asi que cada marco es un recorrido por una
+ * tabla de 2 MB fallando la cache en cada sondeo.  Por eso alli una captura
+ * cuesta 958 ns y en un banco pequeno 365: la diferencia ES la busqueda.
+ *
+ * Y se cachea perfectamente, porque una direccion es siempre de la misma
+ * funcion -- no hay nada que invalidar.  Medido en esa misma compilacion,
+ * 235.481 marcos impresos salian de solo 6.421 direcciones distintas, cada una
+ * buscada 36,7 veces de mas.
+ *
+ * LO QUE NO SE HACE, y por que.  Bajar por debajo de `RtlVirtualUnwind` -- leer
+ * nosotros los datos de desenrollado y quedarnos solo con "cuanto sube la pila
+ * aqui" -- se prototipo y se midio: ahorra otros 35 ns de los 222, y obliga a
+ * acertar a mano con el registro de marco, la informacion encadenada y el caer
+ * dentro de un epilogo.  Un recorrido que falle en eso no va lento, NOMBRA OTRA
+ * FUNCION, que es el fallo que este cambio entero existe para quitar.  La mitad
+ * dificil se queda en el sistema; la cache nos la quedamos nosotros.
+ * \~
+ */
+struct FnSlot {
+    std::atomic<const void *> pc; // publicado el ULTIMO: ver `lookup_fn`
+    PRUNTIME_FUNCTION rf;
+    ULONG64 base;
+};
+
+/**
+ * @brief
+ * \~english How many addresses are remembered.  One probe, never a chain.
+ * \~spanish Cuantas direcciones se recuerdan.  Un sondeo, nunca una cadena.
+ * \~
+ *
+ * \~english
+ * SIZED BY THE WALK, NOT BY THE REPORT.  The first try was 16k, from the 6.421
+ * distinct frames the report ends up printing -- and that is the wrong
+ * population: the report keeps `g_depth` frames per stack, while the walk goes
+ * THROUGH every frame between the allocation and the bottom of the stack, and
+ * those are the addresses that get looked up.  At 16k the table thrashed and
+ * the lookup stayed at 12,90 s of 21,5, which is what the cache existed to
+ * remove.
+ *
+ * \~spanish
+ * DIMENSIONADA POR EL RECORRIDO, NO POR EL INFORME.  El primer intento fueron
+ * 16k, sacadas de los 6.421 marcos distintos que el informe acaba imprimiendo
+ * -- y esa es la poblacion equivocada: el informe guarda `g_depth` marcos por
+ * pila, mientras que el recorrido pasa POR todos los marcos entre la reserva y
+ * el fondo de la pila, y esas son las direcciones que se buscan.  Con 16k la
+ * tabla se pisaba sola y la busqueda se quedaba en 12,90 s de 21,5, que es lo
+ * que la cache venia a quitar.
+ * \~
+ */
+constexpr uint32_t kFnBits = 18;
+constexpr uint32_t kFnSlots = 1u << kFnBits;
+FnSlot g_fn[kFnSlots];
+
+/* \~english AND NOTHING IS COUNTED IN HERE.  The first version kept a hit and a
+ * miss counter, two atomic increments on ONE shared line, run once per frame of
+ * every allocation -- some hundred and fifty million of them across threads.
+ * VTune put 12,90 s of 21,5 inside this function and the lookup it was meant to
+ * be saving was not what was costing: the MEASUREMENT was.  Whoever measures has
+ * to show up among the measured, and here the only honest place to show up is
+ * the clock.
+ *
+ * \~spanish Y AQUI DENTRO NO SE CUENTA NADA.  La primera version llevaba un
+ * contador de aciertos y otro de fallos, dos incrementos atomicos sobre UNA
+ * linea compartida, ejecutados por cada marco de cada reserva -- unos ciento
+ * cincuenta millones repartidos entre hilos.  VTune puso 12,90 s de 21,5 dentro
+ * de esta funcion, y lo que costaba no era la busqueda que venia a ahorrar: era
+ * la MEDIDA.  Quien mide tiene que aparecer entre lo medido, y aqui el unico
+ * sitio honrado donde aparecer es el reloj.  \~ */
+
+[[gnu::always_inline]] inline PRUNTIME_FUNCTION
+lookup_fn(ULONG64 rip, ULONG64 *base) noexcept {
+    const uint32_t i =
+        uint32_t((uint64_t(rip) * 0x9E3779B97F4A7C15ull) >> (64 - kFnBits));
+    FnSlot &s = g_fn[i];
+    /* \~english WHAT IS READ BACK IS CHECKED, and publishing the address last
+     * is not enough on its own.  Two threads filling the same slot interleave:
+     * one writes its function, the other writes its own, and then the first
+     * publishes ITS address -- leaving a reader an address paired with somebody
+     * else's function.  Handing that to `RtlVirtualUnwind` is not a wrong name,
+     * it is a fault, and that is exactly how it crashed the first time.
+     *
+     * The check costs two compares and needs nothing else, because the answer
+     * carries its own proof: a function entry says which range it covers, so
+     * an entry that does not cover the address IS the torn one.  Then it counts
+     * as a miss, which is correct and costs what it used to.
+     *
+     * \~spanish LO QUE SE LEE SE COMPRUEBA, y publicar la direccion la ultima
+     * no basta por si solo.  Dos hilos llenando la misma ranura se entrelazan:
+     * uno escribe su funcion, el otro escribe la suya, y entonces el primero
+     * publica SU direccion -- dejandole a quien lea una direccion emparejada
+     * con la funcion de otro.  Darle eso a `RtlVirtualUnwind` no es un nombre
+     * equivocado, es un fallo de pagina, y asi es como revento la primera vez.
+     *
+     * La comprobacion cuesta dos comparaciones y no necesita nada mas, porque
+     * la respuesta lleva su propia prueba: una entrada de funcion dice que
+     * rango cubre, asi que una entrada que no cubre la direccion ES la rota.
+     * Entonces cuenta como fallo, que es correcto y cuesta lo que costaba.  \~ */
+    if (s.pc.load(std::memory_order_acquire) ==
+        reinterpret_cast<const void *>(rip)) {
+        PRUNTIME_FUNCTION rf = s.rf;
+        const ULONG64 b = s.base;
+        const ULONG64 off = rip - b;
+        if (rf != nullptr && off >= rf->BeginAddress && off < rf->EndAddress) {
+            *base = b;
+            return rf;
+        }
+    }
+    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(rip, base, nullptr);
+    /* \~english A leaf has no entry, and "no entry" cannot be checked against a
+     * range -- so it is not remembered.  There are few of them and the lookup
+     * that says so is the cheap half.
+     * \~spanish Una hoja no tiene entrada, y "no hay entrada" no se puede
+     * contrastar con un rango -- asi que no se recuerda.  Son pocas y la
+     * busqueda que lo dice es la mitad barata.  \~ */
+    if (rf != nullptr) {
+        s.rf = rf;
+        s.base = *base;
+        s.pc.store(reinterpret_cast<const void *>(rip),
+                   std::memory_order_release);
+    }
+    return rf;
+}
+
+/**
+ * @brief
+ * \~english Fills @p raw with return addresses, innermost first.
+ * \~spanish Llena @p raw con direcciones de retorno, de dentro hacia fuera.
+ * \~
+ *
+ * \~english
+ * The same loop `RtlCaptureStackBackTrace` runs, with the lookup remembered.
+ * A function with no entry in the table is a LEAF -- it pushed nothing, so its
+ * return address is the top of the stack and one add is the whole unwind.
+ * \~spanish
+ * El mismo bucle que corre `RtlCaptureStackBackTrace`, con la busqueda
+ * recordada.  Una funcion sin entrada en la tabla es una HOJA -- no empujo
+ * nada, asi que su direccion de retorno es lo alto de la pila y una suma es
+ * todo el desenrollado.
+ * \~
+ */
+[[gnu::noinline]] unsigned capture_tables(void **raw, unsigned max) noexcept {
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    unsigned n = 0;
+    while (n < max) {
+        ULONG64 base = 0;
+        PRUNTIME_FUNCTION rf = lookup_fn(ctx.Rip, &base);
+        if (rf == nullptr) {
+            /* \~english A leaf frame: nothing was pushed but the call itself.
+             * The stack is read by HAND here, so it is checked to be stack
+             * first -- this is the one place the walk dereferences an address
+             * the tables did not vouch for.
+             * \~spanish Un marco hoja: no se empujo nada mas que la llamada.
+             * Aqui se lee la pila a MANO, asi que primero se comprueba que sea
+             * pila -- es el unico sitio donde el recorrido desreferencia una
+             * direccion por la que no respondieron las tablas.  \~ */
+            if (!in_own_stack(reinterpret_cast<const void *>(ctx.Rsp))) break;
+            ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
+            ctx.Rsp += sizeof(DWORD64);
+        } else {
+            PVOID handler = nullptr;
+            ULONG64 established = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx,
+                             &handler, &established, nullptr);
+        }
+        /* \~english The bottom of the stack answers with zero, and that is the
+         * end -- not an error.
+         * \~spanish El fondo de la pila contesta con cero, y ahi se acaba -- no
+         * es un error.  \~ */
+        if (ctx.Rip == 0) break;
+        raw[n++] = reinterpret_cast<void *>(ctx.Rip);
+    }
+    return n;
+}
+
+#else // !_WIN32
+
+/**
+ * @brief
+ * \~english What one frame of the unwind writes down.
+ * \~spanish Lo que apunta un marco del desenrollado.
+ * \~
+ */
+struct Capture {
+    void **raw;
+    unsigned max;
+    unsigned n;
+};
+
+/// \~english One frame.  A named function and not a lambda, as the rest of this
+///           project is written.
+/// \~spanish Un marco.  Una funcion con NOMBRE y no una lambda, como esta
+///           escrito el resto de este proyecto.
+/// \~
+_Unwind_Reason_Code capture_one(struct _Unwind_Context *ctx, void *arg) {
+    Capture *const c = static_cast<Capture *>(arg);
+    if (c->n >= c->max) return _URC_END_OF_STACK;
+    const uintptr_t ip = uintptr_t(_Unwind_GetIP(ctx));
+    if (ip == 0) return _URC_END_OF_STACK;
+    c->raw[c->n++] = reinterpret_cast<void *>(ip);
+    return _URC_NO_REASON;
+}
+
+/**
+ * @brief
+ * \~english Fills @p raw with return addresses, innermost first.
+ * \~spanish Llena @p raw con direcciones de retorno, de dentro hacia fuera.
+ * \~
+ *
+ * \~english
+ * THE SAME ARGUMENT AS ON WINDOWS, through the machinery this platform
+ * REQUIRES instead.  Here the unwind data lives in `.eh_frame`, and it is
+ * there for the same reason `.pdata` is there: throwing an exception through a
+ * frame needs it, so every compiler emits it whatever it did with the frame
+ * pointer.  `_Unwind_Backtrace` is libgcc's own reader of it -- the very code
+ * that runs when something is thrown.
+ *
+ * WHY NOT `backtrace(3)`.  Because glibc's is a thin wrapper over exactly this
+ * and drags in `execinfo.h`, which musl does not have: a checker that only
+ * works against one C library is a checker half the targets cannot run.
+ *
+ * AND THE FRAME-POINTER WALK STAYS UNDERNEATH, not as the way in but as the
+ * answer where there is no unwind data at all -- a freestanding build with
+ * `-fno-asynchronous-unwind-tables`, which is a target this allocator is meant
+ * to serve.  See `walk_stack`.
+ *
+ * \~spanish
+ * EL MISMO ARGUMENTO QUE EN WINDOWS, por la maquinaria que esta plataforma
+ * EXIGE en su lugar.  Aqui los datos de desenrollado viven en `.eh_frame`, y
+ * estan por la misma razon que esta `.pdata`: lanzar una excepcion a traves de
+ * un marco los necesita, asi que todo compilador los emite haga lo que haga
+ * con el puntero de marco.  `_Unwind_Backtrace` es el lector que libgcc tiene
+ * de ellos -- el mismisimo codigo que corre cuando algo se lanza.
+ *
+ * POR QUE NO `backtrace(3)`.  Porque el de glibc es una capa fina sobre esto
+ * mismo y arrastra `execinfo.h`, que musl no tiene: un comprobador que solo
+ * funciona con una libreria de C es un comprobador que la mitad de los
+ * objetivos no pueden correr.
+ *
+ * Y EL RECORRIDO POR PUNTERO DE MARCO SIGUE DEBAJO, no como via de entrada
+ * sino como respuesta donde no haya datos de desenrollado en absoluto -- una
+ * construccion sin sistema operativo con `-fno-asynchronous-unwind-tables`,
+ * que es un objetivo al que este asignador quiere servir.  Ver `walk_stack`.
+ * \~
+ */
+[[gnu::noinline]] unsigned capture_tables(void **raw, unsigned max) noexcept {
+    Capture c;
+    c.raw = raw;
+    c.max = max;
+    c.n = 0;
+    _Unwind_Backtrace(&capture_one, &c);
+    return c.n;
+}
+
+#endif // _WIN32
+
+/**
+ * @brief
+ * \~english Unwinds with the tables the platform REQUIRES, not with a register.
+ * \~spanish Desenrolla con las tablas que la plataforma EXIGE, no con un
+ *           registro.
+ * \~
+ *
+ * \~english
+ * WHY THIS IS THE WAY IN, and the frame pointer the fallback.  On x86-64
+ * Windows every function that is not a leaf must carry its own unwind
+ * information in `.pdata` / `.xdata`; it is not a debugging extra, it is what
+ * makes throwing an exception work.  So the chain is ALWAYS there to be read,
+ * whatever the optimiser did with `rbp` -- and in a Release build, where
+ * nothing keeps a frame pointer, this is the only thing that answers at all.
+ *
+ * IT WAS MEASURED BEFORE BEING WRITTEN, because the earlier conclusion here was
+ * the opposite one and it was wrong.  Walking `rbp` was kept on the grounds
+ * that the profiling build keeps frame pointers.  It does -- for 8 of the 82
+ * functions of `host_allocator.cpp` and 10 of the 40 of this file, with
+ * `-fno-omit-frame-pointer` explicitly on.  GCC takes the flag and still uses
+ * `rbp` as an ordinary callee-saved register, precisely because on this
+ * platform the unwinding does not go through it.
+ *
+ * And none of the few that do keep it are on the way out of the allocator, so
+ * the chain died TWO HOPS from the hook, inside this library, before it could
+ * reach the program: at `new_measured` the slot where a return address should
+ * be held the constant `0x10`.  That is where the numbers that were being
+ * stored as frames came from -- the same `1`, `8`, `0x20` the report was full
+ * of -- and why a `std::vector` could only ever be named by the one shared body
+ * of `_M_realloc_insert`, never by its owner.
+ *
+ * THE CHECKER PAYS IT, NOT THE ALLOCATOR.  Reading unwind data is much dearer
+ * than following two stack slots, and it is called from the checker's hooks
+ * alone: with the mode off, this function is not reached and not linked in.
+ *
+ * \~spanish
+ * POR QUE ESTA ES LA VIA, y el puntero de marco el respaldo.  En Windows de 64
+ * bits toda funcion que no sea hoja tiene que llevar su informacion de
+ * desenrollado en `.pdata` / `.xdata`; no es un extra de depuracion, es lo que
+ * hace que lanzar una excepcion funcione.  Asi que la cadena esta SIEMPRE ahi
+ * para leerla, haga lo que haga el optimizador con `rbp` -- y en un build de
+ * Release, donde nadie conserva puntero de marco, es lo unico que contesta.
+ *
+ * SE MIDIO ANTES DE ESCRIBIRLO, porque la conclusion anterior era la contraria
+ * y estaba equivocada.  Se mantuvo el recorrido por `rbp` con el argumento de
+ * que el build de perfilado conserva punteros de marco.  Los conserva -- en 8
+ * de las 82 funciones de `host_allocator.cpp` y en 10 de las 40 de este
+ * fichero, con `-fno-omit-frame-pointer` puesto a proposito.  GCC acepta la
+ * bandera y usa `rbp` igualmente como un registro salvado cualquiera,
+ * justamente porque en esta plataforma el desenrollado no pasa por el.
+ *
+ * Y ninguna de las pocas que si lo conservan esta en el camino de salida del
+ * asignador, asi que la cadena moria A DOS SALTOS del gancho, dentro de esta
+ * libreria, antes de poder llegar al programa: en `new_measured`, la ranura
+ * donde deberia ir una direccion de retorno llevaba la constante `0x10`.  De
+ * ahi salian los numeros que se guardaban como marcos -- los mismos `1`, `8`,
+ * `0x20` de los que estaba lleno el informe -- y por eso a un `std::vector`
+ * solo se le podia poner el nombre del unico cuerpo compartido de
+ * `_M_realloc_insert`, jamas el de su dueno.
+ *
+ * LO PAGA EL COMPROBADOR, NO EL ASIGNADOR.  Leer datos de desenrollado es mucho
+ * mas caro que seguir dos ranuras de pila, y se llama solo desde los ganchos
+ * del comprobador: con el modo apagado no se llega aqui ni se enlaza.
+ * \~
+ *
+ * @return
+ * \~english how many frames were written, or 0 if @p first was not in the
+ *          chain -- which is not a failure, it is a "this is not my call" and
+ *          the caller falls back.
+ * \~spanish cuantos marcos se escribieron, o 0 si @p first no estaba en la
+ *          cadena -- que no es un fallo, es un "esta no es mi llamada" y quien
+ *          llama se va al respaldo.
+ * \~
+ */
+unsigned walk_tables(const void **out, const void *first, bool *walked,
+                     bool *cut) noexcept {
+    /* Room for the checker's own frames on top of what a stack can hold: this
+     * capture starts HERE, and the frames between here and `first` are ours. */
+    void *raw[kFrames + 8];
+    /* \~english ONLY AS FAR AS IT IS GOING TO BE KEPT.  Unwinding is paid per
+     * FRAME, and the room here is for the deepest walk anybody can ask for --
+     * so filling it always meant unwinding the whole stack of the program and
+     * throwing away everything past `g_depth`.  In a compiler, where a stack is
+     * forty frames deep, that is most of the work done for nothing.
+     *
+     * The margin on top is for the checker's own frames, which sit between this
+     * capture and the anchor and do not count towards what was asked for.
+     *
+     * \~spanish SOLO HASTA DONDE SE VA A GUARDAR.  Desenrollar se paga por
+     * MARCO, y el sitio de aqui es para el recorrido mas hondo que alguien
+     * pueda pedir -- asi que llenarlo siempre significaba desenrollar la pila
+     * entera del programa y tirar todo lo pasado de `g_depth`.  En un
+     * compilador, donde una pila tiene cuarenta marcos, eso es casi todo el
+     * trabajo hecho para nada.
+     *
+     * El margen de arriba es para los marcos del propio comprobador, que estan
+     * entre esta captura y el ancla y no cuentan para lo que se pidio.  \~ */
+    const unsigned room = unsigned(sizeof raw / sizeof raw[0]);
+    const unsigned need = g_depth + 8;
+    const unsigned got = capture_tables(raw, need < room ? need : room);
+
+    /* \~english FOUND BY ADDRESS, not by counting.  How many frames of the
+     * checker there are between this capture and the allocation depends on what
+     * the compiler inlined into what, and a fixed number would be right in one
+     * build and silently point at the wrong function in the next.  `first` is
+     * the one address the caller already knows to be true, so it is the anchor.
+     *
+     * \~spanish SE ENCUENTRA POR DIRECCION, no contando.  Cuantos marcos del
+     * comprobador hay entre esta captura y la reserva depende de que inlinara
+     * el compilador dentro de que, y un numero fijo seria correcto en un build
+     * y apuntaria en silencio a otra funcion en el siguiente.  `first` es la
+     * unica direccion que quien llama ya sabe cierta, asi que es el ancla.  \~ */
+    unsigned at = 0;
+    while (at < got && raw[at] != first) ++at;
+    if (at == got) return 0;
+
+    unsigned n = 1; // out[0] is `first`, already written by the caller
+    for (unsigned k = at + 1; k < got && n < g_depth; ++k) {
+        out[n++] = raw[k];
+        *walked = true;
+    }
+    /* Same distinction as the fallback keeps: out of room is not out of stack.
+     * See the note at the end of `walk_stack`. */
+    if (cut != nullptr && n >= g_depth && at + n < got) *cut = true;
+    return n;
+}
+
+unsigned walk_frame_pointer(const void **out, const void *first,
+                            const void *from, bool *walked,
+                            bool *cut) noexcept {
     out[0] = first;
     *walked = false;
+    if (cut != nullptr) *cut = false;
     unsigned n = 1;
 
     /* \~english WHERE TO START, and it is given rather than taken, for the same
@@ -464,6 +1218,72 @@ unsigned walk_stack(const void **out, const void *first, const void *from,
         const void *const next = slot[0];
         const void *const ret = slot[1];
         if (ret == nullptr || !plausible_frame(next, below)) break;
+        /* \~english AND THAT WHAT IS WRITTEN DOWN IS AN ADDRESS, not whatever
+         * happened to be in that slot.  Until now the NEXT link was checked and
+         * the VALUE never was: a function that sets up no frame leaves in
+         * `slot[1]` whatever it carries there -- a pointer to a local, a
+         * temporary -- and that was kept as if it were a frame.
+         *
+         * Measured before fixing it, on a real compile: at depth 4, 2.824 of
+         * 12.994 frames were values the resolver could not name, 21,7 %.  And it
+         * was not only noise in the report: those values go into the depot KEY,
+         * so one stack counted as several and the number of distinct sites came
+         * out inflated.
+         *
+         * THE LINK AND THE VALUE ARE TWO CLAIMS, each with its own test, and
+         * they fail apart.  `plausible_frame` has already vouched for
+         * `slot[0]`; what is being rejected here is `slot[1]`, read out of the
+         * same frame but proving nothing about it.  So the hop is MARKED and
+         * the walk goes on -- it is not following an unchecked pointer, it is
+         * carrying on along a link that was checked and found good.
+         *
+         * Measured on a real compile before deciding: of the 3.944 stacks with
+         * an unreadable hop, 3.848 still had a true frame BEHIND it, and in
+         * 3.938 of them the hop was the very first step.  Stopping would have
+         * thrown away the only useful frame in 97 % of them -- and the one it
+         * throws away is precisely the caller that says whose the container
+         * was.
+         *
+         * WHAT GETS WRITTEN DOWN IS THE MARK, never the number.  Every
+         * unreadable hop lands on the same value, so the same stack stops
+         * splitting into several: those values go into the depot KEY, and with
+         * the raw number in there 7.397 distinct stacks were really 3.443 --
+         * 3.954 of them the same site counted twice, told apart by a size that
+         * leaked in.  The commonest was a bare `1`, 3.356 times.
+         *
+         * \~spanish Y QUE LO QUE SE APUNTA SEA UNA DIRECCION, no lo que hubiera
+         * en esa ranura.  Hasta aqui se comprobaba el eslabon siguiente y nunca
+         * el VALOR: una funcion que no monta marco deja en `slot[1]` lo que
+         * llevara ahi -- un puntero a un local, un temporal --, y eso se
+         * guardaba como si fuera un marco.
+         *
+         * EL ESLABON Y EL VALOR SON DOS AFIRMACIONES, cada una con su prueba, y
+         * fallan por separado.  `plausible_frame` ya ha respondido por
+         * `slot[0]`; lo que se rechaza aqui es `slot[1]`, leido del mismo marco
+         * pero sin demostrar nada de el.  Asi que el salto se MARCA y el
+         * recorrido sigue -- no esta siguiendo un puntero sin comprobar, esta
+         * continuando por un eslabon que se comprobo y salio bueno.
+         *
+         * Medido sobre una compilacion real antes de decidirlo: de las 3.944
+         * pilas con un salto ilegible, 3.848 tenian todavia un marco cierto
+         * DETRAS, y en 3.938 el salto era el primer paso.  Parar habria tirado
+         * el unico marco util en el 97 % de ellas -- y el que tira es justo el
+         * llamante que dice de quien era el contenedor.
+         *
+         * SE APUNTA LA MARCA, nunca el numero.  Todo salto ilegible cae en el
+         * mismo valor, con lo que la misma pila deja de partirse en varias: esos
+         * valores entran en la CLAVE del deposito, y con el numero crudo dentro
+         * 7.397 pilas distintas eran en realidad 3.443 -- 3.954 de ellas el
+         * mismo sitio contado dos veces, separado por un tamano que se colo --.
+         * El mas repetido era un `1` pelado, 3.356 veces.  \~ */
+        if (in_own_stack(ret) || in_own_heap(ret)) break;
+        if (!could_be_code(ret)) {
+            out[n++] = kUnreadableFrame;
+            g_frames_unreadable.fetch_add(1, std::memory_order_relaxed);
+            below = fp;
+            fp = next;
+            continue;
+        }
         /* \~english THE FIRST ONE IS USUALLY THE ONE WE ALREADY HAVE.  Whether
          * the hook ends up as its own frame depends on what the compiler
          * inlined into what, so the chain may start at the very address the
@@ -482,7 +1302,95 @@ unsigned walk_stack(const void **out, const void *first, const void *from,
         below = fp;
         fp = next;
     }
+    /* \~english RUNNING OUT OF ROOM IS NOT THE SAME AS RUNNING OUT OF STACK.
+     * The loop has two exits -- nothing more could be proven, or there was
+     * nowhere left to put it -- and until now both returned the same thing.  A
+     * cut stack wearing the face of a whole one says "it started here" when the
+     * truth is "this is as far as we got", and whoever reads it goes looking for
+     * the bug in the wrong place.
+     *
+     * \~spanish SALIR POR ARRIBA NO ES LO MISMO QUE NO PODER SEGUIR.  El bucle
+     * tiene dos salidas -- se acabo lo demostrable, o se acabo el sitio -- y
+     * hasta ahora devolvian lo mismo.  Una pila cortada con el aspecto de una
+     * entera dice "aqui empezo" cuando lo cierto es "hasta aqui llegamos", y
+     * quien la lea buscara el fallo donde no esta.  \~ */
+    if (cut != nullptr && n >= g_depth) *cut = true;
     return n;
+}
+
+/* \~english WHAT THE CHEAP WAY WOULD HAVE ANSWERED, counted against what the
+ * true one answers.  Following `rbp` costs 1,5 ns and reading the tables 250,
+ * so using the cheap one where it works is worth asking about -- but it cannot
+ * be decided by argument, because the way it fails is by handing back a NUMBER
+ * and not by saying it could not.  A value that lands above the first page
+ * passes every test there is and is a lie nothing catches.
+ *
+ * So both are run and compared, and this is the only place that can say how
+ * often the cheap one would have been enough and how often it would have been
+ * WRONG WITHOUT SAYING SO.  Asked for with `VESTA_ALLOC_SAN_COMPARE=1`, because
+ * it doubles the cost of every walk: it is how the question gets decided, not
+ * how the checker runs.
+ *
+ * \~spanish LO QUE HABRIA CONTESTADO LA VIA BARATA, contado contra lo que
+ * contesta la cierta.  Seguir `rbp` cuesta 1,5 ns y leer las tablas 250, asi
+ * que usar la barata donde funcione merece la pregunta -- pero no se decide
+ * discutiendo, porque su forma de fallar es devolver un NUMERO y no decir que
+ * no pudo.  Un valor que caiga por encima de la primera pagina pasa todas las
+ * pruebas que hay y es una mentira que no coge nadie.
+ *
+ * Asi que se corren las dos y se comparan, y este es el unico sitio que puede
+ * decir cuantas veces habria bastado la barata y cuantas habria estado MAL SIN
+ * DECIRLO.  Se pide con `VESTA_ALLOC_SAN_COMPARE=1`, porque duplica el coste de
+ * cada recorrido: es como se decide la pregunta, no como corre el
+ * comprobador.  \~ */
+std::atomic<uint64_t> g_cmp_walks{0};    // recorridos comparados
+std::atomic<uint64_t> g_cmp_same{0};     // rbp llego igual de lejos y acerto
+std::atomic<uint64_t> g_cmp_short{0};    // rbp acerto hasta donde llego, y paro
+std::atomic<uint64_t> g_cmp_wrong{0};    // rbp dijo OTRA cosa, sin avisar
+std::atomic<uint64_t> g_cmp_rbp_frames{0};
+std::atomic<uint64_t> g_cmp_tab_frames{0};
+bool g_compare = false;
+
+void compare_walks(const void *first, const void *from,
+                   const void **truth, unsigned tn) noexcept {
+    const void *mine[kFrames];
+    bool w = false, c = false;
+    const unsigned mn = walk_frame_pointer(mine, first, from, &w, &c);
+    g_cmp_walks.fetch_add(1, std::memory_order_relaxed);
+    g_cmp_rbp_frames.fetch_add(mn, std::memory_order_relaxed);
+    g_cmp_tab_frames.fetch_add(tn, std::memory_order_relaxed);
+
+    /* A mark is the walk SAYING it could not read that hop, so it is not a
+     * wrong answer -- it is the absence of one, and it counts as stopping. */
+    unsigned k = 1;
+    while (k < mn && k < tn && mine[k] == truth[k]) ++k;
+    if (k < mn && mine[k] != kUnreadableFrame && k < tn)
+        g_cmp_wrong.fetch_add(1, std::memory_order_relaxed);
+    else if (mn >= tn)
+        g_cmp_same.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_cmp_short.fetch_add(1, std::memory_order_relaxed);
+}
+
+unsigned walk_stack(const void **out, const void *first, const void *from,
+                    bool *walked, bool *cut) noexcept {
+    /* \~english THE TABLES FIRST, and the register walk only where there are
+     * none.  Zero means the anchor was not in the captured chain, which is not
+     * an answer -- so the old way gets its turn rather than the stack being
+     * reported as one frame long.
+     *
+     * \~spanish LAS TABLAS PRIMERO, y el recorrido por registro solo donde no
+     * las haya.  Cero significa que el ancla no estaba en la cadena capturada,
+     * que no es una respuesta -- asi que le toca el turno a la via vieja en vez
+     * de dar la pila por larga de un marco.  \~ */
+    out[0] = first;
+    *walked = false;
+    if (cut != nullptr) *cut = false;
+    if (const unsigned got = walk_tables(out, first, walked, cut)) {
+        if (g_compare) compare_walks(first, from, out, got);
+        return got;
+    }
+    return walk_frame_pointer(out, first, from, walked, cut);
 }
 
 /// \~english FNV-1a over the frames.  The same stack lands on the same slot
@@ -506,9 +1414,11 @@ uint32_t hash_stack(const void *const *pc, unsigned n) noexcept {
 }
 
 bool same_stack(const Stack &s, const void *const *pc, unsigned n) noexcept {
-    if (s.frames != n) return false;
+    if (s.n != n) return false;
+    const void *const *const f = frames_of(s);
+    if (f == nullptr) return false;
     for (unsigned i = 0; i < n; ++i)
-        if (s.pc[i] != pc[i]) return false;
+        if (f[i] != pc[i]) return false;
     return true;
 }
 
@@ -541,7 +1451,8 @@ bool same_stack(const Stack &s, const void *const *pc, unsigned n) noexcept {
  * \~spanish el identificador, o 0 cuando no hay pila que dar.
  * \~
  */
-uint32_t intern_stack(const void *const *pc, unsigned n, bool walked) noexcept {
+uint32_t intern_stack(const void *const *pc, unsigned n, bool walked,
+                      bool cut) noexcept {
     if (g_depot == nullptr) return 0;
     uint32_t i = hash_stack(pc, n) & (kDepotSlots - 1);
     if (i == 0) i = 1; // zero is reserved for "no stack"
@@ -582,8 +1493,40 @@ uint32_t intern_stack(const void *const *pc, unsigned n, bool walked) noexcept {
             if (s.state.compare_exchange_strong(expected, kSlotClaiming,
                                                 std::memory_order_acq_rel,
                                                 std::memory_order_acquire)) {
-                for (unsigned k = 0; k < n; ++k) s.pc[k] = pc[k];
-                s.frames = uint8_t(n);
+                /* \~english THE FRAMES FIRST AND THE ENTRY AFTERWARDS, which is
+                 * the same order as before -- only now "the frames" means a run
+                 * in the pool.  Nobody can read them until `state` says ready,
+                 * and that store is the release that publishes both.
+                 *
+                 * No room in the pool is not a reason to lose the stack: the
+                 * entry is still made, with zero frames and the cut mark on, so
+                 * whoever reads it knows there WAS a stack and that this is not
+                 * it.  Silence would be the other answer, and the wrong one.
+                 *
+                 * \~spanish LOS MARCOS PRIMERO Y LA ENTRADA DESPUES, que es el
+                 * mismo orden de antes -- solo que ahora "los marcos" es una
+                 * tirada del almacen.  Nadie puede leerlos hasta que `state`
+                 * diga listo, y ese almacenamiento es la publicacion de los dos.
+                 *
+                 * Que no haya sitio en el almacen no es razon para perder la
+                 * pila: la entrada se hace igual, con cero marcos y la marca de
+                 * corte puesta, para que quien la lea sepa que HABIA una pila y
+                 * que esto no lo es.  Callar seria la otra respuesta, y la
+                 * equivocada.  \~ */
+                const uint32_t at = pool_reserve(n);
+                if (at != UINT32_MAX) {
+                    const void **const dst =
+                        g_pool[at / kPoolChunk].load(std::memory_order_acquire) +
+                        (at % kPoolChunk);
+                    for (unsigned k = 0; k < n; ++k) dst[k] = pc[k];
+                    s.first = at;
+                    s.n = uint8_t(n);
+                    s.cut = cut ? 1 : 0;
+                } else {
+                    s.first = 0;
+                    s.n = 0;
+                    s.cut = 1;
+                }
                 s.walked = walked ? 1 : 0;
                 s.state.store(kSlotReady, std::memory_order_release);
                 return i;
@@ -683,6 +1626,86 @@ constexpr uint32_t kSlotsPerChunk = kChunkBytes / kAlign;
 
 std::atomic<Slot *> *g_rows = nullptr; ///< one entry per chunk of the region
 uint32_t g_row_count = 0;
+
+/**
+ * @brief
+ * \~english How many blocks of each chunk are alive right now.
+ * \~spanish Cuantos bloques de cada trozo estan vivos ahora mismo.
+ * \~
+ *
+ * \~english
+ * WHAT IT IS FOR.  A chunk handed to a size class never goes back: it comes off
+ * the region watermark, gets its class, and serves that class for the rest of
+ * the run.  So a chunk whose blocks all died is 64 KiB the program is paying
+ * for and nobody can use -- unless the allocator learned to return it.
+ *
+ * How much that would be worth is the question, and it decides whose work the
+ * next fix is: chunks that end up EMPTY are the allocator's to reclaim, while
+ * chunks stuck at three per cent with their live blocks scattered are nobody's
+ * to reclaim -- there the answer is not to hold a whole program at once, and
+ * that is the caller's.
+ *
+ * COUNTED, NOT WALKED.  A chunk is 4.096 slots; walking every row at every cut
+ * would be sixty-five million reads a cut.  One counter per row, moved where
+ * the shadow already writes the state, answers the same thing for an add.
+ *
+ * \~spanish
+ * PARA QUE.  Un trozo entregado a una clase de tamano no vuelve nunca: sale de
+ * la marca de agua de la region, coge su clase, y sirve a esa clase el resto de
+ * la corrida.  Asi que un trozo al que se le murieron todos los bloques son 64
+ * KiB que el programa paga y no puede usar nadie -- salvo que el asignador
+ * aprendiera a devolverlo.
+ *
+ * Cuanto valdria eso es la pregunta, y decide de quien es el arreglo siguiente:
+ * los trozos que acaban VACIOS son del asignador, mientras que los que se
+ * quedan al tres por ciento con sus vivos repartidos no son de nadie -- ahi la
+ * respuesta es no sostener un programa entero a la vez, y eso es de quien
+ * llama.
+ *
+ * SE CUENTA, NO SE RECORRE.  Un trozo son 4.096 ranuras; recorrer todas las
+ * filas en cada corte serian sesenta y cinco millones de lecturas por corte.
+ * Un contador por fila, movido donde la sombra ya escribe el estado, contesta
+ * lo mismo por una suma.
+ * \~
+ */
+std::atomic<uint32_t> *g_row_live = nullptr;
+
+/**
+ * @brief
+ * \~english Moves the live count of the chunk @p p is in.
+ * \~spanish Mueve la cuenta de vivos del trozo en el que esta @p p.
+ * \~
+ *
+ * \~english
+ * DRIVEN BY THE TRANSITION, never by the event.  Adding on every birth and
+ * subtracting on every death looks the same and is not: the shadow forgets a
+ * block as soon as its address is handed out again, so a free the checker did
+ * not see leaves a slot that goes alive-to-alive, and the count would climb for
+ * ever with nothing saying so.  Reading the state it is LEAVING makes the
+ * counter exactly "slots that are alive", whatever it missed.
+ *
+ * \~spanish
+ * LA MUEVE LA TRANSICION, nunca el suceso.  Sumar en cada nacimiento y restar
+ * en cada muerte parece lo mismo y no lo es: la sombra olvida un bloque en
+ * cuanto su direccion se vuelve a entregar, asi que una liberacion que el
+ * comprobador no vio deja una ranura que pasa de viva a viva, y la cuenta
+ * subiria para siempre sin que nada lo dijera.  Leer el estado del que SALE
+ * hace que el contador sea exactamente "ranuras vivas", se haya perdido lo que
+ * se haya perdido.  \~
+ */
+[[gnu::always_inline]] inline void row_live_move(const void *p,
+                                                 bool alive) noexcept {
+    if (g_row_live == nullptr) return;
+    const uintptr_t base = detail::g_region_base.load(std::memory_order_relaxed);
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    if (a < base) return;
+    const uint32_t row = uint32_t((a - base) / kChunkBytes);
+    if (row >= g_row_count) return;
+    if (alive)
+        g_row_live[row].fetch_add(1, std::memory_order_relaxed);
+    else
+        g_row_live[row].fetch_sub(1, std::memory_order_relaxed);
+}
 
 /**
  * @brief
@@ -830,6 +1853,770 @@ struct Life {
 
 Life *g_life = nullptr;
 
+// =========================================================================
+// \~english THE TIME AXIS: how much is live, whose it is, and WHEN.
+// \~spanish  EL EJE DEL TIEMPO: cuanto hay vivo, de quien es, y CUANDO.
+// =========================================================================
+
+/**
+ * @brief
+ * \~english Bytes each site has live at this instant.
+ * \~spanish Bytes que cada sitio tiene vivos en este instante.
+ * \~
+ *
+ * \~english
+ * THE FIGURE EVERY OTHER COLUMN HERE WAS BEING MISTAKEN FOR.  @c Life::bytes
+ * adds up every block a site ever handed out, and a vector that doubles twelve
+ * times hands out twice what it ever holds.  Measured on a real compile: one
+ * site showed 407.9 MB in TWELVE allocations, which is ONE vector growing to
+ * about two hundred -- not four hundred megabytes of demand.  Read as
+ * residency, that number sent a whole afternoon after the wrong structure.
+ *
+ * SIGNED ON PURPOSE.  These are plain additions shared between threads, like
+ * the rest of @c Life, so a lost update can leave a site below zero.  Unsigned,
+ * that becomes sixteen exabytes and poisons every total it enters; signed, it
+ * stays a small negative that the report clamps and counts.
+ *
+ * \~spanish
+ * LA CIFRA QUE TODAS LAS DEMAS COLUMNAS PARECIAN SER.  @c Life::bytes suma todo
+ * bloque que un sitio entrego alguna vez, y un vector que dobla doce veces
+ * entrega el doble de lo que llega a tener.  Medido en una compilacion de
+ * verdad: un sitio marcaba 407,9 MB en DOCE reservas, que es UN vector
+ * creciendo hasta unos doscientos -- no cuatrocientos megabytes de demanda.
+ * Leido como residencia, ese numero mando una tarde entera tras la estructura
+ * equivocada.
+ *
+ * CON SIGNO A PROPOSITO.  Son sumas normales compartidas entre hilos, como el
+ * resto de @c Life, asi que una actualizacion perdida puede dejar un sitio por
+ * debajo de cero.  Sin signo eso son dieciseis exabytes y envenena todo total
+ * en el que entre; con signo se queda en un negativo pequeno que el informe
+ * acota y cuenta.
+ * \~
+ */
+int64_t *g_live = nullptr;
+
+/// \~english Bytes live in the whole process, and the most there ever were.
+/// \~spanish Bytes vivos en todo el proceso, y los mas que llego a haber.  \~
+std::atomic<uint64_t> g_live_now{0};
+std::atomic<uint64_t> g_live_max{0};
+
+/// \~english Handed out and given back since the axis was switched on.  The two
+///           apart and not just their difference: the difference is the curve,
+///           these two are the CHURN, and a phase that moves a gigabyte through
+///           a flat curve looks identical to one that does nothing.
+/// \~spanish Entregado y devuelto desde que se encendio el eje.  Los dos por
+///           separado y no solo su diferencia: la diferencia es la curva, estos
+///           dos son el TRASIEGO, y una fase que mueve un gigabyte con la curva
+///           plana se ve igual que una que no hace nada.  \~
+std::atomic<uint64_t> g_born_total{0};
+std::atomic<uint64_t> g_died_total{0};
+std::atomic<uint64_t> g_births_seen{0};
+
+/**
+ * @brief
+ * \~english The same, split BY SIZE: what was handed out, what came back, and
+ *           therefore what is still standing, for each bucket.
+ * \~spanish Lo mismo, repartido POR TAMANO: que se entrego, que volvio y por
+ *           tanto que sigue en pie, en cada casilla.
+ * \~
+ *
+ * \~english
+ * The histogram of the export answers "how many of each size", and the site
+ * table "how many bytes of each size" -- both over the WHOLE run.  Neither can
+ * say what is still there, and that is the question a peak is made of: a bucket
+ * that moves four gigabytes and gives them all back costs nothing, and one that
+ * keeps two hundred megabytes is the peak whatever its count.
+ *
+ * It is counted HERE and not in the allocator because it is the checker that
+ * sees both ends: the allocator's free path knows the block, not the size that
+ * was asked for, and hooking this onto it would make the figure depend on which
+ * of the three doors a block came through.
+ *
+ * Plain counters and not atomics, like `g_live` right above and for the same
+ * reason: a lost update leaves a bucket slightly off, the report bounds it, and
+ * making every allocation pay a locked add to be exact in the third decimal of
+ * a histogram is not a trade this library makes.
+ *
+ * \~spanish
+ * El histograma del volcado contesta "cuantas de cada tamano", y la tabla de
+ * sitios "cuantos bytes de cada tamano" -- las dos sobre TODA la corrida.
+ * Ninguna sabe decir que sigue ahi, y esa es la pregunta de la que esta hecho
+ * un pico: una casilla que mueve cuatro gigabytes y los devuelve todos no
+ * cuesta nada, y una que se queda doscientos megabytes es el pico tenga la
+ * cuenta que tenga.
+ *
+ * Se cuenta AQUI y no en el asignador porque es el comprobador quien ve los dos
+ * extremos: el camino de liberar del asignador conoce el bloque, no el tamano
+ * que se pidio, y colgar esto de el haria que la cifra dependiera de por cual
+ * de las tres puertas entro cada bloque.
+ *
+ * Contadores llanos y no atomicos, como `g_live` justo arriba y por lo mismo:
+ * una actualizacion perdida deja una casilla algo corrida, el informe lo acota,
+ * y hacer que cada reserva pague una suma con cerrojo para ser exacta en el
+ * tercer decimal de un histograma no es un cambio que esta libreria haga.
+ * \~
+ */
+uint64_t g_bucket_born_n[util::kSizeBuckets] = {};
+uint64_t g_bucket_born_bytes[util::kSizeBuckets] = {};
+uint64_t g_bucket_died_n[util::kSizeBuckets] = {};
+uint64_t g_bucket_died_bytes[util::kSizeBuckets] = {};
+
+/// \~english The most that was live in each bucket at once -- the peak of a
+///           bucket, which its total never shows.
+/// \~spanish Lo mas que hubo vivo a la vez en cada casilla -- el pico de una
+///           casilla, que su total no ensena nunca.  \~
+uint64_t g_bucket_live_max[util::kSizeBuckets] = {};
+
+/// \~english What a bucket has live right now: born minus given back, clamped
+///           at its own floor.  A block born before the checker existed comes
+///           back through here all the same, and without the floor its bucket
+///           would go under zero -- which unsigned is sixteen exabytes.
+/// \~spanish Lo que una casilla tiene vivo ahora: nacido menos devuelto,
+///           acotado por su propio suelo.  Un bloque nacido antes de que el
+///           comprobador existiera vuelve igual por aqui, y sin el suelo su
+///           casilla se iria por debajo de cero -- que sin signo son dieciseis
+///           exabytes.  \~
+inline uint64_t bucket_live(uint32_t b) noexcept {
+    const uint64_t born = g_bucket_born_bytes[b];
+    const uint64_t died = g_bucket_died_bytes[b];
+    return born > died ? born - died : 0;
+}
+
+/**
+ * @brief
+ * \~english One CUT of the run: everything that was live at that moment.
+ * \~spanish Un CORTE de la corrida: todo lo que habia vivo en ese momento.
+ * \~
+ *
+ * \~english
+ * A CUT IS A COPY OF THE LIVE TABLE, which is what makes the whole axis cost
+ * nothing on the hot path: no per-epoch counter is kept anywhere, the sites
+ * already know what they hold, and a cut just walks them.  From the one
+ * mechanism come the curve, the curve PER SITE, who was live AT THE SAME TIME
+ * as whom, and the attribution of the peak -- which is the question that
+ * started this and that took three builds and an A/B to answer without it.
+ *
+ * \~spanish
+ * UN CORTE ES UNA COPIA DE LA TABLA DE VIVOS, que es lo que hace que el eje
+ * entero no cueste nada en el camino caliente: no se lleva ningun contador por
+ * epoca en ningun sitio, los sitios ya saben lo que tienen, y un corte solo los
+ * recorre.  Del mismo mecanismo salen la curva, la curva POR SITIO, quien
+ * estaba vivo A LA VEZ que quien, y la atribucion del pico -- que es la
+ * pregunta que empezo todo esto y que sin el costo tres construcciones y un
+ * A/B.
+ * \~
+ */
+struct Epoch {
+    uint64_t allocs;      ///< \~english births so far  \~spanish nacimientos
+                          ///< hasta aqui  \~
+    uint64_t live;        ///< \~english bytes live at the cut  \~spanish bytes
+                          ///< vivos en el corte  \~
+    /// \~english committed by the PROCESS at the cut -- a snapshot, like
+    ///          @c live, so the two can be read together.
+    /// \~spanish comprometido por el PROCESO en el corte -- una foto, como
+    ///          @c live, para que las dos se puedan leer juntas.
+    /// \~
+    uint64_t committed;
+    /**
+     * @brief
+     * \~english Of that, what the allocator's own ranges are costing.
+     * \~spanish De eso, lo que cuestan los rangos del propio asignador.
+     * \~
+     *
+     * \~english
+     * ASKED OF THE SYSTEM, not worked out.  `committed` is the whole process --
+     * image, stacks, whatever another library reserved -- and `live` is what
+     * was handed out and not yet given back.  Between the two there is a gap
+     * that belongs to no site, and until now there was no way to say how much
+     * of it was the allocator holding pages it no longer uses: the tree cannot
+     * show it, because slack has no owner, and adding up the chunk headers
+     * would race with their owners.  So it is asked of the OS, over the two
+     * ranges the allocator publishes, on the cut path -- once every couple of
+     * hundred thousand allocations, never on the hot path.
+     *
+     * `region - live` IS the slack, measured.  Zero means the question could
+     * not be asked (no ranges yet, or the system would not say).
+     *
+     * \~spanish
+     * SE LE PREGUNTA AL SISTEMA, no se deduce.  `committed` es el proceso
+     * entero -- imagen, pilas, lo que reservara otra libreria -- y `live` es lo
+     * entregado y aun no devuelto.  Entre los dos hay un hueco que no es de
+     * ningun sitio, y hasta ahora no habia forma de decir cuanto de el era el
+     * asignador guardando paginas que ya no usa: el arbol no lo ensena, porque
+     * la holgura no tiene dueno, y sumar las cabeceras de los trozos competiria
+     * con sus duenos.  Asi que se le pregunta al SO, sobre los dos rangos que
+     * el asignador publica, en el camino del corte -- una vez cada un par de
+     * cientos de miles de reservas, nunca en el camino caliente.
+     *
+     * `region - live` ES la holgura, medida.  Cero quiere decir que no se pudo
+     * preguntar (aun no hay rangos, o el sistema no lo dice).
+     * \~
+     */
+    uint64_t region;
+    /**
+     * @brief
+     * \~english Of the range, what is sitting in the free lists.
+     * \~spanish Del rango, lo que esta parado en las listas de libres.
+     * \~
+     *
+     * \~english
+     * THE GAP IS TWO THINGS, AND THEY HAVE TWO CURES.  `region - live` is what
+     * the program pays for and does not use, and until this column it was one
+     * lump.  It is really: whole spans nobody is using, which COULD go back to
+     * the system, plus chunks handed to a size class with most of their blocks
+     * free, which cannot -- the ones still in use are scattered through them.
+     *
+     * Building the first cure without knowing the split is how you spend a week
+     * on a release path that recovers a fifth of what was hoped.  This column
+     * is what says which of the two is the problem, and it costs a walk of the
+     * free lists on the cut path.
+     *
+     * \~spanish
+     * EL HUECO SON DOS COSAS, Y TIENEN DOS CURAS.  `region - live` es lo que el
+     * programa paga y no usa, y hasta esta columna era un bulto.  En realidad
+     * es: tramos enteros que no usa nadie, que SI podrian volver al sistema,
+     * mas trozos entregados a una clase de tamano con casi todos sus bloques
+     * libres, que no pueden -- los que siguen en uso estan repartidos por
+     * ellos.
+     *
+     * Construir la primera cura sin saber el reparto es como se pasa una semana
+     * en un camino de devolucion que recupera la quinta parte de lo que se
+     * esperaba.  Esta columna es la que dice cual de las dos es el problema, y
+     * cuesta un recorrido de las listas de libres en el camino del corte.
+     * \~
+     */
+    uint64_t free_spans;
+    /**
+     * @brief
+     * \~english Chunks that served a size class and now hold nothing.
+     * \~spanish Trozos que sirvieron a una clase de tamano y ahora no tienen
+     *           nada.
+     * \~
+     *
+     * \~english
+     * THIS IS THE THIRD PIECE, and it splits what the second one left over.  A
+     * chunk never goes back to a class it did not start in, so one whose blocks
+     * all died is 64 KiB nobody can use.  Those are the allocator's to reclaim;
+     * what is left after them -- chunks at three per cent with their live
+     * blocks scattered -- is nobody's, and the answer there is not to hold a
+     * whole program at once.
+     *
+     * \~spanish
+     * ESTA ES LA TERCERA PIEZA, y parte lo que sobraba de la segunda.  Un trozo
+     * no vuelve nunca a una clase en la que no empezo, asi que uno al que se le
+     * murieron todos los bloques son 64 KiB que no puede usar nadie.  Esos son
+     * del asignador; lo que quede despues de ellos -- trozos al tres por ciento
+     * con sus vivos repartidos -- no es de nadie, y ahi la respuesta es no
+     * sostener un programa entero a la vez.
+     * \~
+     */
+    uint64_t empty_chunks;
+    uint64_t born_bytes;  ///< \~english handed out since the previous cut
+                          ///< \~spanish entregado desde el corte anterior  \~
+    uint64_t died_bytes;  ///< \~english given back since the previous cut
+                          ///< \~spanish devuelto desde el corte anterior  \~
+    uint64_t below_floor; ///< \~english live bytes of sites too small to list
+                          ///< \~spanish bytes vivos de sitios demasiado
+                          ///< pequenos para listar  \~
+    const char *mark;     ///< \~english the phase that was running, or null
+                          ///< \~spanish la fase que corria, o nulo  \~
+    uint32_t first;       ///< \~english its first cell  \~spanish su primera
+                          ///< celda  \~
+    uint32_t cells;       ///< \~english how many  \~spanish cuantas  \~
+    /**
+     * @brief
+     * \~english What each SIZE had live at the cut.
+     * \~spanish Lo que cada TAMANO tenia vivo en el corte.
+     * \~
+     *
+     * \~english
+     * The cells above say who, and this says of what size -- and the second one
+     * cannot be worked out from the first, because one site serves several
+     * buckets and the cells only list the sites above the floor.
+     *
+     * INSIDE the epoch and not in a table of its own: twelve counters are 96
+     * bytes, it rides along with an allocation that already exists, and the
+     * axis keeps its "all or nothing" rule, which is what stops half a curve
+     * from being drawn as a whole one.
+     *
+     * \~spanish
+     * Las celdas de arriba dicen quien, y esto dice de que tamano -- y lo
+     * segundo no sale de lo primero, porque un sitio sirve varias casillas y las
+     * celdas solo listan los sitios que pasan del suelo.
+     *
+     * DENTRO de la epoca y no en una tabla aparte: doce contadores son 96
+     * bytes, viaja con una reserva que ya existe, y el eje conserva su regla de
+     * "todas o ninguna", que es lo que impide que se dibuje media curva como si
+     * fuera entera.
+     * \~
+     */
+    uint64_t by_bucket[util::kSizeBuckets];
+};
+
+/// \~english What one site held at one cut.  \~spanish Lo que un sitio tenia en
+/// un corte.  \~
+struct LiveCell {
+    uint64_t bytes;
+    uint32_t site;
+    uint32_t pad_;
+};
+
+Epoch *g_epochs = nullptr;
+LiveCell *g_cells = nullptr;
+uint32_t g_epoch_cap = 0;   ///< how many cuts fit
+uint32_t g_epochs_used = 0; ///< how many were taken
+uint32_t g_cells_cap = 0;
+uint32_t g_cells_used = 0;
+uint64_t g_epochs_lost = 0; ///< cuts that did not fit, said in the summary
+uint64_t g_cells_lost = 0;  ///< and rows of theirs that did not
+
+/// \~english Allocations between cuts; 0 means the axis is OFF, which is the
+///           default: whoever wants a curve asks for one.
+/// \~spanish Reservas entre cortes; 0 es que el eje esta APAGADO, que es lo de
+///           por defecto: quien quiera curva, la pide.  \~
+uint32_t g_epoch_every = 0;
+/// \~english A site under this is not listed by name (its bytes still count, in
+///           @c Epoch::below_floor).  \~spanish Un sitio por debajo de esto no
+///           se lista por nombre (sus bytes siguen contando, en @c
+///           Epoch::below_floor).  \~
+uint64_t g_epoch_floor = 0;
+/// \~english A rise of this much since the last cut forces one, which is what
+///           guarantees the PEAK gets a snapshot instead of falling between two
+///           cuts.  \~spanish Una subida de esto desde el ultimo corte fuerza
+///           uno, que es lo que garantiza que el PICO tenga foto en vez de
+///           caerse entre dos cortes.  \~
+uint64_t g_epoch_step = 0;
+uint64_t g_epoch_last_live = 0;
+/// \~english Totals as of the previous cut, so a cut can say what moved SINCE
+///           it.  Read and written only while the cut lock is held.
+/// \~spanish Totales en el corte anterior, para que un corte pueda decir lo que
+///           se movio DESDE el.  Solo se leen y escriben con el cerrojo del
+///           corte tomado.  \~
+uint64_t g_born_at_last_cut = 0;
+uint64_t g_died_at_last_cut = 0;
+
+/// \~english Taken while a cut is being copied.  A thread that finds it taken
+///           does NOT wait: it carries on and its blocks land in the next cut.
+///           A checker that stopped the program to measure it would be
+///           measuring another program.
+/// \~spanish Tomado mientras se copia un corte.  Un hilo que lo encuentra
+///           tomado NO espera: sigue, y sus bloques caen en el corte siguiente.
+///           Un comprobador que parara el programa para medirlo estaria
+///           midiendo otro programa.  \~
+std::atomic_flag g_cut_busy = ATOMIC_FLAG_INIT;
+
+/// \~english Whether the axis is on at all.  \~spanish Si el eje esta encendido
+/// siquiera.  \~
+inline bool axis_on() noexcept {
+    return g_epoch_every != 0 && g_live != nullptr;
+}
+
+/**
+ * @brief
+ * \~english The phase that was running at cut @p e.
+ * \~spanish La fase que corria en el corte @p e.
+ * \~
+ *
+ * \~english
+ * WALKING BACK, because a cut only carries a name when a phase boundary took
+ * it, and the peak almost never lands exactly on one -- measured: the peak was
+ * at cut 260 and the nearest mark at 261, so asking the cut itself answered
+ * "no phase" about the most important instant of the run.  What is being asked
+ * is not "was this cut a boundary" but "which phase was in force", and the
+ * answer to that is the last name seen.
+ *
+ * \~spanish
+ * HACIA ATRAS, porque un corte solo lleva nombre si lo tomo una frontera de
+ * fase, y el pico casi nunca cae justo en una -- medido: el pico estaba en el
+ * corte 260 y la marca mas cercana en el 261, asi que preguntarle al corte
+ * contestaba "ninguna fase" sobre el instante mas importante de la corrida.  Lo
+ * que se pregunta no es "fue este corte una frontera" sino "que fase estaba en
+ * vigor", y eso lo contesta el ultimo nombre visto.
+ * \~
+ */
+const char *mark_in_force(uint32_t e) noexcept {
+    if (g_epochs == nullptr) return nullptr;
+    for (uint32_t i = e + 1; i-- > 0;)
+        if (g_epochs[i].mark != nullptr) return g_epochs[i].mark;
+    return nullptr;
+}
+
+// -------------------------------------------------------------------------
+// \~english THE BLOCKS THE SHADOW NEVER SEES, which are the ones that matter.
+// \~spanish LOS BLOQUES QUE EL SOMBREADO NO VE, que son los que importan.
+// -------------------------------------------------------------------------
+
+/**
+ * @brief
+ * \~english One block served outside the shadow: address, size and site.
+ * \~spanish Un bloque servido fuera del sombreado: direccion, tamano y sitio.
+ * \~
+ *
+ * \~english
+ * WITHOUT THIS THE CURVE WOULD MISS ALMOST HALF OF ITSELF.  A block past the
+ * small-class limit lives on its own reservation, so it has no shadow slot --
+ * and with no slot the release is invisible, which would make its site rise
+ * forever and never come down.  Measured on a real compile: 0.44% of the blocks
+ * and FORTY-SIX PER CENT of the bytes are out there.  A curve that only saw the
+ * other 54% would have been wrong precisely about the big, long-lived things it
+ * exists to find.
+ *
+ * It is a table of its own and not a bigger shadow because these are rare by
+ * construction -- a hundred and sixty thousand in a run of thirty-six million
+ * allocations -- so the cost is a hash probe on a path that was already the
+ * slow one.
+ *
+ * \~spanish
+ * SIN ESTO LA CURVA SE PERDERIA CASI LA MITAD DE SI MISMA.  Un bloque que pasa
+ * del limite de clase pequena vive en una reserva propia, asi que no tiene
+ * ranura de sombreado -- y sin ranura su liberacion es invisible, con lo que su
+ * sitio subiria para siempre y no bajaria nunca.  Medido en una compilacion de
+ * verdad: el 0,44% de los bloques y el CUARENTA Y SEIS POR CIENTO de los bytes
+ * estan ahi fuera.  Una curva que solo viera el otro 54% se equivocaria justo
+ * en las cosas grandes y longevas que existe para encontrar.
+ *
+ * Es tabla propia y no un sombreado mayor porque son raros por construccion --
+ * ciento sesenta mil en una corrida de treinta y seis millones de reservas --,
+ * asi que el coste es un sondeo de hash en un camino que ya era el lento.
+ * \~
+ */
+struct Big {
+    std::atomic<const void *> key; ///< null = free; @c kBigDead = was used
+    uint64_t bytes;
+    uint32_t site;
+    uint32_t pad_;
+};
+
+/// \~english A slot that held a block and does not any more.  It cannot go back
+///           to null: the probe that walks a chain stops at a null, and clearing
+///           a slot in the middle would hide everything behind it.
+/// \~spanish Una ranura que tuvo un bloque y ya no.  No puede volver a nulo: el
+///           sondeo que recorre una cadena se para en un nulo, y vaciar una
+///           ranura del medio esconderia todo lo que va detras.  \~
+const void *const kBigDead = reinterpret_cast<const void *>(uintptr_t(1));
+
+constexpr uint32_t kBigSlots = 1u << 18;
+
+Big *g_big = nullptr;
+uint64_t g_big_lost = 0;      ///< blocks that did not fit
+uint64_t g_big_unmatched = 0; ///< frees of a block this table did not have
+
+/// \~english Releases of blocks born before the axis existed: they take nothing
+///           off the curve, and this is how many and how much.  See @c
+///           axis_death.
+/// \~spanish Liberaciones de bloques nacidos antes de que el eje existiera: no
+///           restan nada de la curva, y esto es cuantas y cuanto.  Ver @c
+///           axis_death.  \~
+uint64_t g_axis_orphans = 0;
+uint64_t g_axis_orphan_bytes = 0;
+
+inline uint32_t big_hash(const void *p) noexcept {
+    uint64_t x = uint64_t(uintptr_t(p)) >> 4; // pages, not bytes
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 29;
+    return uint32_t(x) & (kBigSlots - 1);
+}
+
+/// \~english Writes a block down.  \~spanish Apunta un bloque.  \~
+void big_insert(const void *p, uint64_t bytes, uint32_t site) noexcept {
+    if (g_big == nullptr || p == nullptr) return;
+    uint32_t i = big_hash(p);
+    for (uint32_t n = 0; n < kBigSlots; ++n, i = (i + 1) & (kBigSlots - 1)) {
+        const void *k = g_big[i].key.load(std::memory_order_relaxed);
+        if (k != nullptr && k != kBigDead) continue;
+        const void *want = k;
+        if (!g_big[i].key.compare_exchange_strong(want, p,
+                                                  std::memory_order_acq_rel))
+            continue; // somebody took this one; keep walking
+        g_big[i].bytes = bytes;
+        g_big[i].site = site;
+        return;
+    }
+    g_big_lost += 1;
+}
+
+/**
+ * @brief
+ * \~english Takes a block out, if it was ours.
+ * \~spanish Saca un bloque, si era nuestro.
+ * \~
+ * @return \~english true if it was in the table, with @p bytes and @p site
+ *         filled in.  \~spanish true si estaba en la tabla, con @p bytes y @p
+ *         site rellenos.  \~
+ */
+bool big_take(const void *p, uint64_t *bytes, uint32_t *site) noexcept {
+    if (g_big == nullptr || p == nullptr) return false;
+    uint32_t i = big_hash(p);
+    for (uint32_t n = 0; n < kBigSlots; ++n, i = (i + 1) & (kBigSlots - 1)) {
+        const void *k = g_big[i].key.load(std::memory_order_acquire);
+        if (k == nullptr) return false; // end of the chain: not ours
+        if (k != p) continue;
+        const uint64_t b = g_big[i].bytes;
+        const uint32_t s = g_big[i].site;
+        const void *want = p;
+        if (!g_big[i].key.compare_exchange_strong(want, kBigDead,
+                                                  std::memory_order_acq_rel))
+            return false; // another thread got there first
+        *bytes = b;
+        *site = s;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief
+ * \~english What the allocator's ranges are costing right now, asked of the OS.
+ * \~spanish Lo que cuestan ahora mismo los rangos del asignador, preguntado al
+ *           SO.
+ * \~
+ *
+ * \~english
+ * THE TWO RANGES, and only their bounds are read.  The allocator publishes
+ * where the small-class region and the big one start and end; nothing else of
+ * its state is touched -- not the watermarks, which rise before the pages are
+ * committed and before the header is written, and not the chunk headers, which
+ * are read by their owner and nobody else.  What is inside those bounds is a
+ * question for the system, and it answers without disturbing anyone.
+ *
+ * A range still unborn reads as zero on both ends and is skipped, so a cut
+ * before the allocator warms up costs two atomic loads.
+ *
+ * \~spanish
+ * LOS DOS RANGOS, y solo se leen sus limites.  El asignador publica donde
+ * empiezan y acaban la region de clase pequena y la grande; no se toca nada mas
+ * de su estado -- ni las marcas de agua, que suben antes de comprometer las
+ * paginas y antes de escribir la cabecera, ni las cabeceras de los trozos, que
+ * las lee su dueno y nadie mas.  Lo que hay dentro de esos limites es una
+ * pregunta para el sistema, y la contesta sin molestar a nadie.
+ *
+ * Un rango que aun no existe da cero por los dos lados y se salta, asi que un
+ * corte antes de que el asignador arranque cuesta dos lecturas atomicas.
+ * \~
+ * @return \~english bytes, or zero if there is nothing to ask about yet.
+ *         \~spanish bytes, o cero si aun no hay nada por lo que preguntar.  \~
+ */
+/**
+ * @brief
+ * \~english Bytes in chunks that served a class and now hold nothing.
+ * \~spanish Bytes en trozos que sirvieron a una clase y ahora no tienen nada.
+ * \~
+ *
+ * \~english
+ * A ROW THAT EXISTS AND COUNTS ZERO, which is not the same as a row that does
+ * not exist: a row is made the first time a block of that chunk passes through
+ * the shadow, so having one means the chunk WAS serving class blocks.  Zero
+ * live in it means they all died.  A chunk that never served any has no row and
+ * is not counted, which is right -- it is not waste, it was never used.
+ *
+ * \~spanish
+ * UNA FILA QUE EXISTE Y CUENTA CERO, que no es lo mismo que una fila que no
+ * existe: una fila se crea la primera vez que un bloque de ese trozo pasa por
+ * la sombra, asi que tenerla quiere decir que el trozo SI estuvo sirviendo
+ * bloques de clase.  Cero vivos en ella quiere decir que se murieron todos.  Un
+ * trozo que no sirvio ninguno no tiene fila y no se cuenta, que es lo correcto
+ * -- no es desperdicio, es que no se uso nunca.
+ * \~
+ */
+uint64_t empty_chunk_bytes() noexcept {
+    if (g_rows == nullptr || g_row_live == nullptr) return 0;
+    uint64_t empty = 0;
+    for (uint32_t r = 0; r < g_row_count; ++r) {
+        if (g_rows[r].load(std::memory_order_relaxed) == nullptr) continue;
+        if (g_row_live[r].load(std::memory_order_relaxed) == 0) ++empty;
+    }
+    return empty * uint64_t(kChunkBytes);
+}
+
+uint64_t region_memory() noexcept {
+    uint64_t total = 0;
+    const uintptr_t small_lo =
+        detail::g_region_base.load(std::memory_order_relaxed);
+    const uintptr_t small_hi =
+        detail::g_region_end.load(std::memory_order_relaxed);
+    if (small_hi > small_lo)
+        total += os_range_memory(reinterpret_cast<const void *>(small_lo),
+                                 size_t(small_hi - small_lo));
+    const uintptr_t big_lo = detail::g_big_base.load(std::memory_order_relaxed);
+    const uintptr_t big_hi = detail::g_big_end.load(std::memory_order_relaxed);
+    if (big_hi > big_lo)
+        total += os_range_memory(reinterpret_cast<const void *>(big_lo),
+                                 size_t(big_hi - big_lo));
+    return total;
+}
+
+/**
+ * @brief
+ * \~english Copies the live table: one cut of the run.
+ * \~spanish Copia la tabla de vivos: un corte de la corrida.
+ * \~
+ * @param mark \~english the phase that asked, or null for a cut the clock
+ *             took.  \~spanish la fase que lo pidio, o nulo si lo tomo el
+ *             reloj.  \~
+ */
+void epoch_cut(const char *mark) noexcept {
+    if (g_epochs == nullptr || g_cells == nullptr || g_life == nullptr) return;
+    /* \~english A MARK WAITS AND A TICK DOES NOT.  There are a dozen marks in a
+     * run and they carry the only thing a cut cannot reconstruct -- which phase
+     * this was --, so losing one loses the label of a whole stretch.  A tick is
+     * one of hundreds and the next one is a moment away.
+     *
+     * \~spanish UNA MARCA ESPERA Y UN TIC NO.  Hay una docena de marcas por
+     * corrida y llevan lo unico que un corte no puede reconstruir -- que fase
+     * era esta --, asi que perder una pierde la etiqueta de un tramo entero.
+     * Un tic es uno de cientos y el siguiente esta a nada.  \~ */
+    if (mark != nullptr) {
+        while (g_cut_busy.test_and_set(std::memory_order_acquire))
+            ;
+    } else if (g_cut_busy.test_and_set(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (g_epochs_used >= g_epoch_cap) {
+        g_epochs_lost += 1;
+        g_cut_busy.clear(std::memory_order_release);
+        return;
+    }
+
+    Epoch &e = g_epochs[g_epochs_used];
+    e.mark = mark;
+    e.allocs = g_births_seen.load(std::memory_order_relaxed);
+    e.live = g_live_now.load(std::memory_order_relaxed);
+    /* \~english THE SNAPSHOT, not the running total.  This was
+     * `bytes_reserved`, which is CUMULATIVE -- a reused range counts again --
+     * and it sat in the curve right next to `live`, which is a snapshot.  Two
+     * different kinds of number side by side invite you to subtract them, and
+     * the subtraction means nothing: on a compile of 441.000 lines a cut showed
+     * "live 830 MiB / committed 1.3 GiB" and the run ended at 3.3 GiB committed
+     * without the process ever holding more than 2.4.
+     *
+     * \~spanish LA FOTO, no el acumulado.  Esto era `bytes_reserved`, que es
+     * ACUMULADO -- un rango reusado vuelve a contar -- y estaba en la curva
+     * justo al lado de `live`, que si es una foto.  Dos clases distintas de
+     * numero una al lado de otra invitan a restarlas, y la resta no significa
+     * nada: en una compilacion de 441.000 lineas un corte enseñaba "vivo 830
+     * MiB / comprometido 1,3 GiB" y la corrida acabo en 3,3 GiB comprometidos
+     * sin que el proceso tuviera nunca mas de 2,4.  \~ */
+    e.committed = os_process_memory().commit;
+    e.region = region_memory();
+    e.free_spans = host_span_free_bytes();
+    e.empty_chunks = empty_chunk_bytes();
+    const uint64_t born = g_born_total.load(std::memory_order_relaxed);
+    const uint64_t died = g_died_total.load(std::memory_order_relaxed);
+    e.born_bytes = born - g_born_at_last_cut;
+    e.died_bytes = died - g_died_at_last_cut;
+    g_born_at_last_cut = born;
+    g_died_at_last_cut = died;
+    e.below_floor = 0;
+    e.first = g_cells_used;
+    e.cells = 0;
+    /* \~english AND OF WHAT SIZE, in the same photograph and not afterwards:
+     * what a bucket holds only exists at an instant, and a total taken at the
+     * end would answer a different question -- the one the histogram already
+     * answers.  Twelve numbers, so the cut costs the same as before.
+     *
+     * \~spanish Y DE QUE TAMANO, en la misma foto y no despues: lo que una
+     * casilla tiene solo existe en un instante, y un total al final contestaria
+     * otra pregunta -- la que el histograma ya contesta.  Doce numeros, asi que
+     * el corte cuesta lo mismo que antes.  \~ */
+    for (uint32_t b = 0; b < util::kSizeBuckets; ++b)
+        e.by_bucket[b] = bucket_live(b);
+
+    for (uint32_t i = 1; i < kDepotSlots; ++i) {
+        const int64_t v = g_live[i];
+        if (v <= 0) continue; // nothing, or a lost update; see `g_live`
+        const uint64_t b = uint64_t(v);
+        if (b < g_epoch_floor) {
+            e.below_floor += b;
+            continue;
+        }
+        if (g_cells_used >= g_cells_cap) {
+            g_cells_lost += 1;
+            e.below_floor += b;
+            continue;
+        }
+        g_cells[g_cells_used].bytes = b;
+        g_cells[g_cells_used].site = i;
+        g_cells[g_cells_used].pad_ = 0;
+        ++g_cells_used;
+        ++e.cells;
+    }
+
+    g_epoch_last_live = e.live;
+    ++g_epochs_used;
+    g_cut_busy.clear(std::memory_order_release);
+}
+
+/// \~english Adds what a birth did to the axis, and cuts if it is time.
+/// \~spanish Suma al eje lo que hizo un nacimiento, y corta si toca.  \~
+void axis_birth(uint32_t site, uint64_t req) noexcept {
+    g_live[site] += int64_t(req);
+    const uint64_t live = g_live_now.fetch_add(req, std::memory_order_relaxed) + req;
+    g_born_total.fetch_add(req, std::memory_order_relaxed);
+    const uint64_t n = g_births_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    uint64_t top = g_live_max.load(std::memory_order_relaxed);
+    while (live > top && !g_live_max.compare_exchange_weak(
+                             top, live, std::memory_order_relaxed))
+        ;
+
+    if (live > g_epoch_last_live + g_epoch_step || n % g_epoch_every == 0)
+        epoch_cut(nullptr);
+}
+
+/**
+ * @brief
+ * \~english And what a death did.
+ * \~spanish Y lo que hizo una muerte.
+ * \~
+ *
+ * \~english
+ * NO CUT HERE: memory going DOWN never sets a peak, and cutting on the way down
+ * would spend the table on the half of the curve nobody is looking for.
+ *
+ * A RELEASE WHOSE BIRTH THIS NEVER SAW TAKES NOTHING, which is the difference
+ * between a curve and a number that drifts.  The checker starts when the
+ * allocator is already answering, so the first blocks of the process are born
+ * before any of this exists and come back afterwards; measured on one compile,
+ * that was 167 MB more given back than handed out, which sent the running total
+ * BELOW ZERO -- and unsigned, below zero is sixteen exabytes.
+ *
+ * Subtracting only what the site is actually holding fixes it at the only place
+ * that can tell: the site knows what it has.  The gap is counted and said, so
+ * the drift is a figure instead of a mystery.
+ *
+ * \~spanish
+ * AQUI NO SE CORTA: la memoria BAJANDO no marca ningun pico, y cortar al bajar
+ * gastaria la tabla en la mitad de la curva que nadie busca.
+ *
+ * UNA LIBERACION CUYO NACIMIENTO NO SE VIO NO SE LLEVA NADA, que es la
+ * diferencia entre una curva y un numero que deriva.  El comprobador arranca
+ * con el asignador ya contestando, asi que los primeros bloques del proceso
+ * nacen antes de que todo esto exista y vuelven despues; medido en una
+ * compilacion, eso fueron 167 MB mas devueltos que entregados, lo que metio el
+ * total por DEBAJO DE CERO -- y sin signo, por debajo de cero son dieciseis
+ * exabytes.
+ *
+ * Restar solo lo que el sitio tiene de verdad lo arregla en el unico punto que
+ * puede saberlo: el sitio sabe lo que tiene.  La diferencia se cuenta y se
+ * dice, asi que la deriva es una cifra y no un misterio.
+ * \~
+ */
+void axis_death(uint32_t site, uint64_t req) noexcept {
+    const int64_t have = g_live[site];
+    int64_t take = int64_t(req);
+    if (take > have) {
+        g_axis_orphans += 1;
+        g_axis_orphan_bytes += uint64_t(take - (have > 0 ? have : 0));
+        take = have > 0 ? have : 0;
+    }
+    if (take == 0) return;
+    g_live[site] -= take;
+    g_live_now.fetch_sub(uint64_t(take), std::memory_order_relaxed);
+    g_died_total.fetch_add(uint64_t(take), std::memory_order_relaxed);
+}
+
 /**
  * @brief
  * \~english One PAIR: the site that handed a block out and the site that gave
@@ -864,7 +2651,7 @@ Life *g_life = nullptr;
  * lugar es el camino comun.
  *
  * Esa distincion es lo unico que el encaminado necesita y lo unico que aqui no
- * se medía -- y conviene decir claro que lo que esto produce es "si, un dueño"
+ * se media -- y conviene decir claro que lo que esto produce es "si, un dueño"
  * o "no, varios", nunca "seguramente": NO poder demostrar que un sitio tiene un
  * solo dueño no es demostrar que tiene varios, y un sitio que no se sabe se
  * queda donde esta.
@@ -1168,6 +2955,22 @@ void note_birth(uint32_t stack, size_t req, bool inspected) noexcept {
     Life &l = g_life[stack];
     l.births += 1;
     l.bytes += req;
+    /* \~english AND IN ITS SIZE BUCKET, so the histogram can be read by what is
+     * still standing and not only by what went through.  The peak of a bucket
+     * is watched here because a maximum cannot be worked out afterwards from
+     * two totals.
+     *
+     * \~spanish Y EN SU CASILLA DE TAMANO, para que el histograma se pueda leer
+     * por lo que sigue en pie y no solo por lo que paso.  El pico de una
+     * casilla se vigila aqui porque un maximo no se deduce despues a partir de
+     * dos totales.  \~ */
+    {
+        const uint32_t b = util::bucket_of(req);
+        g_bucket_born_n[b] += 1;
+        g_bucket_born_bytes[b] += req;
+        const uint64_t live = bucket_live(b);
+        if (live > g_bucket_live_max[b]) g_bucket_live_max[b] = live;
+    }
     /* \~english INSPECTED, not "in the shadow": a guarded block lives on its own
      * pages and still has a table watching it, so it counts as looked at.  What
      * this column is about is coverage, not which structure holds the entry.
@@ -1180,6 +2983,18 @@ void note_birth(uint32_t stack, size_t req, bool inspected) noexcept {
         l.outside_births += 1;
         l.outside_bytes += req;
     }
+    /* \~english AND WHEN, if the axis was asked for.  Here and not at the call
+     * site because every door that hands a block out already passes through
+     * here -- the shadow's, the guarded one, and the one for blocks too big for
+     * either -- and a tally wired to one of the three goes quiet on the other
+     * two WITHOUT saying so, which this library has already done four times.
+     *
+     * \~spanish Y CUANDO, si se pidio el eje.  Aqui y no en quien llama porque
+     * todas las puertas que entregan un bloque pasan ya por aqui -- la del
+     * sombreado, la del bloque con guarda y la de los que no caben en ninguna
+     * --, y una cuenta enganchada a una de las tres se calla en las otras dos
+     * SIN decirlo, que es algo que esta libreria lleva hecho cuatro veces.  \~ */
+    if (axis_on()) axis_birth(stack, req);
 }
 
 /// Records what one block did with its life.  Called where the block dies,
@@ -1187,6 +3002,45 @@ void note_birth(uint32_t stack, size_t req, bool inspected) noexcept {
 void note_death(uint32_t stack, uint32_t req, bool same_thread,
                 uint32_t born, uint32_t now) noexcept {
     if (g_life == nullptr || stack == 0 || stack >= kDepotSlots) return;
+    /* \~english BEFORE ANY OTHER RETURN.  What follows gives up on a block
+     * released by another thread -- its life is not comparable -- but the BYTES
+     * came back all the same, and an axis that skipped those would watch its
+     * curve climb for ever on a program that frees everything.  Measured: 1.3
+     * million of the frees in one compile are cross-thread.
+     *
+     * \~spanish ANTES QUE CUALQUIER OTRO RETORNO.  Lo que sigue se rinde con un
+     * bloque soltado por otro hilo -- su vida no es comparable --, pero los
+     * BYTES volvieron igual, y un eje que se saltara esos veria su curva subir
+     * para siempre en un programa que lo libera todo.  Medido: 1,3 millones de
+     * las liberaciones de una compilacion cruzan de hilo.  \~ */
+    /* \~english AND NOT WHILE THE REPORT IS RUNNING, for the same reason its
+     * births are not counted: writing this report allocates millions of blocks
+     * and frees them, and their releases have no birth on the axis -- so every
+     * one of them was landing in "released before the axis existed".  Measured:
+     * it turned 187 MB of genuine pre-axis blocks into 1.48 GB of the report
+     * looking at itself, which is the exact figure `g_in_report` exists to keep
+     * out of the program's numbers.
+     *
+     * \~spanish Y NO MIENTRAS CORRE EL INFORME, por lo mismo que no se cuentan
+     * sus nacimientos: escribir este informe reserva millones de bloques y los
+     * suelta, y sus liberaciones no tienen nacimiento en el eje -- asi que
+     * todas caian en "soltado antes de que el eje existiera".  Medido: convirtio
+     * 187 MB de bloques previos de verdad en 1,48 GB del informe mirandose a si
+     * mismo, que es justo la cifra que `g_in_report` existe para mantener fuera
+     * de los numeros del programa.  \~ */
+    if (axis_on() && !g_in_report) axis_death(stack, req);
+    /* \~english AND IN ITS BUCKET, under the same condition and NOT under
+     * `axis_on`: what a size keeps alive is a question of the histogram, which
+     * is always there, while the axis is asked for on purpose.
+     *
+     * \~spanish Y EN SU CASILLA, con la misma condicion y NO bajo `axis_on`: lo
+     * que un tamano mantiene vivo es una pregunta del histograma, que esta
+     * siempre, mientras que el eje se pide a proposito.  \~ */
+    if (!g_in_report) {
+        const uint32_t b = util::bucket_of(req);
+        g_bucket_died_n[b] += 1;
+        g_bucket_died_bytes[b] += req;
+    }
     Life &l = g_life[stack];
     if (l.deaths == 0 && l.unknown == 0) {
         l.size_min = req;
@@ -2040,6 +3894,21 @@ unsigned name_of(const void *pc, AllocFrame *out, unsigned max) noexcept {
  * un desplazamiento, o un simbolo nuestro, o la direccion pelada.  A @p buf,
  * para que los dos lectores le den su formato a partir del mismo texto.  \~ */
 void raw_name(const void *pc, char *buf, size_t cap) noexcept {
+    /* \~english A HOP THAT COULD NOT BE READ IS NOT AN ADDRESS, so it does not
+     * get printed as one.  The walk left a mark here on purpose (see
+     * `kUnreadableFrame`), and printing the mark as a number would put a
+     * `0x1` in the middle of a call chain, where it reads like a place the
+     * program went through.  The text is fixed so the tools can match it.
+     *
+     * \~spanish UN SALTO QUE NO SE PUDO LEER NO ES UNA DIRECCION, asi que no se
+     * imprime como tal.  El recorrido dejo aqui una marca a proposito (ver
+     * `kUnreadableFrame`), e imprimirla como numero pondria un `0x1` en medio
+     * de una cadena de llamadas, donde se lee como un sitio por el que paso el
+     * programa.  El texto es fijo para que las herramientas lo reconozcan.  \~ */
+    if (!could_be_code(pc)) {
+        std::snprintf(buf, cap, "<frame that could not be read>");
+        return;
+    }
     VestaModuleInfo m;
     if (vesta_module_of(pc, &m) && !vesta_module_is_self(pc)) {
         const char *path = m.path != nullptr ? m.path : "?";
@@ -2067,7 +3936,9 @@ void raw_name(const void *pc, char *buf, size_t cap) noexcept {
 
 void print_frame(const void *pc) noexcept {
     AllocFrame fr[kNameFrames];
-    const unsigned got = name_of(pc, fr, kNameFrames);
+    /* Asking a resolver about a mark is asking it about address 1: whatever it
+     * answers is about the symbol NEXT to it.  `raw_name` names the mark. */
+    const unsigned got = could_be_code(pc) ? name_of(pc, fr, kNameFrames) : 0;
     if (got != 0) {
         for (unsigned k = 0; k < got; ++k) {
             const char *fn = alloc_readable_name(fr[k].function);
@@ -2115,18 +3986,97 @@ void print_stack(const char *what, uint32_t id) noexcept {
         return;
     }
     const Stack &s = g_depot[id];
-    std::fprintf(stderr, "    %s%s:\n", what,
-                 s.walked ? "" : " (one frame: no frame pointer to follow)");
-    for (unsigned i = 0; i < s.frames; ++i) print_frame(s.pc[i]);
+    /* \~english AND WHETHER THIS IS THE WHOLE STACK.  A cut one used to come
+     * back looking exactly like a complete one, which turns "as far as we got"
+     * into "that is where it started" -- and a caller reading the second when
+     * the first is true looks for a bug in the wrong place.
+     *
+     * \~spanish Y SI ESTA ES LA PILA ENTERA.  Una cortada volvia con el mismo
+     * aspecto que una completa, lo que convierte "hasta aqui llegamos" en "ahi
+     * empezo" -- y quien lea lo segundo cuando lo cierto es lo primero busca el
+     * fallo donde no esta.  \~ */
+    const char *how = s.walked ? "" : " (one frame: no frame pointer to follow)";
+    if (s.cut) how = " (CUT: this is as deep as the walk could be stored, not "
+                     "as deep as the stack went)";
+    std::fprintf(stderr, "    %s%s:\n", what, how);
+    const void *const *const f = frames_of(s);
+    for (unsigned i = 0; f != nullptr && i < s.n; ++i) print_frame(f[i]);
 }
+
+/**
+ * @brief
+ * \~english One finding, kept so it can leave as DATA and not only as prose.
+ * \~spanish Un hallazgo, guardado para que pueda salir como DATO y no solo
+ *           como prosa.
+ * \~
+ *
+ * \~english
+ * THIS IS WHAT A CHECKER IS FOR, and until now it was the one thing that never
+ * left this file as anything but text.  The counters said HOW MANY findings
+ * there were; the findings themselves -- what was wrong, at which address, with
+ * which stacks -- were printed for a person and nothing else.
+ *
+ * So a tool reading the export could say "there were four verdicts" and not
+ * which four, which is the half nobody needs.  Everything else the run knows
+ * was exportable and this was not, purely because it was written the moment it
+ * happened instead of being kept.
+ *
+ * The stacks are ids, the same ones every other table is keyed by, so joining
+ * them with the frames names both ends without anything new.
+ *
+ * \~spanish
+ * PARA ESTO SIRVE UN COMPROBADOR, y hasta ahora era lo unico que no salia de
+ * este fichero como otra cosa que texto.  Los contadores decian CUANTOS
+ * hallazgos hubo; los hallazgos -- que estaba mal, en que direccion, con que
+ * pilas -- se imprimian para una persona y nada mas.
+ *
+ * Asi que una herramienta que leyera la exportacion podia decir "hubo cuatro
+ * veredictos" y no cuales, que es la mitad que no le sirve a nadie.  Todo lo
+ * demas que la corrida sabe era exportable y esto no, solo porque se escribia
+ * en el momento en que pasaba en vez de guardarse.
+ *
+ * Las pilas son ids, los mismos por los que se indexa cualquier otra tabla, asi
+ * que juntarlas con los marcos nombra los dos extremos sin nada nuevo.  \~
+ */
+struct Verdict {
+    const void *p;       ///< the address the finding is about
+    const char *what;    ///< the headline, a literal that outlives the process
+    uint32_t certainty;  ///< 0 = suspected, 1 = proven
+    uint32_t allocated;  ///< stack id, 0 = not known here
+    uint32_t released;   ///< stack id of the first release, 0 = none
+    uint32_t again;      ///< stack id of the second one, for a double release
+};
+
+/* Acotada, y lo que no cabe se cuenta: un programa que falle en bucle emite
+ * veredictos sin fin, y una tabla sin tope aqui seria memoria creciendo dentro
+ * del modo que existe para vigilar la memoria. */
+constexpr uint32_t kVerdictSlots = 4096;
+Verdict g_verdict_list[kVerdictSlots];
+std::atomic<uint32_t> g_verdict_n{0};
+std::atomic<uint64_t> g_verdict_lost{0};
 
 /// Every verdict goes through here, so none of them can forget to be counted --
 /// and the exit code is that count.
-void verdict(Certainty c, const char *headline, const void *p) noexcept {
+void verdict(Certainty c, const char *headline, const void *p,
+             uint32_t allocated = 0, uint32_t released = 0,
+             uint32_t again = 0) noexcept {
     g_verdicts.fetch_add(1, std::memory_order_relaxed);
     if (c == Certainty::Proven) g_proven.fetch_add(1, std::memory_order_relaxed);
     std::fprintf(stderr, "\n[allocator/check] %s: %s at %p\n",
                  certainty_word(c), headline, p);
+    /* Y GUARDADO, ademas de impreso.  Ver `Verdict`. */
+    const uint32_t at = g_verdict_n.fetch_add(1, std::memory_order_relaxed);
+    if (at >= kVerdictSlots) {
+        g_verdict_lost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Verdict &v = g_verdict_list[at];
+    v.p = p;
+    v.what = headline;
+    v.certainty = c == Certainty::Proven ? 1u : 0u;
+    v.allocated = allocated;
+    v.released = released;
+    v.again = again;
 }
 
 // =========================================================================
@@ -2330,6 +4280,17 @@ bool ensure_ready() noexcept {
         return false;
     }
     std::memset(rows, 0, bytes);
+    /* Y LOS CONTADORES DE VIVOS, del mismo tamano y en la misma jugada.  Que
+     * falten no es un fallo: la sombra funciona igual y lo unico que se pierde
+     * es saber cuantos trozos quedan vacios, asi que se sigue adelante y la
+     * cifra sale a cero -- que es lo que ya significa "no se midio" en el resto
+     * de la exportacion. */
+    const size_t live_bytes = size_t(count) * sizeof(std::atomic<uint32_t>);
+    void *live = os_alloc(live_bytes, kOsReadWrite);
+    if (live != nullptr) {
+        std::memset(live, 0, live_bytes);
+        g_row_live = static_cast<std::atomic<uint32_t> *>(live);
+    }
     g_row_count = count;
     g_rows = static_cast<std::atomic<Slot *> *>(rows);
     rows_state.store(2, std::memory_order_release);
@@ -2359,6 +4320,11 @@ bool ensure_config() noexcept {
              * jamas.  \~ */
             g_depth = env_num("VESTA_ALLOC_SAN_DEPTH", 2, kFrames);
             if (g_depth == 0) g_depth = 1;
+            /* \~english Off unless asked for: it runs BOTH walks on every
+             * allocation.  See `compare_walks`.
+             * \~spanish Apagado salvo que se pida: corre LOS DOS recorridos en
+             * cada reserva.  Ver `compare_walks`.  \~ */
+            g_compare = env_num("VESTA_ALLOC_SAN_COMPARE", 0, 1) != 0;
             g_guard_edge = SanGuard(env_num("VESTA_ALLOC_SAN_GUARD",
                                             unsigned(SanGuard::Overflow),
                                             unsigned(SanGuard::Underflow)));
@@ -2450,6 +4416,76 @@ bool ensure_config() noexcept {
                              "site PAIRS: everything else still works, but "
                              "nothing will be able to say whether a site has "
                              "one owner or several\n");
+            }
+            /* \~english THE TIME AXIS, and only if it was asked for.  Every
+             * other table here is part of some level; this one is not, because
+             * what it answers is not a bug -- it is where the memory IS at each
+             * moment -- and paying for it in a run that came looking for a
+             * double free would be charging for something nobody asked.
+             *
+             * \~spanish EL EJE DEL TIEMPO, y solo si se pidio.  Las demas
+             * tablas de aqui van con algun nivel; esta no, porque lo que
+             * contesta no es un fallo -- es donde ESTA la memoria en cada
+             * momento -- y pagarla en una corrida que venia a por una doble
+             * liberacion seria cobrar por algo que nadie pidio.  \~ */
+            g_epoch_every = env_num("VESTA_ALLOC_SAN_EPOCH", 0, 1u << 30);
+            if (g_epoch_every != 0) {
+                g_epoch_cap = env_num("VESTA_ALLOC_SAN_EPOCHS", 512, 1u << 16);
+                g_epoch_floor =
+                    env_num("VESTA_ALLOC_SAN_EPOCH_FLOOR", 1u << 16, 1u << 30);
+                g_epoch_step = env_num("VESTA_ALLOC_SAN_EPOCH_STEP", 8u << 20,
+                                       1u << 30);
+                /* \~english The cells are a PRODUCT and not a figure of their
+                 * own: a cut lists the sites above the floor, so what is needed
+                 * is how many cuts times how many sites fit in each.  A total
+                 * written by hand would come loose from the number of cuts,
+                 * which is what decides it.
+                 * \~spanish Las celdas son el PRODUCTO y no una cifra suelta:
+                 * un corte lista los sitios que pasan del suelo, asi que lo que
+                 * hace falta es cuantos cortes por cuantos sitios caben en cada
+                 * uno.  Escribir un total a mano lo desacoplaria del numero de
+                 * cortes, que es quien manda.  \~ */
+                constexpr uint32_t kCellsPerEpoch = 4096;
+                void *live = os_alloc(sizeof(int64_t) * kDepotSlots,
+                                      kOsReadWrite);
+                void *eps = os_alloc(sizeof(Epoch) * g_epoch_cap, kOsReadWrite);
+                const uint64_t cells_bytes =
+                    uint64_t(sizeof(LiveCell)) * g_epoch_cap * kCellsPerEpoch;
+                void *cells = os_alloc(size_t(cells_bytes), kOsReadWrite);
+                void *big = os_alloc(sizeof(Big) * kBigSlots, kOsReadWrite);
+                if (live != nullptr && eps != nullptr && cells != nullptr &&
+                    big != nullptr) {
+                    std::memset(live, 0, sizeof(int64_t) * kDepotSlots);
+                    std::memset(eps, 0, sizeof(Epoch) * g_epoch_cap);
+                    std::memset(cells, 0, size_t(cells_bytes));
+                    std::memset(big, 0, sizeof(Big) * kBigSlots);
+                    g_live = static_cast<int64_t *>(live);
+                    g_epochs = static_cast<Epoch *>(eps);
+                    g_cells = static_cast<LiveCell *>(cells);
+                    g_cells_cap = g_epoch_cap * kCellsPerEpoch;
+                    g_big = static_cast<Big *>(big);
+                } else {
+                    /* \~english ALL FOUR OR NONE.  Half an axis is worse than
+                     * none: without the table of big blocks the curve climbs
+                     * for ever, and a curve that is wrong looks exactly like a
+                     * curve that is right.
+                     *
+                     * \~spanish LAS CUATRO O NINGUNA.  Medio eje es peor que
+                     * ninguno: sin la tabla de bloques grandes la curva sube
+                     * para siempre, y una curva equivocada tiene el mismo
+                     * aspecto que una correcta.  \~ */
+                    if (live != nullptr)
+                        os_free(live, sizeof(int64_t) * kDepotSlots);
+                    if (eps != nullptr)
+                        os_free(eps, sizeof(Epoch) * g_epoch_cap);
+                    if (cells != nullptr) os_free(cells, size_t(cells_bytes));
+                    if (big != nullptr) os_free(big, sizeof(Big) * kBigSlots);
+                    g_epoch_every = 0;
+                    std::fprintf(stderr,
+                                 "[allocator/check] no room for the time axis: "
+                                 "the run goes on without it, so there will be "
+                                 "no curve and no attribution of the peak\n");
+                }
             }
             cfg.store(2, std::memory_order_release);
         } else {
@@ -2856,8 +4892,8 @@ void *san_alloc_guarded(size_t n, size_t align, const void *pc,
     }
 
     const void *frames[kFrames];
-    bool walked = false;
-    const unsigned nf = walk_stack(frames, pc, fp, &walked);
+    bool walked = false, cut = false;
+    const unsigned nf = walk_stack(frames, pc, fp, &walked, &cut);
     g->base = base;
     g->total = total;
     g->req = n;
@@ -2878,7 +4914,7 @@ void *san_alloc_guarded(size_t n, size_t align, const void *pc,
      * se pueda situar desde el primer instante en que existe.  Escrito despues
      * de los campos a los que apunta, porque la busqueda los lee.  \~ */
     index_insert(base, total, uint32_t(g - g_guarded));
-    g->alloc_stack = intern_stack(frames, nf, walked);
+    g->alloc_stack = intern_stack(frames, nf, walked, cut);
     /* \~english AND HERE TOO, because at the guard level this is the ONLY place
      * that sees the block.  A guarded block lives on pages of its own, outside
      * the region, so `slot_of` refuses it and the shadow never hears about it
@@ -2946,7 +4982,8 @@ bool guarded_free(void *p, const void *fp) noexcept {
     }
 
     if (g->state == kStFreed) {
-        verdict(Certainty::Proven, "released twice", p);
+        verdict(Certainty::Proven, "released twice", p, g->alloc_stack,
+                g->free_stack);
         print_stack("allocated", g->alloc_stack);
         print_stack("released the first time", g->free_stack);
         return true; // and NOT again: the pages are already gone
@@ -2954,7 +4991,8 @@ bool guarded_free(void *p, const void *fp) noexcept {
 
     for (size_t i = 0; i < g->tail; ++i) {
         if (static_cast<unsigned char *>(p)[g->req + i] != kCanaryByte) {
-            verdict(Certainty::Proven, "written past the end of the block", p);
+            verdict(Certainty::Proven, "written past the end of the block", p,
+                    g->alloc_stack);
             std::fprintf(stderr,
                          "    asked for %zu bytes; it overran into the %zu that "
                          "sit between the block and the guard page, from byte "
@@ -2967,11 +5005,11 @@ bool guarded_free(void *p, const void *fp) noexcept {
     }
 
     const void *frames[kFrames];
-    bool walked = false;
+    bool walked = false, cut = false;
     const unsigned nf =
         walk_stack(frames, __builtin_return_address(0),
-                   __builtin_frame_address(0), &walked);
-    g->free_stack = intern_stack(frames, nf, walked);
+                   __builtin_frame_address(0), &walked, &cut);
+    g->free_stack = intern_stack(frames, nf, walked, cut);
     g->state = kStFreed;
     /* Counted where it is DONE, so that the two ledgers add up to the whole.
      * See `g_guard_frees`. */
@@ -3093,9 +5131,22 @@ void san_on_alloc(void *p, size_t req, const void *pc,
          * \~ */
         g_uncovered.fetch_add(1, std::memory_order_relaxed);
         const void *big[kFrames];
-        bool big_walked = false;
-        const unsigned bn = walk_stack(big, pc, fp, &big_walked);
-        note_birth(intern_stack(big, bn, big_walked), req, false);
+        bool big_walked = false, big_cut = false;
+        const unsigned bn = walk_stack(big, pc, fp, &big_walked, &big_cut);
+        const uint32_t big_site = intern_stack(big, bn, big_walked, big_cut);
+        note_birth(big_site, req, false);
+        /* \~english AND WRITTEN DOWN BY ADDRESS, because nothing else will
+         * recognise it when it comes back: it has no shadow slot, so the free
+         * path cannot tell it from a pointer that was never ours.  Only with
+         * the axis on -- without it nobody asks, and the table is not even
+         * there.  See @c Big.
+         *
+         * \~spanish Y APUNTADO POR DIRECCION, porque no hay nada mas que lo
+         * reconozca cuando vuelva: no tiene ranura de sombreado, asi que el
+         * camino de liberacion no lo distingue de un puntero que nunca fue
+         * nuestro.  Solo con el eje encendido -- sin el no lo pregunta nadie, y
+         * la tabla ni existe.  Ver @c Big.  \~ */
+        if (axis_on()) big_insert(p, req, big_site);
         return;
     }
 
@@ -3115,7 +5166,8 @@ void san_on_alloc(void *p, size_t req, const void *pc,
         for (size_t i = 0; i < len; ++i) {
             if (b[from + i] != kPoisonByte) {
                 verdict(Certainty::Proven,
-                        "written into a block after it was released", p);
+                        "written into a block after it was released", p,
+                        s->alloc_stack, s->free_stack);
                 std::fprintf(stderr, "    at byte %zu of the %u it held\n",
                              from + i, s->req);
                 print_stack("allocated", s->alloc_stack);
@@ -3126,13 +5178,13 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     }
 
     const void *frames[kFrames];
-    bool walked = false;
-    const unsigned n = walk_stack(frames, pc, fp, &walked);
+    bool walked = false, cut = false;
+    const unsigned n = walk_stack(frames, pc, fp, &walked, &cut);
 
     const detail::ThreadCache *c = detail::current_cache();
     const uint32_t tid = detail::have_cache(c) ? c->id : 0;
 
-    s->alloc_stack = intern_stack(frames, n, walked);
+    s->alloc_stack = intern_stack(frames, n, walked, cut);
     /* \~english AND WHAT IT MOVED, added up here because here is the only place
      * that sees it.  The shadow forgets a block as soon as its address is used
      * again, so by the end of the run it can say what leaked and cannot say
@@ -3145,6 +5197,8 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     note_birth(s->alloc_stack, req, true);
     s->free_stack = 0;
     s->req = uint32_t(req);
+    // El estado del que SALE, antes de pisarlo: ver `row_live_move`.
+    if (meta_state(s->meta) != kStAlive) row_live_move(p, true);
     s->meta = meta_of(kStAlive, tid, 0);
     /* Its birthday, in allocations of this thread.  Read from counters the
      * allocator already keeps, so nothing new is stored anywhere. */
@@ -3194,6 +5248,46 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     Slot *s = slot_of(p, &block);
     if (s == nullptr) {
         g_uncovered.fetch_add(1, std::memory_order_relaxed);
+        /* \~english THE OTHER HALF OF A BIG BLOCK'S LIFE.  This branch is where
+         * every block without a shadow slot ends up -- ours and foreign alike
+         * --, and until the axis existed it was the end of the line for both.
+         * The table tells them apart: found means it was one of ours and the
+         * bytes go back where they came from; not found leaves everything
+         * exactly as it was.
+         *
+         * \~spanish LA OTRA MITAD DE LA VIDA DE UN BLOQUE GRANDE.  En esta rama
+         * acaba todo bloque sin ranura de sombreado -- los nuestros y los
+         * ajenos --, y hasta que existio el eje era el final del camino para
+         * los dos.  La tabla los distingue: si esta, era nuestro y los bytes
+         * vuelven de donde salieron; si no esta, todo queda exactamente como
+         * estaba.  \~ */
+        /* Tampoco mientras corre el informe, igual que en la puerta del
+         * sombreado: ahi esta la razon entera. */
+        if (axis_on() && !g_in_report) {
+            uint64_t bytes = 0;
+            uint32_t site = 0;
+            if (big_take(p, &bytes, &site)) {
+                axis_death(site, bytes);
+                /* \~english AND IN ITS BUCKET, which is the whole reason the
+                 * live column of `check_sizes.csv` can be believed: a big block
+                 * is born through the door above and, without this, would never
+                 * die -- and its bucket would show everything it ever served as
+                 * if it were still standing.  That is the shape of the figure
+                 * that matters most there.
+                 *
+                 * \~spanish Y EN SU CASILLA, que es la razon entera de que la
+                 * columna de vivos de `check_sizes.csv` se pueda creer: un
+                 * bloque grande nace por la puerta de arriba y, sin esto, no
+                 * moriria nunca -- y su casilla ensenaria todo lo que llego a
+                 * servir como si siguiera en pie.  Y es justo la casilla donde
+                 * mas importa la cifra.  \~ */
+                const uint32_t b = util::bucket_of(size_t(bytes));
+                g_bucket_died_n[b] += 1;
+                g_bucket_died_bytes[b] += bytes;
+            } else {
+                g_big_unmatched += 1;
+            }
+        }
         return true;
     }
 
@@ -3211,15 +5305,22 @@ void san_on_alloc(void *p, size_t req, const void *pc,
          * vez y entregaria un bloque a dos duenos, con lo que el comprobador
          * habria convertido un fallo avisado en un monton corrompido.  Por eso
          * esto contesta false.  \~ */
-        verdict(Certainty::Proven, "released twice", p);
-        print_stack("allocated", s->alloc_stack);
-        print_stack("released the first time", s->free_stack);
+        /* LA TERCERA PILA SE TOMA ANTES DEL VEREDICTO, no despues.  Se imprimia
+         * al final, que para leer da igual, pero el veredicto se GUARDA en el
+         * momento en que se emite: dejarla detras habria apuntado una doble
+         * liberacion sin el sitio que la repitio, que es el unico de los tres
+         * que no se podia deducir mirando el codigo. */
         const void *frames[kFrames];
-        bool walked = false;
+        bool walked = false, cut = false;
         const unsigned n =
             walk_stack(frames, __builtin_return_address(0),
-                   __builtin_frame_address(0), &walked);
-        print_stack("released again", intern_stack(frames, n, walked));
+                   __builtin_frame_address(0), &walked, &cut);
+        const uint32_t again = intern_stack(frames, n, walked, cut);
+        verdict(Certainty::Proven, "released twice", p, s->alloc_stack,
+                s->free_stack, again);
+        print_stack("allocated", s->alloc_stack);
+        print_stack("released the first time", s->free_stack);
+        print_stack("released again", again);
         return false;
     }
 
@@ -3245,7 +5346,8 @@ void san_on_alloc(void *p, size_t req, const void *pc,
         canary_fits(s->req, block)) {
         const unsigned intact = check_canary(p, s->req);
         if (intact < kCanaryBytes) {
-            verdict(Certainty::Proven, "written past the end of the block", p);
+            verdict(Certainty::Proven, "written past the end of the block", p,
+                    s->alloc_stack);
             std::fprintf(stderr,
                          "    asked for %u bytes; the guard behind them was "
                          "overwritten from byte %u\n",
@@ -3255,10 +5357,10 @@ void san_on_alloc(void *p, size_t req, const void *pc,
     }
 
     const void *frames[kFrames];
-    bool walked = false;
+    bool walked = false, cut = false;
     const unsigned n =
         walk_stack(frames, __builtin_return_address(0),
-                   __builtin_frame_address(0), &walked);
+                   __builtin_frame_address(0), &walked, &cut);
     const detail::ThreadCache *c = detail::current_cache();
     const uint32_t tid = detail::have_cache(c) ? c->id : 0;
 
@@ -3285,10 +5387,11 @@ void san_on_alloc(void *p, size_t req, const void *pc,
      * \~ */
     note_death(s->alloc_stack, s->req, same_thread, s->seq, thread_allocs(c));
 
-    s->free_stack = intern_stack(frames, n, walked);
+    s->free_stack = intern_stack(frames, n, walked, cut);
     /* Y QUIEN LO DEVOLVIO, contra quien lo entrego.  Aqui, donde por primera y
      * unica vez se conocen los dos.  Ver `note_pair`. */
     note_pair(s->alloc_stack, s->free_stack, s->req);
+    if (st == kStAlive) row_live_move(p, false);
     s->meta = meta_of(kStFreed, meta_alloc_thread(s->meta), tid);
 
     if (detail::g_san_level >= SanLevel::Poison && g_poison != SanPoison::None)
@@ -3303,6 +5406,13 @@ uint64_t san_verdicts() noexcept {
 
 uint64_t san_longest_life() noexcept {
     return g_longest_life.load(std::memory_order_relaxed);
+}
+
+void san_mark(const char *name) noexcept {
+    if (name == nullptr) return;
+    if (!ensure_config() || detail::g_san_level == SanLevel::Off) return;
+    if (!axis_on()) return;
+    epoch_cut(name);
 }
 
 size_t san_guarded_size(const void *p) noexcept {
@@ -3355,7 +5465,8 @@ bool san_realloc(void *p, size_t n, void **out) noexcept {
          * liberar con otro verbo, y recibe la misma respuesta: se DICE y no se
          * sirve nada.  Devolver memoria aqui convertiria un fallo cazado en un
          * programa que funciona y esta mal.  \~ */
-        verdict(Certainty::Proven, "resized after it was released", p);
+        verdict(Certainty::Proven, "resized after it was released", p,
+                g->alloc_stack, g->free_stack);
         print_stack("allocated", g->alloc_stack);
         print_stack("released", g->free_stack);
         *out = nullptr;
@@ -3752,21 +5863,118 @@ bool write_check_csv(const char *dir) noexcept {
         }
     }
 
+    /* \~english WHAT EACH SITE DID ALONG THE RUN, worked out here from the cuts
+     * instead of being kept while the program ran.  Three questions come out of
+     * the same walk: the most a site ever held, what it held AT THE PEAK, and
+     * whether it ever gave anything back -- and that last one is the one no
+     * existing column could answer, because `use` classifies the life of ONE
+     * block and says nothing about the shape of the site over time.  A site
+     * whose live bytes never fall is ACCUMULATING, which is a different problem
+     * from one that churns a gigabyte through the same megabyte.
+     *
+     * SAMPLED, and it says so in the word: what is below the floor of a cut
+     * never appears, so `live_max` is a lower bound and `growth` is `-` for a
+     * site that was always small.  A figure that pretended otherwise would be
+     * the same mistake this whole axis exists to undo.
+     *
+     * \~spanish LO QUE HIZO CADA SITIO A LO LARGO DE LA CORRIDA, sacado aqui de
+     * los cortes en vez de llevarlo mientras el programa corria.  Del mismo
+     * recorrido salen tres preguntas: lo maximo que un sitio llego a tener, lo
+     * que tenia EN EL PICO, y si llego a devolver algo alguna vez -- y esa
+     * ultima es la que ninguna columna existente podia contestar, porque `use`
+     * clasifica la vida de UN bloque y no dice nada de la forma del sitio en el
+     * tiempo.  Un sitio cuyos bytes vivos no bajan nunca esta ACUMULANDO, que
+     * es un problema distinto del que trasiega un gigabyte por el mismo
+     * megabyte.
+     *
+     * MUESTREADO, y lo dice la palabra: lo que esta por debajo del suelo de un
+     * corte no aparece, asi que `live_max` es una cota inferior y `growth` es
+     * `-` para un sitio que siempre fue pequeno.  Una cifra que fingiera otra
+     * cosa seria el mismo error que este eje entero viene a deshacer.  \~ */
+    struct Trace {
+        uint64_t max;     ///< the most it was seen holding
+        uint64_t at_peak; ///< and what it held at the highest cut
+        uint64_t prev;    ///< working: its value at the previous cut
+        uint32_t last;    ///< working: which cut that was
+        uint32_t falls;   ///< how many times it went down
+    };
+    Trace *trace = nullptr;
+    const size_t tbytes = sizeof(Trace) * kDepotSlots;
+    uint32_t peak_epoch = 0;
+    if (g_epochs != nullptr && g_epochs_used != 0) {
+        void *tmem = os_alloc(tbytes, kOsReadWrite);
+        if (tmem != nullptr) {
+            trace = static_cast<Trace *>(tmem);
+            std::memset(tmem, 0, tbytes);
+            for (uint32_t e = 1; e < g_epochs_used; ++e)
+                if (g_epochs[e].live > g_epochs[peak_epoch].live) peak_epoch = e;
+            for (uint32_t e = 0; e < g_epochs_used; ++e) {
+                const Epoch &ep = g_epochs[e];
+                for (uint32_t c = 0; c < ep.cells; ++c) {
+                    const LiveCell &cell = g_cells[ep.first + c];
+                    if (cell.site >= kDepotSlots) continue;
+                    Trace &t = trace[cell.site];
+                    /* Gone from one or more cuts in between and back: that is a
+                     * fall even though no smaller value was ever written down,
+                     * and missing it would call a site that empties and refills
+                     * an accumulator. */
+                    if (t.prev != 0 && t.last + 1 != e) ++t.falls;
+                    if (cell.bytes < t.prev) ++t.falls;
+                    if (cell.bytes > t.max) t.max = cell.bytes;
+                    if (e == peak_epoch) t.at_peak = cell.bytes;
+                    t.prev = cell.bytes;
+                    t.last = e;
+                }
+            }
+            /* And one last fall for whoever was holding something at its last
+             * cut and was gone by the end of the run. */
+            for (uint32_t i = 1; i < kDepotSlots; ++i)
+                if (trace[i].prev != 0 && trace[i].last + 1 != g_epochs_used)
+                    ++trace[i].falls;
+        }
+    }
+
     bool any = false;
 
     if (FILE *f = csv_open(dir, "check_sites.csv")) {
         std::fprintf(f,
                      "stack_id,births,bytes,outside_births,outside_bytes,"
                      "deaths,alive_blocks,alive_bytes,life_avg,life_max,"
-                     "cross_thread,size_min,size_max,use,shape,walked,frames\n");
+                     "cross_thread,size_min,size_max,use,shape,walked,frames,"
+                     /* `cut` junto a `walked` y `frames` porque son la misma
+                      * pregunta: cuanto de esta pila es lo que habia.  Sin ella
+                      * una pila cortada se lee como completa tambien aqui. */
+                     "cut,"
+                     /* \~english And the three that come from the time axis.
+                      * Empty when nobody asked for it, never zero: zero would
+                      * read as "this site held nothing", which is a claim, and
+                      * what is true is that nothing was measured.
+                      *
+                      * \~spanish Y las tres que salen del eje del tiempo.
+                      * Vacias cuando nadie lo pidio, nunca cero: un cero se lee
+                      * como "este sitio no tenia nada", que es una afirmacion, y
+                      * lo cierto es que no se midio nada.  \~ */
+                     "live_max,live_at_peak,growth\n");
         for (uint32_t i = 1; i < kDepotSlots; ++i) {
             const Life &l = g_life[i];
             /* A stack with no births and nothing alive was never a site. */
             if (l.births == 0 && alive[i].blocks == 0) continue;
             const Stack &s = g_depot[i];
+            char live_max[24] = "";
+            char live_peak[24] = "";
+            const char *growth = "";
+            if (trace != nullptr) {
+                std::snprintf(live_max, sizeof live_max, "%llu",
+                              (unsigned long long)trace[i].max);
+                std::snprintf(live_peak, sizeof live_peak, "%llu",
+                              (unsigned long long)trace[i].at_peak);
+                growth = trace[i].max == 0      ? "-"
+                         : trace[i].falls == 0  ? "accumulates"
+                                                : "churns";
+            }
             std::fprintf(f,
                          "%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%u,%llu,%u,"
-                         "%u,%s,%s,%d,%u\n",
+                         "%u,%s,%s,%d,%u,%d,%s,%s,%s\n",
                          i, (unsigned long long)l.births,
                          (unsigned long long)l.bytes,
                          (unsigned long long)l.outside_births,
@@ -3778,7 +5986,8 @@ bool write_check_csv(const char *dir) noexcept {
                                                   : 0),
                          l.life_max, (unsigned long long)l.unknown, l.size_min,
                          l.size_max, use_word(l), shape_word(l),
-                         s.walked ? 1 : 0, unsigned(s.frames));
+                         s.walked ? 1 : 0, unsigned(s.n), s.cut ? 1 : 0,
+                         live_max, live_peak, growth);
         }
         std::fclose(f);
         any = true;
@@ -3797,21 +6006,44 @@ bool write_check_csv(const char *dir) noexcept {
      * el, que son dos ejes distintos y se confunden cuando una tabla llama
      * "depth" a los dos.  \~ */
     if (FILE *f = csv_open(dir, "check_frames.csv")) {
-        std::fprintf(f, "stack_id,frame,depth,inlined,function,file,line\n");
+        /* \~english AND WHOSE CODE IT IS, the same column the allocator's own
+         * frames carry.  Without it the page can offer "group by module" over
+         * this population and every band comes out as "(?)" -- a control that
+         * is there, answers, and answers nothing.  The resolver already fills
+         * the field; it was simply never written.
+         *
+         * \~spanish Y DE QUIEN ES ESE CODIGO, la misma columna que llevan los
+         * marcos del asignador.  Sin ella la pagina puede ofrecer "agrupar por
+         * modulo" sobre esta poblacion y todas las bandas salen como "(?)" --
+         * un control que esta, contesta, y no dice nada.  El resolutor ya
+         * rellena el campo; lo que faltaba era escribirlo.  \~ */
+        std::fprintf(f,
+                     "stack_id,frame,depth,inlined,function,file,line,module,"
+                     "module_from\n");
         for (uint32_t i = 1; i < kDepotSlots; ++i) {
             if (g_life[i].births == 0 && alive[i].blocks == 0) continue;
             const Stack &s = g_depot[i];
-            for (unsigned k = 0; k < s.frames; ++k) {
+            const void *const *const sf = frames_of(s);
+            for (unsigned k = 0; sf != nullptr && k < s.n; ++k) {
                 AllocFrame fr[kNameFrames];
-                const unsigned got = name_of(s.pc[k], fr, kNameFrames);
+                /* Same reason as in `print_frame`: a mark is not an address to
+                 * ask about, and `raw_name` is what names it. */
+                const unsigned got =
+                    could_be_code(sf[k]) ? name_of(sf[k], fr, kNameFrames) : 0;
                 if (got == 0) {
                     /* Nobody could resolve it, so the address is written as
                      * what it is.  An empty row would read as "no code here". */
                     char buf[512];
-                    raw_name(s.pc[k], buf, sizeof buf);
+                    raw_name(sf[k], buf, sizeof buf);
                     std::fprintf(f, "%u,%u,0,0,", i, k);
                     csv_field(f, buf);
-                    std::fprintf(f, ",,0\n");
+                    /* Y el modulo VACIO, que es "no consta".  La ruta del
+                     * modulo si se sabe por la direccion, pero no es lo mismo
+                     * que esta columna lleva en las demas filas -- ahi va de
+                     * quien es el CODIGO, no en que fichero vive --, y poner
+                     * dos clases de valor en una columna es peor que dejarla
+                     * sin contestar. */
+                    std::fprintf(f, ",,0,,\n");
                     continue;
                 }
                 for (unsigned d = 0; d < got; ++d) {
@@ -3819,8 +6051,23 @@ bool write_check_csv(const char *dir) noexcept {
                                  fr[d].inlined ? 1 : 0);
                     csv_field(f, alloc_readable_name(fr[d].function));
                     std::fputc(',', f);
-                    csv_field(f, fr[d].file);
-                    std::fprintf(f, ",%u\n", fr[d].line);
+                    /* Igual que en los marcos del asignador: sin fichero,
+                     * el del tramo declarado -- que en Release es el unico. */
+                    csv_field(f, fr[d].file != nullptr
+                                     ? fr[d].file
+                                     : alloc_code_name(sf[k]));
+                    std::fprintf(f, ",%u,", fr[d].line);
+                    /* Por el MISMO respaldo que los marcos del asignador: lo
+                     * que supiera el resolutor, y si no supo nada, lo que diga
+                     * el clasificador del consumidor.  Dos poblaciones, una
+                     * sola regla -- si cada una tuviera la suya, agrupar por
+                     * modulo contestaria distinto segun cual mires. */
+                    const AllocModuleAnswer mod = alloc_module_answer(
+                        sf[k], fr[d].file, fr[d].function, fr[d].module);
+                    csv_field(f, mod.name);
+                    std::fputc(',', f);
+                    csv_field(f, mod.from);
+                    std::fputc('\n', f);
                 }
             }
         }
@@ -3835,8 +6082,258 @@ bool write_check_csv(const char *dir) noexcept {
      * \~spanish Y LOS PUNTOS CIEGOS, en su propio fichero, porque una tabla que
      * no los lleva se lee como completa.  El deposito tiene techo y los bloques
      * pasados de ahi no son de ninguna fila de arriba.  \~ */
+    /* \~english WHO GIVES BACK WHOSE, as DATA.  The report prints this for a
+     * person, and a person reading fifteen thousand lines to find out whether a
+     * site has one owner is not how the question gets answered -- it is answered
+     * by sorting, which is what a table is for.
+     *
+     * Both columns are depot ids, the same ones `check_frames.csv` is keyed by,
+     * so joining them names both ends without anything new being invented.
+     *
+     * \~spanish QUIEN DEVUELVE LO DE QUIEN, como DATO.  El informe lo imprime
+     * para una persona, y una persona leyendo quince mil lineas para saber si un
+     * sitio tiene un solo dueño no es como se contesta eso -- se contesta
+     * ordenando, que es para lo que sirve una tabla.
+     *
+     * Las dos columnas son ids del deposito, los mismos por los que se indexa
+     * `check_frames.csv`, asi que juntarlas nombra los dos extremos sin
+     * inventar nada.  \~ */
+    if (g_pairs != nullptr) {
+        if (FILE *f = csv_open(dir, "check_pairs.csv")) {
+            std::fprintf(f, "alloc_stack,free_stack,blocks,bytes\n");
+            for (uint32_t i = 0; i < kPairSlots; ++i) {
+                const uint64_t k =
+                    g_pairs[i].key.load(std::memory_order_relaxed);
+                if (k == 0) continue;
+                std::fprintf(f, "%u,%u,%llu,%llu\n", uint32_t(k >> 32),
+                             uint32_t(k & 0xFFFFFFFFu),
+                             (unsigned long long)g_pairs[i].blocks,
+                             (unsigned long long)g_pairs[i].bytes);
+            }
+            std::fclose(f);
+            any = true;
+        }
+    }
+
+    /* \~english THE FINDINGS THEMSELVES.  Everything else in this export
+     * describes the run; this describes what was WRONG with it, and it was the
+     * one thing that only ever left as prose.
+     *
+     * \~spanish LOS HALLAZGOS.  Todo lo demas de esta exportacion describe la
+     * corrida; esto describe que estaba MAL en ella, y era lo unico que solo
+     * salia como prosa.  \~ */
+    {
+        const uint32_t vn = g_verdict_n.load(std::memory_order_relaxed);
+        if (vn != 0) {
+            if (FILE *f = csv_open(dir, "check_verdicts.csv")) {
+                std::fprintf(f, "certainty,what,address,allocated,released,"
+                                "released_again\n");
+                const uint32_t n = vn < kVerdictSlots ? vn : kVerdictSlots;
+                for (uint32_t i = 0; i < n; ++i) {
+                    const Verdict &v = g_verdict_list[i];
+                    std::fprintf(f, "%s,", v.certainty ? "proven" : "suspected");
+                    csv_field(f, v.what);
+                    std::fprintf(f, ",%p,%u,%u,%u\n", v.p, v.allocated,
+                                 v.released, v.again);
+                }
+                std::fclose(f);
+                any = true;
+            }
+        }
+    }
+
+    /* \~english THE CURVE, AND WHO IS UNDER IT.  Three files and not one because
+     * they answer at three different grains and joining them would repeat the
+     * epoch on every row: the run over time, each site over time, and the
+     * instant that decides everything -- the peak.
+     *
+     * The peak gets a file of its own even though it is one of the cuts already
+     * in the other two.  It is not convenience: it is the ONE question anybody
+     * comes here with, and leaving it to be rebuilt with a join is how a figure
+     * that exists ends up never being read.
+     *
+     * \~spanish LA CURVA, Y QUIEN ESTA DEBAJO.  Tres ficheros y no uno porque
+     * contestan a tres granos distintos y juntarlos repetiria la epoca en cada
+     * fila: la corrida en el tiempo, cada sitio en el tiempo, y el instante que
+     * lo decide todo -- el pico.
+     *
+     * El pico lleva fichero propio aunque sea uno de los cortes que ya estan en
+     * los otros dos.  No es comodidad: es la UNICA pregunta con la que alguien
+     * llega aqui, y dejarla para que se reconstruya con un cruce es como una
+     * cifra que existe acaba sin leerse nunca.  \~ */
+    if (g_epochs != nullptr && g_epochs_used != 0) {
+        if (FILE *f = csv_open(dir, "check_epochs.csv")) {
+            std::fprintf(f, "epoch,mark,allocs,live_bytes,committed_bytes,"
+                            "region_bytes,free_span_bytes,empty_chunk_bytes,"
+                            "born_bytes,died_bytes,sites,"
+                            "below_floor_bytes\n");
+            for (uint32_t e = 0; e < g_epochs_used; ++e) {
+                const Epoch &ep = g_epochs[e];
+                std::fprintf(f, "%u,", e);
+                csv_field(f, ep.mark != nullptr ? ep.mark : "");
+                std::fprintf(f,
+                             ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,"
+                             "%llu\n",
+                             (unsigned long long)ep.allocs,
+                             (unsigned long long)ep.live,
+                             (unsigned long long)ep.committed,
+                             (unsigned long long)ep.region,
+                             (unsigned long long)ep.free_spans,
+                             (unsigned long long)ep.empty_chunks,
+                             (unsigned long long)ep.born_bytes,
+                             (unsigned long long)ep.died_bytes, ep.cells,
+                             (unsigned long long)ep.below_floor);
+            }
+            std::fclose(f);
+            any = true;
+        }
+        if (FILE *f = csv_open(dir, "check_epoch_sites.csv")) {
+            std::fprintf(f, "epoch,stack_id,live_bytes\n");
+            for (uint32_t e = 0; e < g_epochs_used; ++e) {
+                const Epoch &ep = g_epochs[e];
+                for (uint32_t c = 0; c < ep.cells; ++c) {
+                    const LiveCell &cell = g_cells[ep.first + c];
+                    std::fprintf(f, "%u,%u,%llu\n", e, cell.site,
+                                 (unsigned long long)cell.bytes);
+                }
+            }
+            std::fclose(f);
+            any = true;
+        }
+        /* \~english THE SAME CURVE, BY SIZE.  The file above says who had what
+         * at each cut and this one of what size, and the second does not come
+         * out of the first: one site serves several buckets, and the cells only
+         * carry the sites above the floor.
+         *
+         * Sparse, like the other one: a bucket that had nothing at a cut is not
+         * a row of zeros.
+         *
+         * \~spanish LA MISMA CURVA, POR TAMANO.  El fichero de arriba dice
+         * quien tenia que en cada corte y este de que tamano, y el segundo no
+         * sale del primero: un sitio sirve varias casillas, y las celdas solo
+         * llevan los sitios que pasan del suelo.
+         *
+         * Disperso, como el otro: una casilla que no tenia nada en un corte no
+         * es una fila de ceros.  \~ */
+        if (FILE *f = csv_open(dir, "check_epoch_sizes.csv")) {
+            std::fprintf(f, "epoch,bucket,upper_bytes,live_bytes\n");
+            for (uint32_t e = 0; e < g_epochs_used; ++e) {
+                const Epoch &ep = g_epochs[e];
+                for (uint32_t b = 0; b < util::kSizeBuckets; ++b) {
+                    if (ep.by_bucket[b] == 0) continue;
+                    std::fprintf(f, "%u,%u,%llu,%llu\n", e, b,
+                                 util::bucket_limit_out(b),
+                                 (unsigned long long)ep.by_bucket[b]);
+                }
+            }
+            std::fclose(f);
+            any = true;
+        }
+        if (FILE *f = csv_open(dir, "check_peak.csv")) {
+            const Epoch &ep = g_epochs[peak_epoch];
+            /* La fase EN VIGOR, no la del corte: el pico casi nunca cae en una
+             * frontera.  Ver `mark_in_force`. */
+            const char *peak_phase = mark_in_force(peak_epoch);
+            std::fprintf(f, "epoch,mark,stack_id,live_bytes,share_per_mille\n");
+            for (uint32_t c = 0; c < ep.cells; ++c) {
+                const LiveCell &cell = g_cells[ep.first + c];
+                /* \~english In parts per thousand and as an integer: a column
+                 * of percentages with two decimals invites adding them up, and
+                 * what is below the floor is not here to be added.
+                 * \~spanish En milesimas y entero: una columna de porcentajes
+                 * con dos decimales invita a sumarlos, y lo que esta por debajo
+                 * del suelo no esta aqui para sumarse.  \~ */
+                const unsigned share =
+                    ep.live != 0
+                        ? unsigned((cell.bytes * 1000ULL) / ep.live)
+                        : 0u;
+                std::fprintf(f, "%u,", peak_epoch);
+                csv_field(f, peak_phase != nullptr ? peak_phase : "");
+                std::fprintf(f, ",%u,%llu,%u\n", cell.site,
+                             (unsigned long long)cell.bytes, share);
+            }
+            std::fclose(f);
+            any = true;
+        }
+    }
+
+    /* \~english WHAT EACH SIZE KEEPS, which is the reading of the histogram
+     * that neither of the other two files can give.  The export's own histogram
+     * counts allocations and the site table adds up bytes, and both are about
+     * the WHOLE run: a bucket that moves four gigabytes and hands them all back
+     * looks bigger there than one that quietly keeps two hundred megabytes,
+     * when it is the second one that makes the peak.
+     *
+     * Outside the axis block on purpose: this needs no epochs, only the two
+     * doors the checker already stands at.
+     *
+     * \~spanish LO QUE CADA TAMANO SE QUEDA, que es la lectura del histograma
+     * que no puede dar ninguno de los otros dos ficheros.  El histograma del
+     * volcado cuenta reservas y la tabla de sitios suma bytes, y las dos hablan
+     * de TODA la corrida: una casilla que mueve cuatro gigabytes y los devuelve
+     * todos sale ahi mas grande que una que se queda calladita con doscientos
+     * megabytes, cuando es la segunda la que hace el pico.
+     *
+     * Fuera del bloque del eje a proposito: esto no necesita cortes, solo las
+     * dos puertas donde el comprobador ya esta.  \~ */
+    if (FILE *f = csv_open(dir, "check_sizes.csv")) {
+        /* \~english AND WHETHER WHAT IS STILL STANDING CAN BE KNOWN AT ALL.  A
+         * block too big for a shadow slot is recognised on its way back ONLY by
+         * the table the axis keeps: with the axis off, everything above the
+         * small classes is born and never dies, and a live column worked out
+         * from that would put over a gigabyte in the buckets that decide the
+         * peak -- all of it long since given back.
+         *
+         * So the columns are left EMPTY, not zero and not a guess.  The two
+         * that are counted honestly either way -- handed out and given back --
+         * are always there.
+         *
+         * \~spanish Y SI SE PUEDE SABER SIQUIERA LO QUE SIGUE EN PIE.  Un
+         * bloque demasiado grande para una ranura de sombreado se reconoce al
+         * volver SOLO por la tabla que lleva el eje: con el eje apagado, todo lo
+         * que pasa de las clases pequenas nace y no muere nunca, y una columna
+         * de vivos sacada de ahi pondria mas de un gigabyte en las casillas que
+         * deciden el pico -- y devuelto hace rato.
+         *
+         * Asi que las columnas se dejan VACIAS, ni a cero ni a ojo.  Las dos que
+         * se cuentan honradamente en cualquier caso -- entregado y devuelto --
+         * estan siempre.  \~ */
+        const bool live_known = axis_on();
+        std::fprintf(f,
+                     "bucket,upper_bytes,allocs,bytes,frees,freed_bytes,"
+                     "live_bytes,live_bytes_max\n");
+        for (uint32_t b = 0; b < util::kSizeBuckets; ++b) {
+            if (g_bucket_born_n[b] == 0 && g_bucket_died_n[b] == 0) continue;
+            std::fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,", b,
+                         util::bucket_limit_out(b),
+                         (unsigned long long)g_bucket_born_n[b],
+                         (unsigned long long)g_bucket_born_bytes[b],
+                         (unsigned long long)g_bucket_died_n[b],
+                         (unsigned long long)g_bucket_died_bytes[b]);
+            if (live_known)
+                std::fprintf(f, "%llu,%llu\n",
+                             (unsigned long long)bucket_live(b),
+                             (unsigned long long)g_bucket_live_max[b]);
+            else
+                std::fprintf(f, ",\n");
+        }
+        std::fclose(f);
+        any = true;
+    }
+
     if (FILE *f = csv_open(dir, "check_summary.csv")) {
         std::fprintf(f, "key,value\n");
+        /* \~english WHY THE LIVE COLUMN OF `check_sizes.csv` IS EMPTY, when it
+         * is.  A gap that is not said out loud reads as a zero, and a zero
+         * there reads as "this size keeps nothing" -- which is the opposite of
+         * what it means.
+         *
+         * \~spanish POR QUE ESTA VACIA LA COLUMNA DE VIVOS de
+         * `check_sizes.csv`, cuando lo esta.  Un hueco que no se dice se lee
+         * como un cero, y un cero ahi se lee como "este tamano no se queda
+         * nada" -- que es justo lo contrario de lo que significa.  \~ */
+        std::fprintf(f, "sizes_live_needs_the_axis,%u\n",
+                     axis_on() ? 0u : 1u);
         std::fprintf(f, "depot_slots,%u\n", kDepotSlots);
         /* What THIS mode served, which the allocator's own counters cannot see:
          * `site entries == allocator served + this`.  See `g_guard_blocks`. */
@@ -3848,6 +6345,66 @@ bool write_check_csv(const char *dir) noexcept {
                          std::memory_order_relaxed));
         std::fprintf(f, "stacks_that_did_not_fit,%llu\n",
                      (unsigned long long)g_depot_full.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "frames_that_did_not_fit,%llu\n",
+                     (unsigned long long)g_pool_full.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "frames_stored,%llu\n",
+                     (unsigned long long)g_pool_used.load(
+                         std::memory_order_relaxed));
+        /* \~english THE HOPS THAT COULD NOT BE READ, because a walk that
+         * swallows them looks like a program with short stacks.  See
+         * `kUnreadableFrame`: they are marked in the chain, and this is how
+         * many marks there are.
+         *
+         * \~spanish LOS SALTOS QUE NO SE PUDIERON LEER, porque un recorrido que
+         * se los traga parece un programa con pilas cortas.  Ver
+         * `kUnreadableFrame`: van marcados en la cadena, y esto es cuantas
+         * marcas hay.  \~ */
+        std::fprintf(f, "frames_that_could_not_be_read,%llu\n",
+                     (unsigned long long)g_frames_unreadable.load(
+                         std::memory_order_relaxed));
+        /* \~english EVERYTHING THE REPORT SAYS, said here too.  These eight were
+         * printed for a person to read and had no way out for a tool -- so the
+         * page built from this data was answering with less than the run knew,
+         * and nothing said which half was missing.  A figure that exists in one
+         * output and not the other is a figure somebody will conclude is zero.
+         *
+         * \~spanish TODO LO QUE DICE EL INFORME, dicho tambien aqui.  Estos ocho
+         * se imprimian para que los leyera una persona y no tenian salida para
+         * una herramienta -- asi que la pagina construida con estos datos
+         * contestaba con menos de lo que la corrida sabia, y nada decia que
+         * mitad faltaba.  Una cifra que esta en una salida y no en la otra es
+         * una cifra que alguien va a dar por cero.  \~ */
+        std::fprintf(f, "granules_that_did_not_fit,%llu\n",
+                     (unsigned long long)g_index_full.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "allocations_with_no_guard,%llu\n",
+                     (unsigned long long)g_guard_full.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "pairs_that_did_not_fit,%llu\n",
+                     (unsigned long long)g_pair_full.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "blocks_released_by_the_checker,%llu\n",
+                     (unsigned long long)g_guard_frees.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "verdicts,%llu\n",
+                     (unsigned long long)g_verdicts.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "released_on_another_thread,%llu\n",
+                     (unsigned long long)g_cross_thread.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "longest_life,%llu\n",
+                     (unsigned long long)g_longest_life.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "chunks_with_no_shadow,%llu\n",
+                     (unsigned long long)g_no_shadow.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "verdicts_proven,%llu\n",
+                     (unsigned long long)g_proven.load(
+                         std::memory_order_relaxed));
+        std::fprintf(f, "verdicts_not_listed,%llu\n",
+                     (unsigned long long)g_verdict_lost.load(
                          std::memory_order_relaxed));
         std::fprintf(f, "blocks_with_no_site,%llu\n",
                      (unsigned long long)g_birth_lost);
@@ -3872,10 +6429,118 @@ bool write_check_csv(const char *dir) noexcept {
          * deposito saturado.  \~ */
         std::fprintf(f, "frames_walked,%u\n", g_depth);
         std::fprintf(f, "frames_per_stack_max,%u\n", kFrames);
+        /* \~english THE TIME AXIS, including what it could not cover.  The two
+         * totals side by side are the whole point of it: what the PROGRAM holds
+         * against what the allocator has taken from the system, which come
+         * apart because nothing gives pages back -- and confusing the two is
+         * what made a structure look like it set the peak when it was long
+         * gone by then.
+         *
+         * \~spanish EL EJE DEL TIEMPO, con lo que no pudo cubrir incluido.  Los
+         * dos totales juntos son su razon de ser: lo que el PROGRAMA tiene
+         * contra lo que el asignador lleva pedido al sistema, que se separan
+         * porque nadie devuelve paginas -- y confundirlos es lo que hizo que
+         * una estructura pareciera marcar el pico cuando para entonces hacia
+         * rato que no existia.  \~ */
+        std::fprintf(f, "epoch_every_allocations,%u\n", g_epoch_every);
+        /* \~english And WHICH KNOB fills them, said where the gap is noticed.
+         * The three time-axis columns of `check_sites.csv` come out empty on
+         * purpose -- empty is "not measured", zero would be a claim -- but an
+         * empty cell does not say what would fill it, and whoever is reading
+         * that file is not reading this one.  Naming the switch turns "I do not
+         * know" into "I do not know, and here is how to find out", which is the
+         * difference between a gap and a dead end.
+         *
+         * \~spanish Y QUE MANDO las llena, dicho donde se nota el hueco.  Las
+         * tres columnas del eje del tiempo de `check_sites.csv` salen vacias a
+         * proposito -- vacio es "no se midio", un cero seria una afirmacion --
+         * pero una celda vacia no dice que la llenaria, y quien esta leyendo
+         * ese fichero no esta leyendo este.  Nombrar el interruptor convierte
+         * "no lo se" en "no lo se, y asi se averigua", que es la diferencia
+         * entre un hueco y un callejon.  \~ */
+        if (g_epoch_every == 0)
+            std::fprintf(f, "time_axis_off_fill_with,"
+                            "VESTA_ALLOC_SAN_EPOCH=<allocations per cut>\n");
+        if (g_epoch_every != 0) {
+            std::fprintf(f, "epoch_floor_bytes,%llu\n",
+                         (unsigned long long)g_epoch_floor);
+            std::fprintf(f, "epoch_step_bytes,%llu\n",
+                         (unsigned long long)g_epoch_step);
+            std::fprintf(f, "epochs_recorded,%u\n", g_epochs_used);
+            std::fprintf(f, "epochs_that_did_not_fit,%llu\n",
+                         (unsigned long long)g_epochs_lost);
+            std::fprintf(f, "epoch_rows_that_did_not_fit,%llu\n",
+                         (unsigned long long)g_cells_lost);
+            std::fprintf(f, "live_bytes_max,%llu\n",
+                         (unsigned long long)g_live_max.load(
+                             std::memory_order_relaxed));
+            std::fprintf(f, "live_bytes_at_exit,%llu\n",
+                         (unsigned long long)g_live_now.load(
+                             std::memory_order_relaxed));
+            /* \~english THE NAME SAYS IT IS CUMULATIVE, because it is.  It used
+             * to be called `committed_bytes_at_exit`, which reads as a snapshot
+             * next to `live_bytes_at_exit`, and it was not one: it adds up
+             * everything ever committed, and a range that gets reused counts
+             * again.  Measured: 3.328 MiB here on a process that never held
+             * more than 2.374.
+             *
+             * \~spanish EL NOMBRE DICE QUE ES ACUMULADO, porque lo es.  Se
+             * llamaba `committed_bytes_at_exit`, que se lee como una foto al
+             * lado de `live_bytes_at_exit`, y no lo era: suma todo lo
+             * comprometido alguna vez y un rango reusado vuelve a contar.
+             * Medido: 3.328 MiB aqui con un proceso que nunca tuvo mas de
+             * 2.374.  \~ */
+            std::fprintf(f, "committed_bytes_over_the_run,%llu\n",
+                         (unsigned long long)host_alloc_stats().bytes_reserved);
+            /* \~english And the one that DOES answer "how much memory did it
+             * need", asked of the system: it counts the stacks and the image
+             * too.
+             *
+             * \~spanish Y la que si contesta "cuanta memoria hizo falta",
+             * preguntada al sistema: cuenta tambien las pilas y la imagen.
+             * \~ */
+            const OsProcessMemory pm = os_process_memory();
+            std::fprintf(f, "process_committed_peak,%llu\n",
+                         (unsigned long long)pm.commit_peak);
+            std::fprintf(f, "process_resident_peak,%llu\n",
+                         (unsigned long long)pm.working_set_peak);
+            std::fprintf(f, "bytes_handed_out,%llu\n",
+                         (unsigned long long)g_born_total.load(
+                             std::memory_order_relaxed));
+            std::fprintf(f, "bytes_given_back,%llu\n",
+                         (unsigned long long)g_died_total.load(
+                             std::memory_order_relaxed));
+            if (g_epochs_used != 0) {
+                std::fprintf(f, "peak_epoch,%u\n", peak_epoch);
+                std::fprintf(f, "peak_mark,");
+                csv_field(f, mark_in_force(peak_epoch) != nullptr
+                                 ? mark_in_force(peak_epoch)
+                                 : "");
+                std::fprintf(f, "\n");
+            }
+            /* \~english The big blocks the curve depends on, and how many of
+             * them it lost.  A release nobody matched leaves its bytes standing
+             * for ever, so this figure is how much to distrust the tail of the
+             * curve -- not a detail.
+             *
+             * \~spanish Los bloques grandes de los que depende la curva, y
+             * cuantos se le perdieron.  Una liberacion sin pareja deja sus
+             * bytes de pie para siempre, asi que esta cifra es cuanto hay que
+             * desconfiar de la cola de la curva -- no un detalle.  \~ */
+            std::fprintf(f, "big_blocks_that_did_not_fit,%llu\n",
+                         (unsigned long long)g_big_lost);
+            std::fprintf(f, "releases_with_no_block_of_ours,%llu\n",
+                         (unsigned long long)g_big_unmatched);
+            std::fprintf(f, "releases_born_before_the_axis,%llu\n",
+                         (unsigned long long)g_axis_orphans);
+            std::fprintf(f, "bytes_born_before_the_axis,%llu\n",
+                         (unsigned long long)g_axis_orphan_bytes);
+        }
         std::fclose(f);
         any = true;
     }
 
+    if (trace != nullptr) os_free(trace, tbytes);
     os_free(amem, abytes);
     return any;
 }
@@ -4007,6 +6672,95 @@ void report() noexcept {
                      "in the depot of %u and were dropped whole, never merged "
                      "with somebody else's\n",
                      (unsigned long long)full, kDepotSlots);
+    /* \~english AND THE FRAMES, which is a different way of running out: the
+     * entry was made and the frames it points at were not, so that stack is
+     * known to exist and its shape is not.  Counting it and not saying it would
+     * have put the new store's only failure mode back in the dark.
+     *
+     * \~spanish Y LOS MARCOS, que es otra forma de quedarse sin sitio: la ficha
+     * se hizo y los marcos a los que apunta no, asi que de esa pila se sabe que
+     * existe y no como es.  Contarlo y no decirlo habria dejado a oscuras el
+     * unico modo de fallo del almacen nuevo.  \~ */
+    const uint64_t pfull = g_pool_full.load(std::memory_order_relaxed);
+    if (pfull != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] NOT COVERED: %llu frames found no room "
+                     "in the store, so the stacks that wanted them are marked "
+                     "CUT and are shorter than what was walked\n",
+                     (unsigned long long)pfull);
+    /* \~english AND THE HOPS THAT COULD NOT BE READ.  This one is not running
+     * out of room, it is running out of PROOF: the link was good and the return
+     * address in that frame was not an address at all, so the chain carries a
+     * mark where a caller should be.  Saying it matters because the reader is
+     * looking at a chain with a hole in it and would otherwise read the hole as
+     * the place the program went through.
+     *
+     * \~spanish Y LOS SALTOS QUE NO SE PUDIERON LEER.  Este no es quedarse sin
+     * sitio, es quedarse sin PRUEBA: el eslabon era bueno y la direccion de
+     * retorno de ese marco no era una direccion, asi que la cadena lleva una
+     * marca donde deberia ir un llamante.  Decirlo importa porque quien lo lee
+     * tiene delante una cadena con un hueco y si no leeria el hueco como un
+     * sitio por el que paso el programa.  \~ */
+    const uint64_t unread = g_frames_unreadable.load(std::memory_order_relaxed);
+    if (unread != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] NOT COVERED: %llu hops could not be "
+                     "read, and carry a mark in their chain instead of a "
+                     "caller\n",
+                     (unsigned long long)unread);
+
+    /* \~english THE TWO WAYS OF READING A STACK, SIDE BY SIDE.  Only when it was
+     * asked for; see `compare_walks` for why the question cannot be settled any
+     * other way.
+     *
+     * \~spanish LAS DOS FORMAS DE LEER UNA PILA, UNA AL LADO DE LA OTRA.  Solo
+     * si se pidio; ver `compare_walks` para por que la pregunta no se decide de
+     * ninguna otra manera.  \~ */
+    const uint64_t cw = g_cmp_walks.load(std::memory_order_relaxed);
+    if (cw != 0) {
+        const uint64_t same = g_cmp_same.load(std::memory_order_relaxed);
+        const uint64_t shrt = g_cmp_short.load(std::memory_order_relaxed);
+        const uint64_t bad = g_cmp_wrong.load(std::memory_order_relaxed);
+        const uint64_t rf = g_cmp_rbp_frames.load(std::memory_order_relaxed);
+        const uint64_t tf = g_cmp_tab_frames.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "\n[allocator/check] the two walks, compared over %llu "
+                     "stacks:\n"
+                     "                  %llu (%.1f%%) the frame pointer got "
+                     "the whole chain -- there the cheap way is enough\n"
+                     "                  %llu (%.1f%%) it stopped early but "
+                     "said nothing false\n"
+                     "                  %llu (%.1f%%) it answered something "
+                     "ELSE, with nothing to tell it apart\n"
+                     "                  %.2f frames per stack by the frame "
+                     "pointer, %.2f by the tables\n",
+                     (unsigned long long)cw,
+                     (unsigned long long)same, 100.0 * double(same) / double(cw),
+                     (unsigned long long)shrt, 100.0 * double(shrt) / double(cw),
+                     (unsigned long long)bad, 100.0 * double(bad) / double(cw),
+                     double(rf) / double(cw), double(tf) / double(cw));
+    }
+
+    /* \~english AND THE INDEX, whose only failure mode was counted and never
+     * said -- which is the shape of hole this library exists to close.  When a
+     * granule finds no room, an address INSIDE that block stops being placeable,
+     * and the consequence is not subtle: releasing from the middle is correct
+     * code that would be reported as a foreign pointer.
+     *
+     * \~spanish Y EL INDICE, cuyo unico modo de fallo se contaba y no se decia
+     * -- que es la forma de agujero que esta libreria existe para cerrar.
+     * Cuando un granulo no encuentra sitio, una direccion DE DENTRO de ese
+     * bloque deja de poder situarse, y la consecuencia no es sutil: soltar
+     * desde el medio es codigo correcto que se reportaria como puntero
+     * ajeno.  \~ */
+    const uint64_t ifull = g_index_full.load(std::memory_order_relaxed);
+    if (ifull != 0)
+        std::fprintf(stderr,
+                     "[allocator/check] NOT COVERED: %llu granules found no "
+                     "room in the index, so an address INSIDE those blocks "
+                     "cannot be placed and releasing one from the middle -- "
+                     "which the allocator allows -- would be called foreign\n",
+                     (unsigned long long)ifull);
     const uint64_t norow = g_no_shadow.load(std::memory_order_relaxed);
     if (norow != 0)
         std::fprintf(stderr,
@@ -4381,13 +7135,176 @@ void report() noexcept {
      * corrida que no las pidio no escribe nada.  Va DESPUES del texto para que
      * un fallo al escribir se diga debajo de un informe que ya salio entero.
      * \~ */
+    /* \~english THE PEAK, AND WHO WAS UNDER IT.  In the text and not only in the
+     * tables, because it is the one answer somebody comes here for and a figure
+     * that needs a spreadsheet to be seen is a figure that goes unseen.  Five
+     * sites, which is as many as ever matter: the shape of this is one or two
+     * structures holding most of it, and a longer list buries them.
+     *
+     * \~spanish EL PICO, Y QUIEN ESTABA DEBAJO.  En el texto y no solo en las
+     * tablas, porque es la unica respuesta a la que alguien viene y una cifra
+     * que necesita una hoja de calculo para verse es una cifra que no se ve.
+     * Cinco sitios, que son todos los que llegan a importar: la forma de esto
+     * es una o dos estructuras con casi todo, y una lista mas larga las
+     * entierra.  \~ */
+    if (g_epochs != nullptr && g_epochs_used != 0 && g_cells != nullptr) {
+        uint32_t top = 0;
+        for (uint32_t e = 1; e < g_epochs_used; ++e)
+            if (g_epochs[e].live > g_epochs[top].live) top = e;
+        const Epoch &ep = g_epochs[top];
+        const char *phase = mark_in_force(top);
+        std::fprintf(stderr,
+                     "\n[allocator/check] THE PEAK: %llu MiB live at cut %u of "
+                     "%u%s%s, after %llu allocations.  The allocator had %llu "
+                     "MiB from the system by then -- what is live and what is "
+                     "MAPPED come apart because nothing gives pages back, and "
+                     "the second one is what the operating system shows you.\n",
+                     (unsigned long long)(ep.live >> 20), top, g_epochs_used,
+                     phase != nullptr ? ", in " : "",
+                     phase != nullptr ? phase : "",
+                     (unsigned long long)ep.allocs,
+                     (unsigned long long)(ep.committed >> 20));
+        /* \~english FIVE PASSES OVER THE CUT AND NOTHING IS MOVED.  Sorting
+         * would be shorter to write and would reorder the very rows
+         * `check_peak.csv` is about to be written from -- a report that
+         * disturbs what it reports is a bug waiting for whoever reads the table
+         * next.  Each pass takes the biggest that is not above the last one
+         * printed, with the index breaking ties so two equal sizes do not knock
+         * each other out.
+         *
+         * \~spanish CINCO PASADAS SOBRE EL CORTE Y NO SE MUEVE NADA.  Ordenar
+         * seria mas corto de escribir y reordenaria justo las filas de las que
+         * se va a escribir `check_peak.csv` -- un informe que altera lo que
+         * informa es un fallo esperando a quien lea la tabla despues.  Cada
+         * pasada coge el mayor que no pase del ultimo impreso, y el indice
+         * desempata para que dos tamanos iguales no se tumben mutuamente.  \~ */
+        uint64_t shown = 0;
+        uint64_t ceiling = ~uint64_t(0);
+        uint32_t ceiling_at = uint32_t(-1);
+        for (uint32_t k = 0; k < 5 && k < ep.cells; ++k) {
+            uint32_t best = uint32_t(-1);
+            uint64_t best_bytes = 0;
+            for (uint32_t c = 0; c < ep.cells; ++c) {
+                const uint64_t b = g_cells[ep.first + c].bytes;
+                if (b == 0 || b > ceiling) continue;
+                if (b == ceiling && c <= ceiling_at) continue;
+                if (best == uint32_t(-1) || b > best_bytes) {
+                    best = c;
+                    best_bytes = b;
+                }
+            }
+            if (best == uint32_t(-1)) break;
+            std::fprintf(stderr, "\n  %llu MiB (%llu per mille)",
+                         (unsigned long long)(best_bytes >> 20),
+                         ep.live != 0
+                             ? (unsigned long long)((best_bytes * 1000ULL) /
+                                                    ep.live)
+                             : 0ULL);
+            print_stack(" held here", g_cells[ep.first + best].site);
+            shown += best_bytes;
+            ceiling = best_bytes;
+            ceiling_at = best;
+        }
+        if (ep.live > shown)
+            std::fprintf(stderr,
+                         "\n  and %llu MiB between everything else, of which "
+                         "%llu MiB is in sites too small to be listed at all\n",
+                         (unsigned long long)((ep.live - shown) >> 20),
+                         (unsigned long long)(ep.below_floor >> 20));
+    }
+
+    /* \~english THE SLACK, AND IT IS MEASURED.  The paragraph above says what
+     * was live and what the process held, and the distance between those two
+     * has always been the interesting number and the one nobody could account
+     * for: the tree cannot show it, because slack belongs to no site.  Now the
+     * system answers for the allocator's own ranges, so what is printed here is
+     * not a difference between two unrelated totals -- it is the same range,
+     * measured twice: what it costs and what was handed out of it.
+     *
+     * The WORST cut and not the last: holding pages is not undone, so the peak
+     * of the gap is what a run has to be judged by.  Cuts where the range could
+     * not be asked about read as zero and are skipped rather than printed as a
+     * negative slack.
+     *
+     * \~spanish LA HOLGURA, Y MEDIDA.  El parrafo de arriba dice lo que habia
+     * vivo y lo que el proceso tenia, y la distancia entre esas dos siempre fue
+     * la cifra interesante y la que nadie podia justificar: el arbol no la
+     * ensena, porque la holgura no es de ningun sitio.  Ahora el sistema
+     * contesta por los rangos del propio asignador, asi que lo que sale aqui no
+     * es la resta de dos totales que no se hablan -- es el mismo rango, medido
+     * dos veces: lo que cuesta y lo que se entrego de el.
+     *
+     * El PEOR corte y no el ultimo: guardar paginas no se deshace, asi que un
+     * recorrido hay que juzgarlo por el pico del hueco.  Los cortes en los que
+     * no se pudo preguntar dan cero y se saltan, en vez de salir como una
+     * holgura negativa.  \~ */
+    if (g_epochs != nullptr && g_epochs_used != 0) {
+        uint32_t worst = uint32_t(-1);
+        uint64_t worst_gap = 0;
+        for (uint32_t e = 0; e < g_epochs_used; ++e) {
+            const Epoch &c = g_epochs[e];
+            if (c.region <= c.live) continue; // sin medir, o sin holgura
+            const uint64_t gap = c.region - c.live;
+            if (worst == uint32_t(-1) || gap > worst_gap) {
+                worst = e;
+                worst_gap = gap;
+            }
+        }
+        if (worst != uint32_t(-1)) {
+            const Epoch &c = g_epochs[worst];
+            const char *phase = mark_in_force(worst);
+            std::fprintf(
+                stderr,
+                "\n[allocator/check] THE SLACK: %llu MiB held and not handed "
+                "out, at cut %u of %u%s%s -- the allocator's ranges cost %llu "
+                "MiB there and only %llu MiB of that was live.  This is asked "
+                "of the operating system, range by range; it is not the "
+                "process total.\n",
+                (unsigned long long)(worst_gap >> 20), worst, g_epochs_used,
+                phase != nullptr ? ", in " : "", phase != nullptr ? phase : "",
+                (unsigned long long)(c.region >> 20),
+                (unsigned long long)(c.live >> 20));
+            /* \~english AND WHICH HALF IS WHICH, because the two have different
+             * cures: what is in the free lists could go back to the system,
+             * and what is not is chunks a size class is holding with most of
+             * their blocks free -- which no amount of giving pages back will
+             * touch.  Saying only the total invites building the wrong one.
+             * \~spanish Y CUAL ES CADA MITAD, porque tienen curas distintas: lo
+             * que esta en las listas de libres podria volver al sistema, y lo
+             * que no son trozos que una clase de tamano retiene con casi todos
+             * sus bloques libres -- que no arregla ninguna devolucion de
+             * paginas.  Decir solo el total invita a construir la que no
+             * era.  \~ */
+            uint64_t loose = c.free_spans < worst_gap ? c.free_spans
+                                                      : worst_gap;
+            uint64_t empty = c.empty_chunks;
+            if (loose + empty > worst_gap) empty = worst_gap - loose;
+            std::fprintf(
+                stderr,
+                "                  of which %llu MiB is whole spans nobody is "
+                "using, %llu MiB is chunks a size class holds with every block "
+                "dead, and %llu MiB is chunks it holds with a few blocks still "
+                "alive and scattered.\n"
+                "                  The first two an allocator can give back; "
+                "the third one none can, and the answer to it is not to hold a "
+                "whole program at once.\n",
+                (unsigned long long)(loose >> 20),
+                (unsigned long long)(empty >> 20),
+                (unsigned long long)((worst_gap - loose - empty) >> 20));
+        }
+    }
+
     char dir[512];
     const size_t dn = os_env("VESTA_ALLOC_SAN_CSV", dir, sizeof dir);
     if (dn != kOsEnvUnset && dn != 0 && dir[0] != '\0') {
         if (write_check_csv(dir))
             std::fprintf(stderr,
+                         /* Los CINCO, y la lista se actualiza con ellos: un
+                          * mensaje que nombra tres de cinco hace que los otros
+                          * dos no existan para quien lo lee. */
                          "\n[allocator/check] tables written to %s "
                          "(check_sites.csv, check_frames.csv, "
+                         "check_pairs.csv, check_verdicts.csv, "
                          "check_summary.csv)\n",
                          dir);
         else
