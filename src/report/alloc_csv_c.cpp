@@ -35,6 +35,32 @@ void vesta_alloc_set_name_formatter(VestaAllocNameFormatter fn) {
     util::alloc_set_name_formatter(fn);
 }
 
+void vesta_alloc_set_module_classifier(VestaAllocModuleClassifier fn) {
+    util::alloc_set_module_classifier(fn);
+}
+
+const char *vesta_alloc_root_of(const char *file_macro, const char *relative) {
+    return util::alloc_root_of(file_macro, relative);
+}
+
+void vesta_alloc_declare_module(const char *dir, const char *name) {
+    util::alloc_declare_module(dir, name);
+}
+
+void vesta_alloc_declare_module_of_file(const char *file_macro,
+                                        const char *name) {
+    util::alloc_declare_module_of_file(file_macro, name);
+}
+
+void vesta_alloc_declare_code(const VestaAllocCodeRange *ranges,
+                              unsigned count) {
+    util::alloc_declare_code(ranges, count);
+}
+
+void vesta_alloc_declare_file(const void *pc, const char *file) {
+    util::alloc_declare_file(pc, file);
+}
+
 const char *vesta_alloc_readable_name(const char *raw) {
     return util::alloc_readable_name(raw);
 }

@@ -165,6 +165,41 @@ typedef struct VestaAllocSite {
      * \~
      */
     uint32_t size_hist[VESTA_ALLOC_SIZE_BUCKETS];
+    /**
+     * @brief
+     * \~english How many BYTES of each size THIS site asked for.
+     * \~spanish Cuantos BYTES de cada tamano pidio ESTE sitio.
+     * \~
+     *
+     * \~english
+     * The one above counts allocations, and counting is what hides the thing
+     * this is for: a bucket holds a RANGE of sizes, so the count of the last
+     * one -- everything above 16 MiB -- is a handful next to tens of millions
+     * of tiny ones and comes out as a bar of zero width, while in bytes it can
+     * be the one that decides the peak.  Measured on a compile of 441.000
+     * lines: 32 allocations over 16 MiB out of 89,9 million, 0,00004% of the
+     * count.
+     *
+     * It cannot be worked out from the count.  A bucket spans a factor of four,
+     * so counts give a range and never a figure, and the last bucket has no
+     * ceiling at all -- from there only a floor comes out.
+     *
+     * \~spanish
+     * El de arriba cuenta reservas, y contar es justo lo que esconde aquello
+     * para lo que esta esto: una casilla abarca un RANGO de tamanos, asi que la
+     * cuenta de la ultima -- todo lo que pasa de 16 MiB -- es un punado al lado
+     * de decenas de millones de diminutas y sale como una barra de ancho cero,
+     * cuando en bytes puede ser la que decide el pico.  Medido sobre una
+     * compilacion de 441.000 lineas: 32 reservas de mas de 16 MiB entre 89,9
+     * millones, el 0,00004% de la cuenta.
+     *
+     * No se puede deducir de la cuenta.  Una casilla abarca un factor de
+     * cuatro, asi que de un recuento sale un intervalo y nunca una cifra, y la
+     * ultima casilla ni siquiera tiene techo -- de ahi solo sale un suelo.
+     *
+     * \~
+     */
+    uint64_t bytes_hist[VESTA_ALLOC_SIZE_BUCKETS];
 } VestaAllocSite;
 
 /**

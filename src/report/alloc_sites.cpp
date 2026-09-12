@@ -213,6 +213,51 @@ uint32_t *hist_table() noexcept {
     return expected;
 }
 
+/**
+ * @brief Los BYTES de cada tamano, en otra tabla igual.
+ *
+ * OTRA TABLA Y NO UNA MAS ANCHA, por lo mismo que el reparto esta fuera de
+ * `Entry`: el camino caliente escribe una casilla de cuatro bytes, y juntar las
+ * dos cuentas en una estructura de doce bytes por casilla desalinearia la
+ * escritura que ya se hace.  Separadas, cada una es una suma sobre su propia
+ * linea y la que ya existia no cambia de coste.
+ *
+ * Y SE PAGA APARTE.  Son 12,6 MiB, el doble que el reparto de cuentas porque un
+ * contador de bytes no cabe en 32 bits: 4.096 MiB pasan por una sola casilla de
+ * un solo sitio en cualquier compilacion mediana.  Como la otra, se reserva la
+ * primera vez que se apunta algo, asi que quien no pide sitios no paga nada.
+ *
+ * Si NO se puede reservar, se sigue sin ella: el reparto por bytes es
+ * informacion de mas, igual que el de cuentas, y quedarse sin el no puede
+ * impedir apuntar el sitio.
+ */
+std::atomic<uint64_t *> g_bytes_hist{nullptr};
+
+constexpr size_t kBytesHistBytes =
+    size_t(kMaxThreads) * kSlots * kSizeBuckets * sizeof(uint64_t);
+
+/// La fila de este hilo, o nulo si no se pudo reservar.  Ver `hist_table`.
+uint64_t *bytes_hist_table() noexcept {
+    uint64_t *h = g_bytes_hist.load(std::memory_order_acquire);
+    if (h != nullptr) return h;
+
+    void *raw = os_reserve(kBytesHistBytes);
+    if (raw == nullptr) return nullptr;
+    if (!os_commit(raw, kBytesHistBytes)) {
+        os_release(raw, kBytesHistBytes);
+        return nullptr;
+    }
+    uint64_t *mine = static_cast<uint64_t *>(raw);
+
+    uint64_t *expected = nullptr;
+    if (g_bytes_hist.compare_exchange_strong(expected, mine,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+        return mine;
+    os_release(raw, kBytesHistBytes); // gano otro
+    return expected;
+}
+
 /// Reparte una direccion por toda la tabla.  Los punteros de retorno de un
 /// mismo modulo comparten los bits altos y se diferencian en los bajos, asi que
 /// tomar un trozo tal cual amontonaria; multiplicar y quedarse con los altos
@@ -252,6 +297,11 @@ void record_alloc_site(const void *pc, size_t n, uint8_t tag) noexcept {
     uint32_t *hrow = hist_table();
     if (hrow != nullptr)
         hrow += size_t(c->id) * kSlots * kSizeBuckets;
+    /* Y los bytes de cada tamano, en su tabla.  Se piden por separado a
+     * proposito: que una de las dos no quepa no puede dejar sin la otra. */
+    uint64_t *brow = bytes_hist_table();
+    if (brow != nullptr)
+        brow += size_t(c->id) * kSlots * kSizeBuckets;
 
     uint32_t i = slot_of(pc, tag);
     Entry *weakest = &row[i];
@@ -277,6 +327,10 @@ void record_alloc_site(const void *pc, size_t n, uint8_t tag) noexcept {
              * millon de reservas de 32 bytes y una de 16 MiB tiene la misma
              * mascara que uno que hace justo al reves. */
             if (hrow != nullptr) hrow[size_t(i) * kSizeBuckets + bucket_of(n)] += 1;
+            /* Y CUANTOS BYTES de cada tamano, que es otra pregunta todavia: una
+             * casilla abarca un rango, asi que de la cuenta sale un intervalo y
+             * nunca una cifra -- y la ultima casilla ni siquiera tiene techo. */
+            if (brow != nullptr) brow[size_t(i) * kSizeBuckets + bucket_of(n)] += n;
             return;
         }
         if (e.count < weakest->count) weakest = &e;
@@ -329,6 +383,13 @@ void record_alloc_site(const void *pc, size_t n, uint8_t tag) noexcept {
         for (uint32_t b = 0; b < kSizeBuckets; ++b) h[b] = 0;
         h[bucket_of(n)] = 1;
     }
+    /* Los bytes por tamano se reinician con el, y por el mismo motivo: son la
+     * otra mitad de la misma forma. */
+    if (brow != nullptr) {
+        uint64_t *bh = brow + size_t(weakest - row) * kSizeBuckets;
+        for (uint32_t b = 0; b < kSizeBuckets; ++b) bh[b] = 0;
+        bh[bucket_of(n)] = n;
+    }
     g_overflow.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -369,12 +430,15 @@ unsigned merge_sites(AllocSite *out, unsigned max,
     if (t == nullptr || out == nullptr || max == 0) return 0;
 
     const uint32_t *ht = g_hist.load(std::memory_order_acquire);
+    const uint64_t *bt = g_bytes_hist.load(std::memory_order_acquire);
 
     unsigned kept = 0;
     for (uint32_t th = 0; th < kMaxThreads; ++th) {
         const Entry *row = t + size_t(th) * kSlots;
         const uint32_t *hrow =
             ht != nullptr ? ht + size_t(th) * kSlots * kSizeBuckets : nullptr;
+        const uint64_t *brow =
+            bt != nullptr ? bt + size_t(th) * kSlots * kSizeBuckets : nullptr;
         for (uint32_t s = 0; s < kSlots; ++s) {
             if (row[s].pc == nullptr || row[s].count == 0) continue;
             if (scope != SiteScope::All) {
@@ -394,6 +458,8 @@ unsigned merge_sites(AllocSite *out, unsigned max,
             }
             const uint32_t *h =
                 hrow != nullptr ? hrow + size_t(s) * kSizeBuckets : nullptr;
+            const uint64_t *bh =
+                brow != nullptr ? brow + size_t(s) * kSizeBuckets : nullptr;
             /* Si ya estaba (otro hilo) se suma; si no, entra, y cuando esta
              * lleno desplaza al menor.  Es cuadratico sobre unas decenas de
              * elementos y corre una vez. */
@@ -416,16 +482,22 @@ unsigned merge_sites(AllocSite *out, unsigned max,
                 if (h != nullptr)
                     for (uint32_t b = 0; b < kSizeBuckets; ++b)
                         out[j].size_hist[b] += h[b];
+                if (bh != nullptr)
+                    for (uint32_t b = 0; b < kSizeBuckets; ++b)
+                        out[j].bytes_hist[b] += bh[b];
                 continue;
             }
             AllocSite fresh{row[s].pc,    row[s].count,
                             row[s].bytes, row[s].class_mask,
                             row[s].large, row[s].over,
                             row[s].over_bytes, row[s].tag,
-                            {}};
+                            {}, {}};
             if (h != nullptr)
                 for (uint32_t b = 0; b < kSizeBuckets; ++b)
                     fresh.size_hist[b] = h[b];
+            if (bh != nullptr)
+                for (uint32_t b = 0; b < kSizeBuckets; ++b)
+                    fresh.bytes_hist[b] = bh[b];
             if (kept < max) {
                 out[kept++] = fresh;
                 continue;

@@ -224,6 +224,207 @@ using AllocNameFormatter = ::VestaAllocNameFormatter;
 void alloc_set_name_formatter(AllocNameFormatter fn) noexcept;
 
 /**
+ * \~english Whose code a frame is, given where its source lives.  See
+ *           @c VestaAllocModuleClassifier: the rule belongs to the CONSUMER's
+ *           tree, so it is a hook and not a rule in here.
+ * \~spanish De quien es el codigo de un marco, a partir de donde vive su
+ *           fuente.  Ver @c VestaAllocModuleClassifier: la regla es del arbol
+ *           del CONSUMIDOR, asi que es un gancho y no una regla de aqui.
+ * \~
+ */
+using AllocModuleClassifier = ::VestaAllocModuleClassifier;
+
+/**
+ * @brief
+ * \~english Installs the module classifier.  Null removes it.
+ * \~spanish Instala el clasificador de modulos.  Nulo lo quita.
+ * \~
+ *
+ * \~english
+ * @par Threads
+ * Same as the formatter: once, at start-up.
+ *
+ * \~spanish
+ * @par Hilos
+ * Como el formateador: una vez, al arrancar.
+ *
+ * \~
+ * @param fn
+ * \~english what to ask about each source path, or null for no modules.
+ * \~spanish a que preguntar por cada ruta de fuente, o nulo para no tener
+ *           modulos.
+ * \~
+ */
+void alloc_set_module_classifier(AllocModuleClassifier fn) noexcept;
+
+/**
+ * @brief
+ * \~english Where the consumer's tree starts, from @c __FILE__.  See
+ *           @c vesta_alloc_root_of: the macro @c VESTA_ALLOC_ROOT_HERE is how
+ *           to call it, because @c __FILE__ only means anything where it is
+ *           written.
+ * \~spanish Donde empieza el arbol del consumidor, a partir de @c __FILE__.
+ *           Ver @c vesta_alloc_root_of: la macro @c VESTA_ALLOC_ROOT_HERE es
+ *           la forma de llamarla, porque @c __FILE__ solo significa algo donde
+ *           se escribe.
+ * \~
+ */
+const char *alloc_root_of(const char *file_macro,
+                          const char *relative) noexcept;
+
+/**
+ * \~english Declares that everything under @p dir is module @p name.  See
+ *           @c vesta_alloc_declare_module: DECLARED beats deduced, and the
+ *           longest directory wins.
+ * \~spanish Declara que todo lo que cuelga de @p dir es el modulo @p name.
+ *           Ver @c vesta_alloc_declare_module: lo DECLARADO gana a lo deducido,
+ *           y gana el directorio mas largo.
+ * \~
+ */
+void alloc_declare_module(const char *dir, const char *name) noexcept;
+
+/**
+ * \~english The same from a FILE of that module -- its directory is declared.
+ *           What @c VESTA_ALLOC_MODULE_HERE calls with `__FILE__`.
+ * \~spanish Lo mismo desde un FICHERO de ese modulo -- se declara su
+ *           directorio.  Lo que llama @c VESTA_ALLOC_MODULE_HERE con
+ *           `__FILE__`.
+ * \~
+ */
+void alloc_declare_module_of_file(const char *file_macro,
+                                  const char *name) noexcept;
+
+/**
+ * \~english A stretch of code and whose it is.  Documented where it is
+ *           declared, in the C header.
+ * \~spanish Un tramo de codigo y de quien es.  Documentado donde se declara,
+ *           en la cabecera de C.
+ * \~
+ */
+using AllocCodeRange = ::VestaAllocCodeRange;
+
+/**
+ * \~english Hands over a table of code stretches -- the only attribution that
+ *           survives a stripped build, where there is no path and no name.  It
+ *           is NOT copied: see @c vesta_alloc_declare_code.
+ * \~spanish Entrega una tabla de tramos de codigo -- la unica atribucion que
+ *           sobrevive a un binario estripado, donde no hay ni ruta ni nombre.
+ *           NO se copia: ver @c vesta_alloc_declare_code.
+ * \~
+ */
+void alloc_declare_code(const AllocCodeRange *ranges,
+                        unsigned count) noexcept;
+
+/**
+ * \~english Says that the code around @p pc was compiled from @p file -- a
+ *           MARKER, so the range comes from the order of all of them.  See
+ *           @c vesta_alloc_declare_file and the macro @c VESTA_ALLOC_FILE_HERE.
+ * \~spanish Dice que el codigo de alrededor de @p pc se compilo de @p file --
+ *           un MARCADOR, asi que el rango sale del orden de todos ellos.  Ver
+ *           @c vesta_alloc_declare_file y la macro @c VESTA_ALLOC_FILE_HERE.
+ * \~
+ */
+void alloc_declare_file(const void *pc, const char *file) noexcept;
+
+/**
+ * \~english The symbol a declared stretch gives to @p pc, or null.  For a
+ *           report that has addresses and no symbol table.
+ * \~spanish El simbolo que un tramo declarado le da a @p pc, o nulo.  Para un
+ *           informe que tiene direcciones y ninguna tabla de simbolos.
+ * \~
+ */
+const char *alloc_code_name(const void *pc) noexcept;
+
+/**
+ * \~english The module of a frame, ASKING THE ADDRESS FIRST.  The other
+ *           overload is what is left when there is no address to ask about.
+ * \~spanish El modulo de un marco, PREGUNTANDO ANTES A LA DIRECCION.  La otra
+ *           sobrecarga es lo que queda cuando no hay direccion que preguntar.
+ * \~
+ */
+/**
+ * \~english The module of a frame AND where that answer came from.
+ * \~spanish El modulo de un marco Y de donde salio esa respuesta.
+ * \~
+ *
+ * \~english
+ * The two together because they are not the same quality of answer, and a
+ * report that shows only the first invites reading a guess as a measurement:
+ *
+ *     address    a declared stretch WITH a size: measured
+ *     nearby     a declared marker: the nearest one below it, approximate
+ *     resolver   whoever resolved the symbol already knew the module
+ *     declared   a directory the code declared as a module
+ *     rule       the consumer's classifier worked it out from the path
+ *
+ * \~spanish
+ * Las dos juntas porque no son la misma calidad de respuesta, y un informe que
+ * ensena solo la primera invita a leer una suposicion como una medida:
+ *
+ *     address    un tramo declarado CON tamano: medido
+ *     nearby     un marcador declarado: el mas cercano por debajo, aproximado
+ *     resolver   quien resolvio el simbolo ya sabia el modulo
+ *     declared   un directorio que el codigo declaro como modulo
+ *     rule       el clasificador del consumidor lo dedujo de la ruta
+ *
+ * \~
+ */
+struct AllocModuleAnswer {
+    const char *name; ///< el modulo, o nulo
+    const char *from; ///< de donde salio, o nulo si no hay respuesta
+};
+
+AllocModuleAnswer alloc_module_answer(const void *pc, const char *file,
+                                      const char *function,
+                                      const char *known) noexcept;
+
+const char *alloc_module_of(const void *pc, const char *file,
+                            const char *function, const char *known) noexcept;
+
+/**
+ * @brief
+ * \~english The module of a frame: what the resolver knew, or the classifier's
+ *           answer when it knew nothing.
+ * \~spanish El modulo de un marco: lo que supiera el resolutor, o lo que
+ *           conteste el clasificador cuando no supo nada.
+ * \~
+ *
+ * \~english
+ * In ONE place because both exports write this column -- the allocator's frames
+ * and the checker's -- and two copies of the fallback is one of them keeping a
+ * rule the other lost.  A frame that already carries a module keeps it: that
+ * one came from somebody else's binary, and the consumer's rules have nothing
+ * to say about it.
+ *
+ * \~spanish
+ * En UN sitio porque los dos volcados escriben esta columna -- los marcos del
+ * asignador y los del comprobador -- y dos copias del respaldo son una de las
+ * dos conservando una regla que la otra perdio.  Un marco que ya trae modulo se
+ * lo queda: ese salio del binario de otro, y las reglas del consumidor no
+ * tienen nada que decir de el.
+ *
+ * \~
+ * @param file
+ * \~english the source of the frame, or null.
+ * \~spanish el fuente del marco, o nulo.
+ * \~
+ * @param function
+ * \~english its name, for when there is no path.
+ * \~spanish su nombre, para cuando no hay ruta.
+ * \~
+ * @param known
+ * \~english what the resolver already said, or null.
+ * \~spanish lo que ya dijo el resolutor, o nulo.
+ * \~
+ * @return
+ * \~english the module, or null when nobody knows.
+ * \~spanish el modulo, o nulo cuando no lo sabe nadie.
+ * \~
+ */
+const char *alloc_module_of(const char *file, const char *function,
+                            const char *known) noexcept;
+
+/**
  * @brief
  * \~english @p raw through the installed formatter, or @p raw itself.
  * \~spanish @p raw pasado por el formateador instalado, o @p raw tal cual.

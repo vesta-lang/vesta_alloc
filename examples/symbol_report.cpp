@@ -44,6 +44,49 @@
 
 namespace {
 
+/**
+ * @brief De que modulo es un marco, para ESTE programa.
+ *
+ * La libreria no trae ninguna regla de estas dentro y es a proposito: donde
+ * vive cada modulo es una propiedad del arbol de quien la enlaza, y una regla
+ * escrita ahi acertaria en un proyecto y seguiria contestando -- mal -- en
+ * todos los demas.  Asi que pregunta, y esto contesta.
+ *
+ * LA RAIZ SALE DE `__FILE__`, que es el truco que hace que esto no haya que
+ * mantenerlo: la ruta que lleva la informacion de depuracion es la que vio el
+ * compilador, o sea la misma forma que `__FILE__` en este fichero.  Quitandole
+ * el sitio que ocupa este fichero en el arbol queda el prefijo con el que
+ * empiezan todos los fuentes propios -- venga el arbol de donde venga, sin una
+ * sola ruta escrita a mano.
+ *
+ * Devolver NULL es "no lo se", y es una respuesta legitima: la columna sale
+ * vacia en vez de adivinada.
+ */
+/// La raiz, UNA vez.  `VESTA_ALLOC_ROOT_HERE` se escribe aqui y no dentro de la
+/// libreria porque `__FILE__` solo significa algo donde esta escrito: cogido
+/// alla nombraria un fichero de la libreria.
+std::string compute_root() {
+    const char *const root = VESTA_ALLOC_ROOT_HERE("examples/symbol_report.cpp");
+    return root != nullptr ? std::string(root) : std::string();
+}
+
+const char *module_here(const char *file, const char *function) {
+    (void)function;
+    if (file == nullptr) return nullptr;
+    static const std::string root = compute_root();
+    static std::string held;
+    const std::string p(file);
+    if (root.empty() || p.compare(0, root.size(), root) != 0) return nullptr;
+    /* El primer directorio bajo la raiz, que en este arbol es el modulo:
+     * `src/`, `examples/`, `tests/`...  Otro proyecto partira por donde le
+     * convenga, que es justo el motivo de que esto sea suyo y no de la
+     * libreria. */
+    const std::string rest = p.substr(root.size());
+    const size_t slash = rest.find_first_of("/\\");
+    held = slash == std::string::npos ? rest : rest.substr(0, slash);
+    return held.empty() ? nullptr : held.c_str();
+}
+
 /* Los punteros tienen que ESCAPAR o el compilador borra el par: C++14 le deja
  * eliminar un `new`/`delete` cuyo resultado nadie lee, y lo hace.  Esa trampa
  * ya se comio un bucle de calentamiento entero en este proyecto. */
@@ -93,6 +136,11 @@ int main(int argc, char **argv) {
     /* LAS DOS LINEAS.  La primera dice quien sabe poner nombres; la segunda
      * pide el informe.  El resolutor lo trae la propia libreria. */
     util::alloc_set_symbol_resolver(vesta_self_resolver);
+    /* Y LA TERCERA, opcional: de que MODULO es cada marco.  La libreria no
+     * puede saberlo -- depende de como tenga cada proyecto repartido su arbol
+     * --, asi que pregunta, y quien contesta es `module_here`, aqui abajo.  Sin
+     * esta linea el informe sale igual, con una columna menos. */
+    util::alloc_set_module_classifier(module_here);
     if (!util::write_alloc_csv(dir)) {
         std::fprintf(stderr, "no se pudo escribir el informe en '%s'\n", dir);
         return 1;

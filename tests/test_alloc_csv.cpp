@@ -225,33 +225,53 @@ int main() {
     /* LA COMPROBACION QUE IMPORTA: el nombre feo vuelve ENTERO.  Con las
      * comillas mal puestas saldria partido en varias columnas y el numero de
      * campos delataria justo eso. */
+    /* LAS COLUMNAS, POR NOMBRE.  Estaban por posicion y la fila se validaba
+     * contando campos, asi que anadir una columna al fichero ponia CUATRO
+     * comprobaciones en rojo -- ninguna por su propio motivo --, y la que decia
+     * "tiene sus siete campos" es la que mas despista: lo que fallaba no era el
+     * entrecomillado, era el numero siete escrito aqui. */
+    const size_t n_cols = frames[0].size();
+    size_t c_site = 0, c_depth = 0, c_fn = 0, c_file = 0, c_mod = 0;
+    for (size_t c = 0; c < n_cols; ++c) {
+        if (frames[0][c] == "site_id") c_site = c;
+        if (frames[0][c] == "depth") c_depth = c;
+        if (frames[0][c] == "function") c_fn = c;
+        if (frames[0][c] == "file") c_file = c;
+        if (frames[0][c] == "module") c_mod = c;
+    }
+    check(c_fn != 0 && c_file != 0 && c_mod != 0,
+          "frames.csv dice en su cabecera donde esta cada columna");
     bool whole = false, columns_ok = true, joins = true;
     std::string ids;
     for (size_t i = 1; i < sites.size(); ++i)
         if (!sites[i].empty()) ids += "," + sites[i][0] + ",";
     for (size_t i = 1; i < frames.size(); ++i) {
         const auto &row = frames[i];
-        if (row.size() != 7) {
+        if (row.size() != n_cols) {
             columns_ok = false;
             continue;
         }
-        if (ids.find("," + row[0] + ",") == std::string::npos) joins = false;
-        if (row[3] == shouty_formatter(kNastyName)) whole = true;
+        if (ids.find("," + row[c_site] + ",") == std::string::npos)
+            joins = false;
+        if (row[c_fn] == shouty_formatter(kNastyName)) whole = true;
     }
-    check(columns_ok, "toda fila de frames.csv tiene sus siete campos");
+    check(columns_ok,
+          "toda fila de frames.csv tiene tantos campos como su cabecera");
     check(whole,
           "un nombre con comas y comillas vuelve entero por el formateador");
     check(joins, "todo site_id de frames.csv existe en sites.csv");
 
     bool comma_path = false, module_ok = false, module_clean = true;
     for (size_t i = 1; i < frames.size(); ++i) {
-        if (frames[i].size() != 7) continue;
-        if (frames[i][4] == "src/some,file.cpp") comma_path = true;
-        if (frames[i][1] == "0" && frames[i][6] == "mod,ulo") module_ok = true;
+        if (frames[i].size() != n_cols) continue;
+        if (frames[i][c_file] == "src/some,file.cpp") comma_path = true;
+        if (frames[i][c_depth] == "0" && frames[i][c_mod] == "mod,ulo")
+            module_ok = true;
         /* El marco que el resolutor NO rellena tiene que salir vacio, corrida
          * tras corrida.  Con basura heredada saldria el modulo del sitio
          * anterior y el arbol agruparia por algo que nadie midio. */
-        if (frames[i][1] == "1" && !frames[i][6].empty()) module_clean = false;
+        if (frames[i][c_depth] == "1" && !frames[i][c_mod].empty())
+            module_clean = false;
     }
     check(comma_path, "y una RUTA con coma tambien");
 
@@ -283,13 +303,25 @@ int main() {
      * siendo lo que ESE sitio se gano (`allocs`), no lo que heredo. */
     const auto site_sizes = read_csv(dir + "/site_sizes.csv");
     check(site_sizes.size() > 1, "site_sizes.csv trae filas");
+    /* LAS COLUMNAS, POR NOMBRE.  Estaban por posicion y ademas filtrando por
+     * "la fila tiene exactamente cuatro campos", asi que anadir una columna al
+     * fichero no rompia el test: lo dejaba sin encontrar NI UNA fila, sumando
+     * cero, y fallando por algo que no tenia nada que ver con el invariante que
+     * mira.  La cabecera esta ahi; preguntarle cuesta lo mismo. */
+    size_t col_site = 0, col_allocs = 0;
+    for (size_t c = 0; c < site_sizes[0].size(); ++c) {
+        if (site_sizes[0][c] == "site_id") col_site = c;
+        if (site_sizes[0][c] == "allocs") col_allocs = c;
+    }
+    check(col_allocs != 0, "y site_sizes.csv dice cual es su columna `allocs`");
     bool hist_adds_up = true;
     for (size_t i = 1; i < sites.size(); ++i) {
         if (sites[i].size() < 2) continue;
         long long sum = 0;
         for (size_t k = 1; k < site_sizes.size(); ++k)
-            if (site_sizes[k].size() == 4 && site_sizes[k][0] == sites[i][0])
-                sum += std::atoll(site_sizes[k][3].c_str());
+            if (site_sizes[k].size() > col_allocs &&
+                site_sizes[k][col_site] == sites[i][0])
+                sum += std::atoll(site_sizes[k][col_allocs].c_str());
         if (sum != std::atoll(sites[i][1].c_str())) hist_adds_up = false;
     }
     check(hist_adds_up,

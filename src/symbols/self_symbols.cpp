@@ -147,8 +147,66 @@ const Table *table() noexcept {
  * La cache es por RUTA y pequenya a proposito: un informe toca un punado de
  * modulos, y cada tabla cuesta leerse el fichero entero una vez.
  */
+/**
+ * @brief
+ * \~english Whether two paths name the same file, near enough.
+ * \~spanish Si dos rutas nombran el mismo fichero, con lo suficiente.
+ * \~
+ *
+ * \~english
+ * Case and separator, because the two sides come from different places: one is
+ * what the loader reports for the module, the other what the process was asked
+ * to run as.  On Windows they differ in case often enough, and `/` against `\`
+ * whenever a path crossed a shell.  This is not a general path comparison and
+ * does not pretend to be: what it protects against is reading the SAME file
+ * twice, and being wrong only costs what happened before it existed.
+ *
+ * \~spanish
+ * Mayusculas y separador, porque los dos lados vienen de sitios distintos: uno
+ * es lo que el cargador dice del modulo y el otro con lo que se arranco el
+ * proceso.  En Windows difieren en mayusculas bastante a menudo, y `/` contra
+ * `\` en cuanto una ruta pasa por una consola.  Esto no es una comparacion
+ * general de rutas ni lo pretende: de lo que protege es de leer DOS VECES el
+ * mismo fichero, y equivocarse solo cuesta lo que pasaba antes de que
+ * existiera.
+ * \~
+ */
+bool same_file(const char *a, const char *b) noexcept {
+    if (a == nullptr || b == nullptr) return false;
+    for (; *a != '\0' && *b != '\0'; ++a, ++b) {
+        char x = *a, y = *b;
+        if (x == '\\') x = '/';
+        if (y == '\\') y = '/';
+        if (x >= 'A' && x <= 'Z') x = char(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = char(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 const Table *table_for(const char *path) noexcept {
     if (path == nullptr || *path == '\0') return nullptr;
+
+    /* \~english OUR OWN IMAGE ALREADY HAS A TABLE, so it is not read again.
+     * Nothing forbade asking for it by path -- the allocator's own report does,
+     * resolving its sites through `module_symbol` -- and the answer was a
+     * SECOND full table of the same file: the binary read whole a second time,
+     * and every symbol name interned twice.
+     *
+     * Measured on a 24k-line compile with a 173 MB binary: 172,9 MB in ONE
+     * allocation, plus the table built out of it.  It was the second largest
+     * thing the report spent on itself, and it was a duplicate.
+     *
+     * \~spanish NUESTRA PROPIA IMAGEN YA TIENE TABLA, asi que no se lee otra
+     * vez.  Nada impedia pedirla por ruta -- lo hace el informe del propio
+     * asignador, resolviendo sus sitios por `module_symbol` -- y la respuesta
+     * era una SEGUNDA tabla entera del mismo fichero: el binario leido entero
+     * una vez mas, y cada nombre de simbolo internado dos veces.
+     *
+     * Medido sobre una compilacion de 24k lineas con un binario de 173 MB:
+     * 172,9 MB en UNA reserva, mas la tabla construida a partir de ella.  Era
+     * lo segundo mas grande que el informe se gastaba en si mismo, y era una
+     * copia.  \~ */
 
     /* LA CLAVE ES UN BUFFER Y NO UN `std::string`, y no es una preferencia.
      *
@@ -182,6 +240,25 @@ const Table *table_for(const char *path) noexcept {
      * por el otro. */
     const size_t plen = std::strlen(path);
     if (plen + 1 > sizeof(cache[0].path)) return nullptr;
+
+    /* \~english AFTER the cache and not before it: asking this costs a
+     * `std::string` from `self_image_path()`, and the answer gets remembered in
+     * the entry below -- so it is paid once per module and never on the way
+     * that just reads the cache.
+     * \~spanish DESPUES de la cache y no antes: preguntar esto cuesta un
+     * `std::string` de `self_image_path()`, y la respuesta se recuerda en la
+     * entrada de abajo -- asi que se paga una vez por modulo y nunca en el
+     * camino que solo lee la cache.  \~ */
+    {
+        const std::string self = self_image_path();
+        if (same_file(path, self.c_str())) {
+            const Table *t = table();
+            std::memcpy(cache[used].path, path, plen + 1);
+            cache[used].table = t;
+            ++used;
+            return t;
+        }
+    }
 
     const Table *built = nullptr;
     Table *mine = nullptr;
